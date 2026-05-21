@@ -7,7 +7,7 @@
 	model = "riscv-minimal-nommu,qemu";
 
 	chosen {
-		bootargs = "earlycon=pl011,mmio32,0x40070000 console=ttyAMA0";
+		bootargs = "earlycon=pl011,mmio32,0x40070000 console=ttyAMA0 root=mtd:cramfs rootfstype=cramfs ro";
 	};
 
 	flash@10000000 {

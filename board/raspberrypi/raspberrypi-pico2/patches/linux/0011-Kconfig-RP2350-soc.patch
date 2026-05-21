@@ -1,0 +1,33 @@
+--- a/arch/riscv/Kconfig.socs	2025-05-26 01:09:23.000000000 +0200
++++ b/arch/riscv/Kconfig.socs	2026-05-17 11:58:50.676423527 +0200
+@@ -13,6 +13,30 @@
+ 	help
+ 	  This enables support for the RISC-V based Renesas SoCs.
+ 
++config ARCH_RP2350
++	bool "Raspberry Pi RP2350"
++	select HAVE_PAGE_SIZE_4KB
++	select MMAP_ALLOW_UNINITIALIZED
++	select PM_GENERIC_DOMAINS if PM
++	select PM_GENERIC_DOMAINS_OF if PM && OF
++	select RISCV_SBI_CPUIDLE if CPU_IDLE && RISCV_SBI
++	select ARM_AMBA
++	select SERIAL_AMBA_PL011
++	select SERIAL_AMBA_PL011_CONSOLE
++	imply SPI
++	imply SPI_PL022
++	select MISC_FILESYSTEMS
++	select MTD
++	select MTD_PHRAM
++	select CRAMFS
++	select CRAMFS_MTD
++	config GOLDFISH
++		def_bool n
++	config IRQ_STACKS
++		def_bool n
++	help
++          This enables support for Raspberry Pi RP2350 microcontroller.
++
+ config ARCH_SIFIVE
+ 	bool "SiFive SoCs"
+ 	select ERRATA_SIFIVE if !XIP_KERNEL

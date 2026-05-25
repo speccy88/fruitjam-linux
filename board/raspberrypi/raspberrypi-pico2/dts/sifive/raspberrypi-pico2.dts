@@ -7,7 +7,31 @@
 	model = "riscv-minimal-nommu,qemu";
 
 	chosen {
-		bootargs = "earlycon=pl011,mmio32,0x40070000 console=ttyAMA0";
+		bootargs = "earlycon=pl011,mmio32,0x40070000 console=ttyAMA0 root=mtd:cramfs rootfstype=cramfs ro";
+	};
+
+	flash@10000000 {
+		compatible = "phram"; /* ROM mapped into physical address space */
+		/* reg = <0x10000000  0x800000>; */  /* 8MB Flash Base & Size */
+		reg = <0x10000000 0x1000000>;        /* 16MB Flash Base & Size */
+
+		partitions {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			compatible = "fixed-partitions";
+
+			/* partition@0 {
+				label = "kernel";
+				reg = <0x0 0x200000>;
+				read-only;
+			}; */
+
+			partition@600000 {
+				label = "cramfs";
+				reg = <0x600000 0x200000>; /* ~2MB for cramfs at 6MB offset*/
+				read-only;
+			};
+		};
 	};
 
 	memory@11000000 {

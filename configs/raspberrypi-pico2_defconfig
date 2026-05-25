@@ -12,7 +12,8 @@ BR2_PTHREADS_NONE=y
 BR2_OPTIMIZE_S=y
 
 # Filesystem
-BR2_TARGET_ROOTFS_INITRAMFS=y
+BR2_TARGET_ROOTFS_CRAMFS=y
+BR2_TARGET_ROOTFS_CRAMFS_XIP=y
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL)/board/raspberrypi/raspberrypi-pico2/rootfs_overlay"
 
 # Bootloader

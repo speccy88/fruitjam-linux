@@ -1,40 +1,59 @@
-# Raspberry Pi Pico 2 Buildroot
+# RP2350 no-MMU Linux Buildroot ports
 
-How to build:
+This tree builds tiny Buildroot-based Linux images for RP2350 RISC-V (Hazard3)
+boards. The original target is the Raspberry Pi Pico 2 / SparkFun Pro Micro RP2350
+work; this branch adds an Adafruit Fruit Jam RP2350B UART-only milestone target.
+
+## Adafruit Fruit Jam RP2350B UART milestone
+
+The Fruit Jam target is named `adafruit_fruit_jam_rp2350`. It uses:
+
+* RV32 RISC-V Hazard3, no MMU.
+* SMP disabled.
+* BusyBox-only userspace.
+* CramFS root filesystem in flash.
+* Kernel copied to 8 MiB external PSRAM.
+* UART1 console on the Fruit Jam `TX`/`RX` pins (GPIO8/GPIO9), 115200 8N1.
+* `fruitjamctl` GPIO diagnostics for red LED, buttons, USB-host power enable,
+  and shared TLV320/ESP32-C6 reset while real kernel drivers are still pending.
+
+Build and flash:
 
 ```bash
-git clone https://github.com/Mr-Bossman/pi-pico2-linux
-
-cd pi-pico2-linux
-
 git submodule update --init
-
-# cd buildroot
-# make BR2_EXTERNAL=$PWD/../ raspberrypi-pico2_defconfig
-make -C buildroot BR2_EXTERNAL=$PWD/ raspberrypi-pico2_defconfig
-
+make -C buildroot BR2_EXTERNAL=$PWD adafruit_fruit_jam_rp2350_defconfig
 make -C buildroot
-
 picotool load -fu buildroot/output/images/flash-image.uf2
 ```
 
-## Designed to work with [SparkFun Pro Micro - RP2350](https://www.sparkfun.com/products/24870)
+If `picotool` was not available during the Buildroot post-image step, generate the
+UF2 manually:
 
-![Image of boot](images/booting.png)
+```bash
+picotool uf2 convert buildroot/output/images/flash-image.bin \
+  buildroot/output/images/flash-image.uf2 --family rp2350-riscv
+```
 
-#### NOTES on Atomics
-On page 307 of the RP2350 Datasheet MCAUSE register CODE 7 says:
-> Store/AMO access fault. A store/AMO failed a PMP check, or
-encountered a downstream bus error. Also set if an AMO is attempted on a
-region that does not support atomics (on RP2350, anything but SRAM).
+See [`board/adafruit/adafruit_fruit_jam_rp2350/README.md`](board/adafruit/adafruit_fruit_jam_rp2350/README.md)
+for board assumptions, serial wiring, expected boot log, and limitations. See
+[`docs/pinmap-fruitjam.md`](docs/pinmap-fruitjam.md), [`docs/risks.md`](docs/risks.md),
+and [`docs/milestones.md`](docs/milestones.md) for follow-on work.
 
-Atomics will only work in SRAM, the kernel is located PSRAM, not SRAM.
-The `lr` and `sr` atomic load and store will always return error in this region causing most code using them to behave incorrectly.
-Most implementations assume `lr` and `sr` will eventually succeed.
+## Raspberry Pi Pico 2 / SparkFun Pro Micro RP2350
 
-### Use on other boards
+The original target is still available:
 
-This only works on the RP2350 RISC-V cores.
+```bash
+git submodule update --init
+make -C buildroot BR2_EXTERNAL=$PWD raspberrypi-pico2_defconfig
+make -C buildroot
+picotool load -fu buildroot/output/images/flash-image.uf2
+```
 
-If you want to run this on other boards, please change the psram CS pin with the `RP2350_XIP_CSI_PIN` macro in `package/pico2-bootloader/bootloader/src/main.c`.
-As of now the only psram chip tested is the `APS6404L` and any others may not work.
+## Notes on RP2350 atomics
+
+RP2350 reports a Store/AMO access fault if RISC-V AMO/exclusive operations target a
+region that does not support atomics. External PSRAM is not normal cache-coherent RAM,
+but this port places the kernel in PSRAM. The existing patch stack includes RP2350
+workarounds for Linux atomics; do not remove those patches without a replacement and
+a hardware test plan.

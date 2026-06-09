@@ -1,5 +1,44 @@
 config BR2_PACKAGE_PICO2_BOOTLOADER
-	bool "raspberry pi pico 2 bootloader"
+	bool "RP2350 no-MMU Linux bootloader"
 	help
-		Custom bootloader for raspberry pi pico 2
-		to load linux.
+		Custom RP2350 RISC-V bootloader to initialize PSRAM and load Linux.
+
+if BR2_PACKAGE_PICO2_BOOTLOADER
+
+config BR2_PACKAGE_PICO2_BOOTLOADER_UART_INDEX
+	int "Bootloader UART index"
+	range 0 1
+	default 0
+	help
+		RP2350 UART peripheral used by the bootloader console.
+
+config BR2_PACKAGE_PICO2_BOOTLOADER_UART_TX_PIN
+	int "Bootloader UART TX GPIO"
+	default 0
+	help
+		GPIO pin muxed to UART TX before jumping to Linux.
+
+config BR2_PACKAGE_PICO2_BOOTLOADER_UART_RX_PIN
+	int "Bootloader UART RX GPIO"
+	default 1
+	help
+		GPIO pin muxed to UART RX before jumping to Linux.
+
+config BR2_PACKAGE_PICO2_BOOTLOADER_PSRAM_CS_PIN
+	int "PSRAM XIP CS1 GPIO"
+	default 19
+	help
+		GPIO used for the RP2350 QMI/XIP CS1 PSRAM chip select.
+
+config BR2_PACKAGE_PICO2_BOOTLOADER_LED_PIN
+	int "Boot diagnostic LED GPIO"
+	default 2
+	help
+		Optional GPIO toggled when the bootloader starts.
+
+config BR2_PACKAGE_PICO2_BOOTLOADER_LED_ACTIVE_LOW
+	bool "Boot diagnostic LED is active low"
+	help
+		Select this when driving the LED GPIO low turns the LED on.
+
+endif

@@ -11,5 +11,5 @@ else
 		${BINARIES_DIR}/flash-image.uf2 --family rp2350-riscv\` instead."
 fi
 tput smso 2>/dev/null
-echo "Run \`picotool load -fu ${BINARIES_DIR}/flash-image.uf2\` to flash to pi pico2."
+echo "Run \`picotool load -fu ${BINARIES_DIR}/flash-image.uf2\` to flash to Adafruit Fruit Jam RP2350."
 tput rmso 2>/dev/null

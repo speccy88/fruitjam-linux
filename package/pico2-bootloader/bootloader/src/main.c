@@ -27,8 +27,27 @@
 #include "string_local.h"
 #endif
 
-#define LED_PIN			2
-#define RP2350_XIP_CSI_PIN	19
+#ifndef PICO2_BOOTLOADER_LED_PIN
+#define PICO2_BOOTLOADER_LED_PIN		2
+#endif
+#ifndef PICO2_BOOTLOADER_PSRAM_CS_PIN
+#define PICO2_BOOTLOADER_PSRAM_CS_PIN	19
+#endif
+#ifndef PICO2_BOOTLOADER_UART_INDEX
+#define PICO2_BOOTLOADER_UART_INDEX	0
+#endif
+#ifndef PICO2_BOOTLOADER_UART_TX_PIN
+#define PICO2_BOOTLOADER_UART_TX_PIN	0
+#endif
+#ifndef PICO2_BOOTLOADER_UART_RX_PIN
+#define PICO2_BOOTLOADER_UART_RX_PIN	1
+#endif
+#ifndef PICO2_BOOTLOADER_LED_ACTIVE_LOW
+#define PICO2_BOOTLOADER_LED_ACTIVE_LOW	0
+#endif
+
+#define LED_PIN			PICO2_BOOTLOADER_LED_PIN
+#define RP2350_XIP_CSI_PIN	PICO2_BOOTLOADER_PSRAM_CS_PIN
 
 #define PSRAM_LOCATION (0x11000000U)
 
@@ -46,7 +65,7 @@ extern size_t __payload_load_start[];
 		((size) + (align) - 1) & ~((align) - 1);			\
 	})
 
-static inline void set_uart0_pinmux(void);
+static inline void set_uart_pinmux(void);
 static inline void set_xip_cs1_pinmux(void);
 
 static int wait_for_input(const char *msg);
@@ -83,16 +102,24 @@ int main(void) {
 
 	riscv_ticks_init(CLK_REF / MHZ);
 
+#if PICO2_BOOTLOADER_UART_INDEX == 0
 	set_reset(RESETS_UART0, 0);
+#else
+	set_reset(RESETS_UART1, 0);
+#endif
 
-	set_uart0_pinmux();
+	set_uart_pinmux();
 
 	set_config(LED_PIN, PADS_CLEAR);
 	set_pinfunc(LED_PIN, GPIO_FUNC_SIO);
 	uart_init();
 
 	SIO_BASE[0x38/4] = BIT(LED_PIN); // OE_SET
-	SIO_BASE[0x28/4] = BIT(LED_PIN); // OUT_XOR
+#if PICO2_BOOTLOADER_LED_ACTIVE_LOW
+	SIO_BASE[0x18/4] = BIT(LED_PIN); // OUT_CLR
+#else
+	SIO_BASE[0x14/4] = BIT(LED_PIN); // OUT_SET
+#endif
 #endif
 
 	puts("\n\n\nRP2350 Bootloader starting...\n");
@@ -148,11 +175,11 @@ exit:
 }
 
 #ifndef PICO_SDK
-static inline void set_uart0_pinmux(void) {
-	set_config(0, PADS_CLEAR); /* TX, PICO PIN 1 */
-	set_config(1, PADS_IE); /* RX, PICO PIN 2 */
-	set_pinfunc(0, GPIO_FUNC_UART); /* TX, PICO PIN 1 */
-	set_pinfunc(1, GPIO_FUNC_UART); /* RX, PICO PIN 2 */
+static inline void set_uart_pinmux(void) {
+	set_config(PICO2_BOOTLOADER_UART_TX_PIN, PADS_CLEAR);
+	set_config(PICO2_BOOTLOADER_UART_RX_PIN, PADS_IE);
+	set_pinfunc(PICO2_BOOTLOADER_UART_TX_PIN, GPIO_FUNC_UART);
+	set_pinfunc(PICO2_BOOTLOADER_UART_RX_PIN, GPIO_FUNC_UART);
 }
 
 static inline void set_xip_cs1_pinmux(void) {

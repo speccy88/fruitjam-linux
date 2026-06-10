@@ -1,8 +1,8 @@
 # Adafruit Fruit Jam RP2350B pin map
 
-This document records board wiring relevant to the no-MMU Linux port. Milestone A
-uses only PSRAM, flash, UART, and the boot LED; the remaining entries are planning
-notes for later milestones and are not implemented by the first PR.
+This document records board wiring relevant to the no-MMU Linux port. The current
+image uses PSRAM, flash, UART, USB CDC, GPIO diagnostics, and the onboard NeoPixels;
+the remaining entries are planning notes for later milestones.
 
 | Function | Fruit Jam / RP2350B GPIO | Linux milestone status | Notes |
 | --- | ---: | --- | --- |
@@ -15,7 +15,7 @@ notes for later milestones and are not implemented by the first PR.
 | Button 1 / BOOT | GPIO0 | `fruitjamctl` input diagnostic | Active-low button. Holding at reset enters ROM boot. |
 | Button 2 | GPIO4 | `fruitjamctl` input diagnostic | Active-low button. |
 | Button 3 | GPIO5 | `fruitjamctl` input diagnostic | Active-low button. |
-| NeoPixels | GPIO32 | Not implemented | Five onboard WS2812-style status NeoPixels; timing-sensitive, needs a PIO/second-core/kernel LED driver rather than `/dev/mem` bit-banging. |
+| NeoPixels | GPIO32 | `/dev/neopixels` | Five onboard WS2812-style status NeoPixels, driven by a PIO-backed misc driver. |
 | microSD SCK | GPIO34 | Not implemented | SPI-mode first; also SDIO clock. |
 | microSD MOSI / CMD | GPIO35 | Not implemented | SPI MOSI, SDIO command. |
 | microSD MISO / DAT0 | GPIO36 | Not implemented | SPI MISO, SDIO data0. |
@@ -30,9 +30,12 @@ notes for later milestones and are not implemented by the first PR.
 | USB host D+ | GPIO1 | Not implemented | Connected through the Fruit Jam USB host/hub path. |
 | USB host D- | GPIO2 | Not implemented | Connected through the Fruit Jam USB host/hub path. |
 | USB host 5V power | GPIO11 | `fruitjamctl` power switch only | Power-enable/control for USB host 5 V path; Linux USB host protocol driver is not implemented. |
-| ESP32-C6 SPI CS | GPIO46 | Not implemented | AirLift WiFi is out of first-PR scope. |
+| ESP32-C6 SPI SCK | GPIO30 | Not implemented | AirLift WiFi is SPI coprocessor work for a later milestone. |
+| ESP32-C6 SPI MOSI | GPIO31 | Not implemented | Shared board SPI MOSI. |
+| ESP32-C6 SPI MISO | GPIO28 | Not implemented | Shared board SPI MISO. |
+| ESP32-C6 SPI CS | GPIO46 | Not implemented | AirLift WiFi is SPI coprocessor work for a later milestone. |
 | ESP32-C6 IRQ | GPIO23 | Not implemented | Also shared as TLV320 DAC interrupt according to CircuitPython pin names. |
-| ESP32-C6 busy | GPIO3 | Not implemented | AirLift WiFi is out of first-PR scope. |
+| ESP32-C6 busy | GPIO3 | Not implemented | AirLift WiFi is SPI coprocessor work for a later milestone. |
 | Peripheral reset | GPIO22 | `fruitjamctl` reset line | Shared ESP32-C6/TLV320 reset. |
 | I2S DIN | GPIO24 | Not implemented | TLV320DAC3100 data input. |
 | I2S MCLK | GPIO25 | Not implemented | TLV320DAC3100 master clock. |

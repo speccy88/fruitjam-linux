@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 10 Jun 2026 00:00:00 -0400
+Subject: [PATCH] riscv: rp2350: add bootsel restart command
+
+Allow userspace to request the RP2350 USB BOOTSEL loader with the
+standard restart2 command string "bootsel". Linux marks the watchdog
+scratch register and resets through the watchdog; the first-stage
+bootloader then enters BOOTSEL from a clean runtime.
+---
+ arch/riscv/kernel/reset.c | 58 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/arch/riscv/kernel/reset.c b/arch/riscv/kernel/reset.c
+index f927fcefe6b0..80741b9baf26 100644
+--- a/arch/riscv/kernel/reset.c
++++ b/arch/riscv/kernel/reset.c
+@@ -4,7 +4,63 @@
+  */
+
+ #include <linux/reboot.h>
++#include <linux/io.h>
++#include <linux/string.h>
+ #include <linux/pm.h>
++
++#ifdef CONFIG_ARCH_RP2350
++#define RP2350_WATCHDOG_PHYS		0x400d8000
++#define RP2350_PSM_PHYS			0x4001a000
++#define RP2350_WATCHDOG_MMIO_SIZE	0x4000
++#define RP2350_PSM_MMIO_SIZE		0x1000
++
++#define RP2350_WATCHDOG_CTRL_REG	0
++#define RP2350_WATCHDOG_LOAD_REG	1
++#define RP2350_WATCHDOG_SCRATCH4_REG	7
++#define RP2350_WATCHDOG_CTRL_ENABLE	BIT(30)
++#define RP2350_WATCHDOG_CTRL_TRIGGER	BIT(31)
++#define RP2350_WATCHDOG_CTRL_PAUSE_MASK	(BIT(24) | BIT(25) | BIT(26))
++#define RP2350_WATCHDOG_RESCUE_MAGIC	0x6ab73121
++
++#define RP2350_PSM_WDSEL_REG		2
++#define RP2350_PSM_WDSEL_BITS		0x01ffffff
++#define RP2350_PSM_WDSEL_ROSC		BIT(2)
++#define RP2350_PSM_WDSEL_XOSC		BIT(3)
++
++static void rp2350_restart_bootsel(void)
++{
++	void __iomem *watchdog = ioremap(RP2350_WATCHDOG_PHYS,
++					 RP2350_WATCHDOG_MMIO_SIZE);
++	void __iomem *psm = ioremap(RP2350_PSM_PHYS, RP2350_PSM_MMIO_SIZE);
++
++	if (!watchdog || !psm)
++		goto spin;
++
++	/*
++	 * Ask the first-stage bootloader to enter BOOTSEL from a clean runtime.
++	 * Direct ROM calls from the live Linux kernel can leave USB half-alive.
++	 */
++	writel(RP2350_WATCHDOG_CTRL_ENABLE,
++	       watchdog + 0x3000 + RP2350_WATCHDOG_CTRL_REG * 4);
++	writel(RP2350_PSM_WDSEL_BITS &
++	       ~(RP2350_PSM_WDSEL_ROSC | RP2350_PSM_WDSEL_XOSC),
++	       psm + RP2350_PSM_WDSEL_REG * 4);
++	writel(RP2350_WATCHDOG_RESCUE_MAGIC,
++	       watchdog + RP2350_WATCHDOG_SCRATCH4_REG * 4);
++	writel(RP2350_WATCHDOG_CTRL_PAUSE_MASK,
++	       watchdog + RP2350_WATCHDOG_CTRL_REG * 4);
++	writel(RP2350_WATCHDOG_CTRL_TRIGGER,
++	       watchdog + 0x2000 + RP2350_WATCHDOG_CTRL_REG * 4);
++
++spin:
++	while (1)
++		;
++}
++#else
++static inline void rp2350_restart_bootsel(void)
++{
++}
++#endif
+
+ static void default_power_off(void)
+ {
+@@ -17,6 +73,8 @@
+
+ void machine_restart(char *cmd)
+ {
++	if (cmd && !strcmp(cmd, "bootsel"))
++		rp2350_restart_bootsel();
+ 	do_kernel_restart(cmd);
+ 	while (1);
+ }
+--
+2.49.0

@@ -1,11 +1,11 @@
 # Adafruit Fruit Jam RP2350B Buildroot port
 
-This board target is the first UART-only milestone for booting the Adafruit Fruit Jam
-(product 6200) on the RP2350B Hazard3 RISC-V core with no MMU. It is based on the
-existing RP2350 no-MMU Linux/Buildroot work in this tree and keeps the image small:
-RV32, single core, BusyBox, CramFS in flash, and an 8 MiB PSRAM kernel load address.
+This board target boots the Adafruit Fruit Jam (product 6200) on the RP2350B
+Hazard3 RISC-V core with no MMU. It is based on the existing RP2350 no-MMU
+Linux/Buildroot work in this tree and keeps the image small: RV32, single core,
+BusyBox, CramFS in flash, and an 8 MiB PSRAM kernel load address.
 
-## Board assumptions for Milestone A
+## Current hardware milestone
 
 * CPU mode: RP2350B Hazard3 RISC-V (`rp2350-riscv` UF2 family), not Cortex-M33.
 * External flash: 16 MiB XIP flash mapped at `0x10000000`.
@@ -16,9 +16,24 @@ RV32, single core, BusyBox, CramFS in flash, and an 8 MiB PSRAM kernel load addr
 * UART console: Fruit Jam `TX`/`RX` pins are GPIO8/GPIO9 using RP2350 UART1.
   Linux uses `earlycon=pl011,mmio32,0x40078000 console=ttyAMA0` with only this UART
   enabled in the Fruit Jam DT, so it is enumerated as `/dev/ttyAMA0`.
+* USB device console: the RP2350 USB device controller exposes a CDC ACM gadget
+  console as `/dev/ttyGS0`.
 * Boot diagnostic LED: red LED on GPIO29, active low. The bootloader drives it low
   during startup and Linux includes `fruitjamctl` for later LED/button/USB-power
   bring-up diagnostics.
+* NeoPixels: GPIO32 is driven by the `rp2350_neopixel` PIO driver and exposed as
+  `/dev/neopixels`.
+
+Validated on the Fruit Jam board:
+
+* Hardware UART shell/log path at 115200 8N1.
+* USB CDC shell on `/dev/cu.usbmodem1101` from macOS.
+* Berry installed at `/usr/bin/berry`.
+* `berry -e 'print("berry ok")'`.
+* Berry REPL expression evaluation.
+* `/root/neopixels.be` runs with `berry /root/neopixels.be` and lights the five
+  onboard NeoPixels.
+* BusyBox `vi` is enabled as `/bin/vi`.
 
 ## Build
 
@@ -49,7 +64,7 @@ Put the Fruit Jam into the RP2350 USB bootloader with the BOOT button, then flas
 picotool load -fu buildroot/output/images/flash-image.uf2
 ```
 
-## Serial console
+## Serial consoles
 
 Connect a 3.3 V UART adapter to the labeled Fruit Jam header pins:
 
@@ -61,6 +76,13 @@ Open the console at `115200 8N1`, no flow control. Example:
 
 ```sh
 picocom -b 115200 /dev/ttyUSB0
+```
+
+When the USB gadget is up, a second shell is available over CDC ACM. On the tested
+macOS host it enumerated as:
+
+```sh
+screen /dev/cu.usbmodem1101 115200
 ```
 
 ## Expected boot log
@@ -92,21 +114,49 @@ fruitjamctl led on
 fruitjamctl led off
 fruitjamctl usb-power on
 fruitjamctl periph-reset pulse
+fruitjamctl bootsel
 ```
 
 BusyBox init runs `fruitjamctl init` during boot to configure the three buttons
 with pull-ups, turn the red LED off after the bootloader handoff, deassert the
 shared TLV320/ESP32-C6 reset line, and enable USB host 5 V power. This does not
-make USB HID, I2S audio, HSTX DVI, or NeoPixels complete Linux drivers; it is a
-bring-up bridge so hardware validation can proceed over UART.
+make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
+bridge so hardware validation can proceed over UART and USB CDC.
+
+The `bootsel` command is experimental. It requests a restart into the RP2350 ROM
+BOOTSEL loader. Current testing shows it drops the USB CDC console, but it has not
+yet reliably re-enumerated as a `picotool` BOOTSEL device.
+
+## Berry and NeoPixels
+
+Berry is installed as `/usr/bin/berry` with expression execution, script execution,
+and REPL support:
+
+```sh
+berry -e 'print("hello fruit jam")'
+berry
+berry /root/neopixels.be
+```
+
+The NeoPixel driver exposes `/dev/neopixels` with a simple text command interface:
+
+```text
+clear
+fill R G B
+set INDEX R G B
+write
+test
+```
 
 ## Known limitations
 
-* UART console only. HSTX DVI output is not implemented.
+* HSTX DVI output is not implemented.
 * USB host 5 V power can be enabled by `fruitjamctl`, but USB host and USB
   keyboard input protocol support are not implemented.
 * microSD block support is not enabled or tested.
 * Buttons are readable through `fruitjamctl`; WiFi/AirLift, I2S audio, DVI, and
-  NeoPixels are not complete Linux drivers in this PR.
+  USB host input still need real Linux support.
+* Software BOOTSEL is not yet reliable enough to remove the physical BOOTSEL/reset
+  recovery path.
 * RP2350 atomics are only safe in internal SRAM; see `docs/risks.md` before moving
   lock-heavy structures or userspace runtimes into PSRAM.

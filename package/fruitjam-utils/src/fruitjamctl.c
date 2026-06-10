@@ -16,7 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#include <linux/reboot.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define BIT(n) (1u << (n))
@@ -77,6 +79,7 @@ static void usage(FILE *out)
 		"  init                  configure LED/buttons/reset/USB-power GPIOs\n"
 		"  status                print LED, button, reset, and USB-power state\n"
 		"  buttons               print button pressed/released state\n"
+		"  bootsel               reboot into the RP2350 BOOTSEL USB loader\n"
 		"  led on|off|toggle     control active-low red LED on GPIO29\n"
 		"  usb-power on|off      control USB host 5V power GPIO11\n"
 		"  periph-reset assert|deassert|pulse\n"
@@ -155,6 +158,13 @@ static void fruitjam_init(struct maps *maps)
 	gpio_output(maps, FRUITJAM_PERIPH_RESET_GPIO, 1);
 }
 
+static int reboot_bootsel(void)
+{
+	sync();
+	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
+}
+
 static void print_buttons(struct maps *maps)
 {
 	size_t i;
@@ -195,6 +205,14 @@ int main(int argc, char **argv)
 	if (argc < 2) {
 		usage(stderr);
 		return 2;
+	}
+
+	if (!strcmp(argv[1], "bootsel")) {
+		if (reboot_bootsel() < 0) {
+			fprintf(stderr, "fruitjamctl: reboot bootsel: %s\n", strerror(errno));
+			return 1;
+		}
+		return 1;
 	}
 
 	if (maps_open(&maps) < 0)

@@ -1,0 +1,1234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 9 Jun 2026 22:00:00 -0400
+Subject: [PATCH] usb: gadget: add RP2040/RP2350 full-speed UDC
+
+Add a small USB device-controller driver for the RP2040-style USBCTRL
+block used by RP2350.  The first supported target is CDC ACM gadget serial
+on the Adafruit Fruit Jam RP2350 Linux bring-up image, so the driver
+implements full-speed control, bulk, and interrupt endpoints and leaves
+isochronous support for later.
+
+The register programming model follows the Raspberry Pi Pico SDK/TinyUSB
+RP2040 DCD code, adapted to Linux's gadget UDC API.
+---
+ drivers/usb/gadget/udc/Kconfig      |   13 +
+ drivers/usb/gadget/udc/Makefile     |    1 +
+ drivers/usb/gadget/udc/rp2040_udc.c | 1036 +++++++++++++++++++++++++++
+ 3 files changed, 1018 insertions(+)
+ create mode 100644 drivers/usb/gadget/udc/rp2040_udc.c
+
+diff --git a/drivers/usb/gadget/udc/Kconfig b/drivers/usb/gadget/udc/Kconfig
+index 9d6c7861c1cc..4ac325564f33 100644
+--- a/drivers/usb/gadget/udc/Kconfig
++++ b/drivers/usb/gadget/udc/Kconfig
+@@ -429,0 +430,13 @@ config USB_GADGET_XILINX
++config USB_RP2040_UDC
++	tristate "Raspberry Pi RP2040/RP2350 USB device controller"
++	depends on HAS_IOMEM
++	help
++	  UDC driver for the full-speed USB device controller present in
++	  Raspberry Pi RP2040 and RP2350 microcontrollers.
++
++	  This driver currently supports control, bulk, and interrupt
++	  endpoints.  It is intended for early RP2350 no-MMU bring-up
++	  targets such as USB CDC ACM gadget serial.
++
++	  Say "y" to link the driver statically, or "m" to build a module
++	  named "rp2040_udc".
++
+diff --git a/drivers/usb/gadget/udc/Makefile b/drivers/usb/gadget/udc/Makefile
+index 39d35d02c5c8..ebbc608e1db5 100644
+--- a/drivers/usb/gadget/udc/Makefile
++++ b/drivers/usb/gadget/udc/Makefile
+@@ -40,0 +41,1 @@ obj-$(CONFIG_USB_GADGET_XILINX)	+= udc-xilinx.o
++obj-$(CONFIG_USB_RP2040_UDC)	+= rp2040_udc.o
+diff --git a/drivers/usb/gadget/udc/rp2040_udc.c b/drivers/usb/gadget/udc/rp2040_udc.c
+new file mode 100644
+index 000000000000..50fc8af4bd16
+--- /dev/null
++++ b/drivers/usb/gadget/udc/rp2040_udc.c
+@@ -0,0 +1,1180 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Raspberry Pi RP2040/RP2350 USB device controller driver.
++ *
++ * Copyright (c) 2026
++ *
++ * The hardware programming sequence is based on the Raspberry Pi Pico SDK
++ * and TinyUSB RP2040 device-controller backend:
++ * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
++ * Copyright (c) 2021 Ha Thach (tinyusb.org)
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/usb/ch9.h>
++#include <linux/usb/gadget.h>
++#include <linux/unaligned.h>
++
++#define DRIVER_NAME			"rp2040-udc"
++
++#define RP2040_MAX_ENDPOINTS		16
++#define RP2040_MAX_NON_CONTROL_EPS	((RP2040_MAX_ENDPOINTS - 1) * 2)
++#define RP2040_EP0_SIZE			64
++#define RP2040_DPRAM_SIZE		4096
++#define RP2040_DPRAM_EPX_DATA		0x180
++#define RP2040_EPX_BUF_SIZE		64
++
++#define RP2040_USB_ADDR_ENDP		0x000
++#define RP2040_USB_MAIN_CTRL		0x040
++#define RP2040_USB_SOF_RD		0x048
++#define RP2040_USB_SIE_CTRL		0x04c
++#define RP2040_USB_SIE_STATUS		0x050
++#define RP2040_USB_BUFF_STATUS		0x058
++#define RP2040_USB_EP_ABORT		0x060
++#define RP2040_USB_EP_ABORT_DONE	0x064
++#define RP2040_USB_EP_STALL_ARM		0x068
++#define RP2040_USB_MUXING		0x074
++#define RP2040_USB_PWR			0x078
++#define RP2040_USBPHY_DIRECT		0x07c
++#define RP2040_USBPHY_DIRECT_OVERRIDE	0x080
++#define RP2040_USB_INTE			0x090
++#define RP2040_USB_INTS			0x098
++
++#define RP2040_RESETS_RESET		0x000
++#define RP2040_RESETS_RESET_DONE	0x008
++#define RESETS_RESET_USBCTRL		BIT(28)
++
++#define MAIN_CTRL_CONTROLLER_EN		BIT(0)
++
++#define SIE_CTRL_PULLUP_EN		BIT(16)
++#define SIE_CTRL_EP0_INT_1BUF		BIT(29)
++
++#define SIE_STATUS_VBUS_DETECTED	BIT(0)
++#define SIE_STATUS_RESUME		BIT(11)
++#define SIE_STATUS_SETUP_REC		BIT(17)
++#define SIE_STATUS_BUS_RESET		BIT(19)
++#define SIE_STATUS_CONNECTED		BIT(16)
++#define SIE_STATUS_SUSPENDED		BIT(4)
++
++#define MUXING_TO_PHY			BIT(0)
++#define MUXING_SOFTCON			BIT(3)
++
++#define PWR_VBUS_DETECT			BIT(2)
++#define PWR_VBUS_DETECT_OVERRIDE_EN	BIT(3)
++
++#define USBPHY_DIRECT_DP_PULLUP_EN	BIT(1)
++#define USBPHY_DIRECT_OVERRIDE_DP_PULLUP_EN_OVERRIDE_EN	BIT(2)
++
++#define USB_INT_BUS_RESET		BIT(12)
++#define USB_INT_DEV_CONN_DIS		BIT(13)
++#define USB_INT_DEV_SUSPEND		BIT(14)
++#define USB_INT_DEV_RESUME_FROM_HOST	BIT(15)
++#define USB_INT_SETUP_REQ		BIT(16)
++#define USB_INT_BUFF_STATUS		BIT(4)
++
++#define EP_CTRL_ENABLE			BIT(31)
++#define EP_CTRL_INTERRUPT_PER_BUFFER	BIT(29)
++#define EP_CTRL_BUFFER_TYPE_SHIFT	26
++#define EP_CTRL_BUFFER_TYPE_MASK	GENMASK(27, 26)
++
++#define BUF_CTRL_LEN_MASK		GENMASK(9, 0)
++#define BUF_CTRL_AVAIL			BIT(10)
++#define BUF_CTRL_STALL			BIT(11)
++#define BUF_CTRL_DATA1_PID		BIT(13)
++#define BUF_CTRL_LAST			BIT(14)
++#define BUF_CTRL_FULL			BIT(15)
++
++#define XFER_CONTROL			0
++#define XFER_ISOC			1
++#define XFER_BULK			2
++#define XFER_INTERRUPT			3
++
++struct rp2040_udc;
++
++struct rp2040_request {
++	struct usb_request	req;
++	struct list_head	queue;
++	bool			needs_zlp;
++};
++
++struct rp2040_ep {
++	struct usb_ep		ep;
++	struct rp2040_udc	*udc;
++	struct list_head	queue;
++	const struct usb_endpoint_descriptor *desc;
++	char			name[20];
++	u8			num;
++	bool			in;
++	bool			enabled;
++	bool			halted;
++	bool			active;
++	bool			next_pid;
++	u16			maxpacket;
++	u8			xfer_type;
++	u16			buf_offset;
++};
++
++struct rp2040_udc {
++	struct device		*dev;
++	void __iomem		*regs;
++	void __iomem		*dpram;
++	void __iomem		*resets;
++	int			irq;
++
++	spinlock_t		lock;
++	struct usb_gadget	gadget;
++	struct usb_gadget_driver *driver;
++
++	struct rp2040_ep	ep0;
++	struct rp2040_ep	eps[RP2040_MAX_NON_CONTROL_EPS];
++	u16			next_buf;
++
++	bool			pullup;
++	bool			connected;
++	bool			ep0_in;
++	bool			ep0_status_pending;
++	bool			ep0_internal_data;
++	bool			pending_addr_valid;
++	u8			pending_addr;
++	u8			ep0_scratch[RP2040_EP0_SIZE];
++};
++
++static inline struct rp2040_udc *gadget_to_rp2040(struct usb_gadget *gadget)
++{
++	return container_of(gadget, struct rp2040_udc, gadget);
++}
++
++static inline struct rp2040_ep *usb_ep_to_rp2040(struct usb_ep *ep)
++{
++	return container_of(ep, struct rp2040_ep, ep);
++}
++
++static inline struct rp2040_request *req_to_rp2040(struct usb_request *req)
++{
++	return container_of(req, struct rp2040_request, req);
++}
++
++static inline u32 rp2040_read(struct rp2040_udc *udc, u32 reg)
++{
++	return readl(udc->regs + reg);
++}
++
++static inline void rp2040_write(struct rp2040_udc *udc, u32 reg, u32 val)
++{
++	writel(val, udc->regs + reg);
++}
++
++static inline void rp2040_set_bits(struct rp2040_udc *udc, u32 reg, u32 bits)
++{
++	rp2040_write(udc, reg, rp2040_read(udc, reg) | bits);
++}
++
++static inline void rp2040_clear_bits(struct rp2040_udc *udc, u32 reg, u32 bits)
++{
++	rp2040_write(udc, reg, rp2040_read(udc, reg) & ~bits);
++}
++
++static void rp2040_log_state(struct rp2040_udc *udc, const char *tag)
++{
++	dev_dbg(udc->dev,
++		 "%s: main=%08x sie_ctrl=%08x sie_status=%08x ints=%08x inte=%08x buff_status=%08x mux=%08x pwr=%08x phy=%08x phy_ovr=%08x\n",
++		 tag,
++		 rp2040_read(udc, RP2040_USB_MAIN_CTRL),
++		 rp2040_read(udc, RP2040_USB_SIE_CTRL),
++		 rp2040_read(udc, RP2040_USB_SIE_STATUS),
++		 rp2040_read(udc, RP2040_USB_INTS),
++		 rp2040_read(udc, RP2040_USB_INTE),
++		 rp2040_read(udc, RP2040_USB_BUFF_STATUS),
++		 rp2040_read(udc, RP2040_USB_MUXING),
++		 rp2040_read(udc, RP2040_USB_PWR),
++		 rp2040_read(udc, RP2040_USBPHY_DIRECT),
++		 rp2040_read(udc, RP2040_USBPHY_DIRECT_OVERRIDE));
++}
++
++static inline u32 rp2040_ep_ctrl_off(u8 ep, bool in)
++{
++	return 0x08 + ((ep - 1) * 8) + (in ? 0 : 4);
++}
++
++static inline u32 rp2040_buf_ctrl_off(u8 ep, bool in)
++{
++	return 0x80 + (ep * 8) + (in ? 0 : 4);
++}
++
++static inline void rp2040_dpram_write(struct rp2040_udc *udc, u32 off, u32 val)
++{
++	writel(val, udc->dpram + off);
++}
++
++static inline u32 rp2040_dpram_read(struct rp2040_udc *udc, u32 off)
++{
++	return readl(udc->dpram + off);
++}
++
++static inline u32 rp2040_buf_bit(u8 ep, bool in)
++{
++	return BIT((ep * 2) + (in ? 0 : 1));
++}
++
++static inline u32 rp2040_buf_offset(struct rp2040_ep *ep)
++{
++	return ep->num ? ep->buf_offset : 0x100;
++}
++
++static inline struct rp2040_ep *rp2040_find_ep(struct rp2040_udc *udc,
++					       u8 ep, bool in)
++{
++	int i;
++
++	if (ep == 0)
++		return &udc->ep0;
++
++	for (i = 0; i < RP2040_MAX_NON_CONTROL_EPS; i++) {
++		if (udc->eps[i].num == ep && udc->eps[i].in == in)
++			return &udc->eps[i];
++	}
++
++	return NULL;
++}
++
++static inline u8 rp2040_ep_dir_in(struct rp2040_ep *ep)
++{
++	if (ep->num == 0)
++		return ep->udc->ep0_in;
++
++	return ep->in;
++}
++
++static void rp2040_ep_reset_state(struct rp2040_ep *ep)
++{
++	ep->active = false;
++	ep->halted = false;
++	ep->next_pid = ep->num == 0;
++}
++
++static void rp2040_complete_request(struct rp2040_ep *ep,
++				    struct rp2040_request *req, int status)
++{
++	struct rp2040_udc *udc = ep->udc;
++
++	list_del_init(&req->queue);
++	req->req.status = status;
++	ep->active = false;
++
++	spin_unlock(&udc->lock);
++	usb_gadget_giveback_request(&ep->ep, &req->req);
++	spin_lock(&udc->lock);
++}
++
++static void rp2040_nuke(struct rp2040_ep *ep, int status)
++{
++	struct rp2040_request *req;
++
++	while (!list_empty(&ep->queue)) {
++		req = list_first_entry(&ep->queue, struct rp2040_request, queue);
++		rp2040_complete_request(ep, req, status);
++	}
++
++	ep->active = false;
++}
++
++static void rp2040_ep_hw_disable(struct rp2040_ep *ep)
++{
++	struct rp2040_udc *udc = ep->udc;
++	bool in = rp2040_ep_dir_in(ep);
++	u32 bit = rp2040_buf_bit(ep->num, in);
++	u32 tmp;
++
++	if (ep->num) {
++		rp2040_dpram_write(udc, rp2040_ep_ctrl_off(ep->num, in), 0);
++		rp2040_set_bits(udc, RP2040_USB_EP_ABORT, bit);
++		readl_poll_timeout_atomic(udc->regs + RP2040_USB_EP_ABORT_DONE,
++					  tmp, tmp & bit,
++					  1, 1000);
++		rp2040_clear_bits(udc, RP2040_USB_EP_ABORT, bit);
++		rp2040_write(udc, RP2040_USB_EP_ABORT_DONE, bit);
++	}
++
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(ep->num, in), 0);
++}
++
++static void rp2040_prime_ep(struct rp2040_ep *ep)
++{
++	struct rp2040_udc *udc = ep->udc;
++	struct rp2040_request *req;
++	struct usb_request *usb_req;
++	u8 *buf;
++	bool in = rp2040_ep_dir_in(ep);
++	u32 ctrl;
++	u32 len;
++	u32 off;
++	u32 remaining;
++
++	if (ep->active || ep->halted || list_empty(&ep->queue))
++		return;
++
++	req = list_first_entry(&ep->queue, struct rp2040_request, queue);
++	usb_req = &req->req;
++	remaining = usb_req->length - usb_req->actual;
++	len = min_t(u32, remaining, ep->ep.maxpacket);
++
++	if (!remaining && !req->needs_zlp && usb_req->length)
++		return;
++
++	if (!remaining && req->needs_zlp) {
++		len = 0;
++		req->needs_zlp = false;
++	}
++
++	off = rp2040_buf_offset(ep);
++	buf = usb_req->buf + usb_req->actual;
++
++	ctrl = len | BUF_CTRL_AVAIL | BUF_CTRL_LAST;
++	if (ep->next_pid)
++		ctrl |= BUF_CTRL_DATA1_PID;
++	ep->next_pid = !ep->next_pid;
++
++	if (in) {
++		if (len)
++			memcpy_toio(udc->dpram + off, buf, len);
++		ctrl |= BUF_CTRL_FULL;
++	}
++
++	ep->active = true;
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(ep->num, in), ctrl);
++	if (ep->num == 0)
++		dev_dbg(udc->dev,
++			 "ep0 prime %s len=%u actual=%u total=%u ctrl=%08x\n",
++			 in ? "in" : "out", len, usb_req->actual,
++			 usb_req->length, ctrl);
++}
++
++static void rp2040_ep0_prime_internal(struct rp2040_udc *udc, const void *buf,
++				      u16 len)
++{
++	u32 ctrl = len | BUF_CTRL_AVAIL | BUF_CTRL_LAST | BUF_CTRL_FULL;
++
++	if (len)
++		memcpy_toio(udc->dpram + 0x100, buf, len);
++
++	ctrl |= BUF_CTRL_DATA1_PID;
++	udc->ep0_in = true;
++	udc->ep0.active = true;
++	udc->ep0_internal_data = true;
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(0, true), ctrl);
++	dev_dbg(udc->dev, "ep0 internal in len=%u ctrl=%08x\n", len, ctrl);
++}
++
++static void rp2040_ep0_prime_status(struct rp2040_udc *udc, bool in)
++{
++	u32 ctrl = BUF_CTRL_AVAIL | BUF_CTRL_LAST | BUF_CTRL_DATA1_PID;
++
++	if (in)
++		ctrl |= BUF_CTRL_FULL;
++
++	udc->ep0_in = in;
++	udc->ep0.active = true;
++	udc->ep0_status_pending = true;
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(0, in), ctrl);
++	dev_dbg(udc->dev, "ep0 status %s ctrl=%08x\n",
++		 in ? "in" : "out", ctrl);
++}
++
++static void rp2040_ep0_stall(struct rp2040_udc *udc)
++{
++	u32 bit = udc->ep0_in ? BIT(0) : BIT(1);
++
++	rp2040_write(udc, RP2040_USB_EP_STALL_ARM, bit);
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(0, udc->ep0_in),
++			   BUF_CTRL_STALL);
++}
++
++static int rp2040_ep_enable(struct usb_ep *usb_ep,
++			    const struct usb_endpoint_descriptor *desc)
++{
++	struct rp2040_ep *ep = usb_ep_to_rp2040(usb_ep);
++	struct rp2040_udc *udc = ep->udc;
++	unsigned long flags;
++	u8 type;
++	u32 ctrl;
++	int ret = 0;
++
++	if (!usb_ep || !desc || ep->num == 0)
++		return -EINVAL;
++
++	if (usb_endpoint_num(desc) != ep->num ||
++	    usb_endpoint_dir_in(desc) != ep->in)
++		return -EINVAL;
++
++	if (usb_endpoint_xfer_isoc(desc))
++		return -EOPNOTSUPP;
++
++	spin_lock_irqsave(&udc->lock, flags);
++
++	if (ep->enabled) {
++		ret = -EBUSY;
++		goto out;
++	}
++
++	type = usb_endpoint_type(desc);
++	ep->desc = desc;
++	ep->xfer_type = type;
++	ep->ep.maxpacket = usb_endpoint_maxp(desc);
++	ep->enabled = true;
++	ep->halted = false;
++	ep->active = false;
++	ep->next_pid = false;
++
++	ctrl = EP_CTRL_ENABLE | EP_CTRL_INTERRUPT_PER_BUFFER |
++	       FIELD_PREP(EP_CTRL_BUFFER_TYPE_MASK, type) | ep->buf_offset;
++	rp2040_dpram_write(udc, rp2040_ep_ctrl_off(ep->num, ep->in), ctrl);
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(ep->num, ep->in), 0);
++
++out:
++	spin_unlock_irqrestore(&udc->lock, flags);
++	return ret;
++}
++
++static int rp2040_ep_disable(struct usb_ep *usb_ep)
++{
++	struct rp2040_ep *ep = usb_ep_to_rp2040(usb_ep);
++	struct rp2040_udc *udc = ep->udc;
++	unsigned long flags;
++
++	if (!usb_ep || ep->num == 0)
++		return -EINVAL;
++
++	spin_lock_irqsave(&udc->lock, flags);
++	rp2040_nuke(ep, -ESHUTDOWN);
++	rp2040_ep_hw_disable(ep);
++	ep->enabled = false;
++	ep->desc = NULL;
++	ep->ep.maxpacket = RP2040_EPX_BUF_SIZE;
++	rp2040_ep_reset_state(ep);
++	spin_unlock_irqrestore(&udc->lock, flags);
++
++	return 0;
++}
++
++static struct usb_request *rp2040_ep_alloc_request(struct usb_ep *usb_ep,
++						   gfp_t gfp_flags)
++{
++	struct rp2040_request *req;
++
++	req = kzalloc(sizeof(*req), gfp_flags);
++	if (!req)
++		return NULL;
++
++	INIT_LIST_HEAD(&req->queue);
++	return &req->req;
++}
++
++static void rp2040_ep_free_request(struct usb_ep *usb_ep,
++				   struct usb_request *usb_req)
++{
++	kfree(req_to_rp2040(usb_req));
++}
++
++static int rp2040_ep_queue(struct usb_ep *usb_ep, struct usb_request *usb_req,
++			   gfp_t gfp_flags)
++{
++	struct rp2040_ep *ep = usb_ep_to_rp2040(usb_ep);
++	struct rp2040_udc *udc = ep->udc;
++	struct rp2040_request *req;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!usb_ep || !usb_req || !usb_req->complete || !usb_req->buf)
++		return -EINVAL;
++
++	if (ep->num && !ep->enabled)
++		return -ESHUTDOWN;
++
++	req = req_to_rp2040(usb_req);
++
++	spin_lock_irqsave(&udc->lock, flags);
++
++	if (!udc->driver) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
++
++	usb_req->status = -EINPROGRESS;
++	usb_req->actual = 0;
++	req->needs_zlp = usb_req->zero && usb_req->length &&
++			 !(usb_req->length % ep->ep.maxpacket);
++	list_add_tail(&req->queue, &ep->queue);
++
++	rp2040_prime_ep(ep);
++
++out:
++	spin_unlock_irqrestore(&udc->lock, flags);
++	return ret;
++}
++
++static int rp2040_ep_dequeue(struct usb_ep *usb_ep, struct usb_request *usb_req)
++{
++	struct rp2040_ep *ep = usb_ep_to_rp2040(usb_ep);
++	struct rp2040_udc *udc = ep->udc;
++	struct rp2040_request *req;
++	unsigned long flags;
++	int ret = -EINVAL;
++
++	spin_lock_irqsave(&udc->lock, flags);
++	list_for_each_entry(req, &ep->queue, queue) {
++		if (&req->req == usb_req) {
++			rp2040_complete_request(ep, req, -ECONNRESET);
++			ret = 0;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&udc->lock, flags);
++
++	return ret;
++}
++
++static int rp2040_ep_set_halt(struct usb_ep *usb_ep, int value)
++{
++	struct rp2040_ep *ep = usb_ep_to_rp2040(usb_ep);
++	struct rp2040_udc *udc = ep->udc;
++	unsigned long flags;
++	bool in;
++	u32 off;
++
++	spin_lock_irqsave(&udc->lock, flags);
++
++	if (value && ep->active) {
++		spin_unlock_irqrestore(&udc->lock, flags);
++		return -EAGAIN;
++	}
++
++	in = rp2040_ep_dir_in(ep);
++	off = rp2040_buf_ctrl_off(ep->num, in);
++
++	if (value) {
++		ep->halted = true;
++		if (ep->num == 0)
++			rp2040_write(udc, RP2040_USB_EP_STALL_ARM,
++				     in ? BIT(0) : BIT(1));
++		rp2040_dpram_write(udc, off, BUF_CTRL_STALL);
++	} else {
++		ep->halted = false;
++		ep->next_pid = false;
++		rp2040_dpram_write(udc, off, 0);
++		rp2040_prime_ep(ep);
++	}
++
++	spin_unlock_irqrestore(&udc->lock, flags);
++	return 0;
++}
++
++static int rp2040_ep_set_wedge(struct usb_ep *usb_ep)
++{
++	return rp2040_ep_set_halt(usb_ep, 1);
++}
++
++static int rp2040_ep_fifo_status(struct usb_ep *usb_ep)
++{
++	return 0;
++}
++
++static void rp2040_ep_fifo_flush(struct usb_ep *usb_ep)
++{
++	struct rp2040_ep *ep = usb_ep_to_rp2040(usb_ep);
++	struct rp2040_udc *udc = ep->udc;
++	unsigned long flags;
++
++	spin_lock_irqsave(&udc->lock, flags);
++	rp2040_ep_hw_disable(ep);
++	if (ep->num && ep->enabled) {
++		u32 ctrl = EP_CTRL_ENABLE | EP_CTRL_INTERRUPT_PER_BUFFER |
++			   FIELD_PREP(EP_CTRL_BUFFER_TYPE_MASK, ep->xfer_type) |
++			   ep->buf_offset;
++
++		rp2040_dpram_write(udc, rp2040_ep_ctrl_off(ep->num, ep->in),
++				   ctrl);
++	}
++	spin_unlock_irqrestore(&udc->lock, flags);
++}
++
++static const struct usb_ep_ops rp2040_ep_ops = {
++	.enable		= rp2040_ep_enable,
++	.disable	= rp2040_ep_disable,
++	.alloc_request	= rp2040_ep_alloc_request,
++	.free_request	= rp2040_ep_free_request,
++	.queue		= rp2040_ep_queue,
++	.dequeue	= rp2040_ep_dequeue,
++	.set_halt	= rp2040_ep_set_halt,
++	.set_wedge	= rp2040_ep_set_wedge,
++	.fifo_status	= rp2040_ep_fifo_status,
++	.fifo_flush	= rp2040_ep_fifo_flush,
++};
++
++static void rp2040_handle_ep_complete(struct rp2040_ep *ep)
++{
++	struct rp2040_udc *udc = ep->udc;
++	struct rp2040_request *req;
++	struct usb_request *usb_req;
++	bool in = rp2040_ep_dir_in(ep);
++	u32 ctrl;
++	u32 len;
++	u32 off;
++	bool done = false;
++
++	if (ep->num == 0 && udc->ep0_status_pending) {
++		udc->ep0_status_pending = false;
++		ep->active = false;
++		rp2040_dpram_write(udc, rp2040_buf_ctrl_off(0, in), 0);
++		if (udc->pending_addr_valid) {
++			rp2040_write(udc, RP2040_USB_ADDR_ENDP,
++				     udc->pending_addr);
++			udc->pending_addr_valid = false;
++			udc->pending_addr = 0;
++		}
++		return;
++	}
++
++	if (ep->num == 0 && udc->ep0_internal_data) {
++		udc->ep0_internal_data = false;
++		ep->active = false;
++		rp2040_dpram_write(udc, rp2040_buf_ctrl_off(0, in), 0);
++		rp2040_ep0_prime_status(udc, false);
++		return;
++	}
++
++	if (list_empty(&ep->queue)) {
++		ep->active = false;
++		return;
++	}
++
++	req = list_first_entry(&ep->queue, struct rp2040_request, queue);
++	usb_req = &req->req;
++	off = rp2040_buf_offset(ep);
++	ctrl = rp2040_dpram_read(udc, rp2040_buf_ctrl_off(ep->num, in));
++	len = FIELD_GET(BUF_CTRL_LEN_MASK, ctrl);
++	if (ep->num == 0)
++		dev_dbg(udc->dev,
++			 "ep0 complete %s len=%u actual=%u total=%u ctrl=%08x status_pending=%d\n",
++			 in ? "in" : "out", len, usb_req->actual,
++			 usb_req->length, ctrl, udc->ep0_status_pending);
++
++	if (in) {
++		usb_req->actual += len;
++		if (usb_req->actual >= usb_req->length) {
++			if (!req->needs_zlp)
++				done = true;
++		}
++	} else {
++		if (len) {
++			memcpy_fromio(usb_req->buf + usb_req->actual,
++				      udc->dpram + off, len);
++			usb_req->actual += len;
++		}
++
++		if (len < ep->ep.maxpacket || usb_req->actual >= usb_req->length)
++			done = true;
++	}
++
++	ep->active = false;
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(ep->num, in), 0);
++
++	if (done)
++		rp2040_complete_request(ep, req, 0);
++
++	if (ep->num == 0 && done) {
++		rp2040_ep0_prime_status(udc, !in);
++		return;
++	}
++
++	rp2040_prime_ep(ep);
++}
++
++static int rp2040_ep0_get_status(struct rp2040_udc *udc,
++				 const struct usb_ctrlrequest *ctrl)
++{
++	u16 status = 0;
++	u16 index = le16_to_cpu(ctrl->wIndex);
++	struct rp2040_ep *ep;
++
++	if (le16_to_cpu(ctrl->wLength) != 2)
++		return -EINVAL;
++
++	switch (ctrl->bRequestType & USB_RECIP_MASK) {
++	case USB_RECIP_DEVICE:
++		if (udc->gadget.is_selfpowered)
++			status |= BIT(USB_DEVICE_SELF_POWERED);
++		break;
++	case USB_RECIP_INTERFACE:
++		break;
++	case USB_RECIP_ENDPOINT:
++		ep = rp2040_find_ep(udc, index & USB_ENDPOINT_NUMBER_MASK,
++				    !!(index & USB_DIR_IN));
++		if (!ep)
++			return -EINVAL;
++		if (ep->halted)
++			status |= BIT(0);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	put_unaligned_le16(status, udc->ep0_scratch);
++	rp2040_ep0_prime_internal(udc, udc->ep0_scratch, 2);
++
++	return 0;
++}
++
++static void rp2040_reset_non_control_eps(struct rp2040_udc *udc)
++{
++	int i;
++
++	for (i = 0; i < RP2040_MAX_NON_CONTROL_EPS; i++) {
++		struct rp2040_ep *ep = &udc->eps[i];
++
++		rp2040_nuke(ep, -ECONNRESET);
++		rp2040_dpram_write(udc, rp2040_ep_ctrl_off(ep->num, ep->in), 0);
++		rp2040_dpram_write(udc, rp2040_buf_ctrl_off(ep->num, ep->in), 0);
++		ep->enabled = false;
++		ep->desc = NULL;
++		ep->ep.maxpacket = RP2040_EPX_BUF_SIZE;
++		rp2040_ep_reset_state(ep);
++	}
++}
++
++static void rp2040_reset_ep0(struct rp2040_udc *udc)
++{
++	rp2040_nuke(&udc->ep0, -ECONNRESET);
++	udc->ep0_in = true;
++	udc->ep0_status_pending = false;
++	udc->ep0_internal_data = false;
++	udc->pending_addr_valid = false;
++	udc->pending_addr = 0;
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(0, true), 0);
++	rp2040_dpram_write(udc, rp2040_buf_ctrl_off(0, false), 0);
++	udc->ep0.next_pid = true;
++	udc->ep0.active = false;
++}
++
++static void rp2040_handle_setup(struct rp2040_udc *udc)
++{
++	struct usb_ctrlrequest ctrl;
++	u16 value = 0;
++	int ret = -EOPNOTSUPP;
++
++	memcpy_fromio(&ctrl, udc->dpram, sizeof(ctrl));
++	value = le16_to_cpu(ctrl.wValue);
++	dev_dbg(udc->dev,
++		 "setup reqtype=%02x req=%02x value=%04x index=%04x len=%04x\n",
++		 ctrl.bRequestType, ctrl.bRequest, value,
++		 le16_to_cpu(ctrl.wIndex), le16_to_cpu(ctrl.wLength));
++
++	rp2040_reset_ep0(udc);
++	udc->ep0_in = !!(ctrl.bRequestType & USB_DIR_IN);
++	if (!ctrl.wLength)
++		udc->ep0_in = true;
++
++	if ((ctrl.bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD) {
++		switch (ctrl.bRequest) {
++		case USB_REQ_SET_ADDRESS:
++			if (ctrl.bRequestType != (USB_TYPE_STANDARD | USB_RECIP_DEVICE) ||
++			    value > 127)
++				goto stall;
++			udc->pending_addr = value;
++			udc->pending_addr_valid = true;
++			rp2040_ep0_prime_status(udc, true);
++			return;
++		case USB_REQ_GET_STATUS:
++			ret = rp2040_ep0_get_status(udc, &ctrl);
++			if (!ret)
++				return;
++			break;
++		default:
++			break;
++		}
++	}
++
++	if (!udc->driver || !udc->driver->setup)
++		goto stall;
++
++	spin_unlock(&udc->lock);
++	ret = udc->driver->setup(&udc->gadget, &ctrl);
++	spin_lock(&udc->lock);
++	dev_dbg(udc->dev, "setup driver ret=%d\n", ret);
++
++	if (ret > 0)
++		return;
++
++	if (!ret) {
++		if (!ctrl.wLength && !udc->ep0.active &&
++		    list_empty(&udc->ep0.queue))
++			rp2040_ep0_prime_status(udc, true);
++		return;
++	}
++
++stall:
++	rp2040_ep0_stall(udc);
++}
++
++static irqreturn_t rp2040_irq(int irq, void *data)
++{
++	struct rp2040_udc *udc = data;
++	u32 status;
++	u32 handled = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&udc->lock, flags);
++
++	status = rp2040_read(udc, RP2040_USB_INTS);
++	if (!status) {
++		spin_unlock_irqrestore(&udc->lock, flags);
++		return IRQ_NONE;
++	}
++
++	if (status & USB_INT_BUFF_STATUS) {
++		u32 remaining = rp2040_read(udc, RP2040_USB_BUFF_STATUS);
++		u32 bit;
++		int epnum;
++		struct rp2040_ep *ep;
++
++		handled |= USB_INT_BUFF_STATUS;
++
++		while (remaining) {
++			bit = remaining & -remaining;
++			epnum = __ffs(bit) / 2;
++			rp2040_write(udc, RP2040_USB_BUFF_STATUS, bit);
++			ep = rp2040_find_ep(udc, epnum, !(__ffs(bit) & 1));
++			if (ep)
++				rp2040_handle_ep_complete(ep);
++			remaining &= ~bit;
++		}
++	}
++
++	if (status & USB_INT_SETUP_REQ) {
++		handled |= USB_INT_SETUP_REQ;
++		rp2040_log_state(udc, "setup");
++		rp2040_handle_setup(udc);
++		rp2040_write(udc, RP2040_USB_SIE_STATUS, SIE_STATUS_SETUP_REC);
++	}
++
++	if (status & USB_INT_BUS_RESET) {
++		handled |= USB_INT_BUS_RESET;
++		rp2040_log_state(udc, "bus-reset");
++		rp2040_write(udc, RP2040_USB_ADDR_ENDP, 0);
++		udc->gadget.speed = USB_SPEED_FULL;
++		usb_gadget_set_state(&udc->gadget, USB_STATE_DEFAULT);
++		rp2040_reset_ep0(udc);
++		rp2040_reset_non_control_eps(udc);
++		rp2040_write(udc, RP2040_USB_SIE_STATUS, SIE_STATUS_BUS_RESET);
++	}
++
++	if (status & USB_INT_DEV_SUSPEND) {
++		handled |= USB_INT_DEV_SUSPEND;
++		usb_gadget_set_state(&udc->gadget, USB_STATE_SUSPENDED);
++		rp2040_write(udc, RP2040_USB_SIE_STATUS, SIE_STATUS_SUSPENDED);
++	}
++
++	if (status & USB_INT_DEV_RESUME_FROM_HOST) {
++		handled |= USB_INT_DEV_RESUME_FROM_HOST;
++		if (udc->gadget.state == USB_STATE_SUSPENDED)
++			usb_gadget_set_state(&udc->gadget, USB_STATE_CONFIGURED);
++		rp2040_write(udc, RP2040_USB_SIE_STATUS, SIE_STATUS_RESUME);
++	}
++
++	if (status & USB_INT_DEV_CONN_DIS) {
++		handled |= USB_INT_DEV_CONN_DIS;
++		if (rp2040_read(udc, RP2040_USB_SIE_STATUS) & SIE_STATUS_CONNECTED)
++			udc->connected = true;
++		else
++			udc->connected = false;
++		rp2040_log_state(udc, udc->connected ? "connect" : "disconnect");
++		rp2040_write(udc, RP2040_USB_SIE_STATUS, SIE_STATUS_CONNECTED);
++	}
++
++	if (status & ~handled)
++		dev_dbg(udc->dev, "unhandled usb irq status 0x%08x\n",
++			status & ~handled);
++
++	spin_unlock_irqrestore(&udc->lock, flags);
++
++	return IRQ_HANDLED;
++}
++
++static int rp2040_gadget_get_frame(struct usb_gadget *gadget)
++{
++	struct rp2040_udc *udc = gadget_to_rp2040(gadget);
++
++	return rp2040_read(udc, RP2040_USB_SOF_RD) & 0x7ff;
++}
++
++static int rp2040_gadget_pullup(struct usb_gadget *gadget, int is_on)
++{
++	struct rp2040_udc *udc = gadget_to_rp2040(gadget);
++	unsigned long flags;
++
++	spin_lock_irqsave(&udc->lock, flags);
++	udc->pullup = is_on;
++	if (is_on) {
++		rp2040_set_bits(udc, RP2040_USB_SIE_CTRL, SIE_CTRL_PULLUP_EN);
++		rp2040_set_bits(udc, RP2040_USBPHY_DIRECT,
++				USBPHY_DIRECT_DP_PULLUP_EN);
++		rp2040_set_bits(udc, RP2040_USBPHY_DIRECT_OVERRIDE,
++				USBPHY_DIRECT_OVERRIDE_DP_PULLUP_EN_OVERRIDE_EN);
++	} else {
++		rp2040_clear_bits(udc, RP2040_USBPHY_DIRECT_OVERRIDE,
++				  USBPHY_DIRECT_OVERRIDE_DP_PULLUP_EN_OVERRIDE_EN);
++		rp2040_clear_bits(udc, RP2040_USBPHY_DIRECT,
++				  USBPHY_DIRECT_DP_PULLUP_EN);
++		rp2040_clear_bits(udc, RP2040_USB_SIE_CTRL, SIE_CTRL_PULLUP_EN);
++	}
++	rp2040_log_state(udc, is_on ? "pullup-on" : "pullup-off");
++	spin_unlock_irqrestore(&udc->lock, flags);
++
++	return 0;
++}
++
++static int rp2040_gadget_set_selfpowered(struct usb_gadget *gadget,
++					 int is_selfpowered)
++{
++	gadget->is_selfpowered = !!is_selfpowered;
++
++	return 0;
++}
++
++static int rp2040_gadget_start(struct usb_gadget *gadget,
++			       struct usb_gadget_driver *driver)
++{
++	struct rp2040_udc *udc = gadget_to_rp2040(gadget);
++	unsigned long flags;
++
++	if (driver->max_speed < USB_SPEED_FULL)
++		return -EINVAL;
++
++	spin_lock_irqsave(&udc->lock, flags);
++	udc->driver = driver;
++	udc->gadget.speed = USB_SPEED_UNKNOWN;
++	rp2040_set_bits(udc, RP2040_USB_SIE_CTRL, SIE_CTRL_PULLUP_EN);
++	rp2040_set_bits(udc, RP2040_USBPHY_DIRECT,
++			USBPHY_DIRECT_DP_PULLUP_EN);
++	rp2040_set_bits(udc, RP2040_USBPHY_DIRECT_OVERRIDE,
++			USBPHY_DIRECT_OVERRIDE_DP_PULLUP_EN_OVERRIDE_EN);
++	rp2040_log_state(udc, "gadget-start");
++	spin_unlock_irqrestore(&udc->lock, flags);
++
++	return 0;
++}
++
++static int rp2040_gadget_stop(struct usb_gadget *gadget)
++{
++	struct rp2040_udc *udc = gadget_to_rp2040(gadget);
++	unsigned long flags;
++
++	spin_lock_irqsave(&udc->lock, flags);
++	rp2040_clear_bits(udc, RP2040_USBPHY_DIRECT_OVERRIDE,
++			  USBPHY_DIRECT_OVERRIDE_DP_PULLUP_EN_OVERRIDE_EN);
++	rp2040_clear_bits(udc, RP2040_USBPHY_DIRECT,
++			  USBPHY_DIRECT_DP_PULLUP_EN);
++	rp2040_clear_bits(udc, RP2040_USB_SIE_CTRL, SIE_CTRL_PULLUP_EN);
++	rp2040_reset_ep0(udc);
++	rp2040_reset_non_control_eps(udc);
++	udc->driver = NULL;
++	spin_unlock_irqrestore(&udc->lock, flags);
++
++	return 0;
++}
++
++static const struct usb_gadget_ops rp2040_gadget_ops = {
++	.get_frame		= rp2040_gadget_get_frame,
++	.set_selfpowered	= rp2040_gadget_set_selfpowered,
++	.pullup			= rp2040_gadget_pullup,
++	.udc_start		= rp2040_gadget_start,
++	.udc_stop		= rp2040_gadget_stop,
++};
++
++static int rp2040_usbctrl_unreset(struct rp2040_udc *udc)
++{
++	u32 val;
++
++	if (!udc->resets)
++		return 0;
++
++	val = readl(udc->resets + RP2040_RESETS_RESET);
++	writel(val | RESETS_RESET_USBCTRL, udc->resets + RP2040_RESETS_RESET);
++	udelay(2);
++	writel(val & ~RESETS_RESET_USBCTRL, udc->resets + RP2040_RESETS_RESET);
++
++	return readl_poll_timeout(udc->resets + RP2040_RESETS_RESET_DONE,
++				  val, val & RESETS_RESET_USBCTRL, 1, 1000);
++}
++
++static void rp2040_hw_init(struct rp2040_udc *udc)
++{
++	memset_io(udc->dpram, 0, RP2040_DPRAM_SIZE);
++	rp2040_write(udc, RP2040_USB_MUXING, MUXING_TO_PHY | MUXING_SOFTCON);
++	rp2040_write(udc, RP2040_USB_PWR,
++		     PWR_VBUS_DETECT | PWR_VBUS_DETECT_OVERRIDE_EN);
++	rp2040_write(udc, RP2040_USBPHY_DIRECT_OVERRIDE, 0);
++	rp2040_write(udc, RP2040_USBPHY_DIRECT, 0);
++	rp2040_write(udc, RP2040_USB_ADDR_ENDP, 0);
++	rp2040_write(udc, RP2040_USB_MAIN_CTRL, MAIN_CTRL_CONTROLLER_EN);
++	rp2040_write(udc, RP2040_USB_SIE_CTRL, SIE_CTRL_EP0_INT_1BUF);
++	rp2040_write(udc, RP2040_USB_INTE,
++		     USB_INT_BUFF_STATUS | USB_INT_BUS_RESET |
++		     USB_INT_SETUP_REQ | USB_INT_DEV_SUSPEND |
++		     USB_INT_DEV_RESUME_FROM_HOST | USB_INT_DEV_CONN_DIS);
++	rp2040_log_state(udc, "hw-init");
++}
++
++static void rp2040_init_ep(struct rp2040_udc *udc, struct rp2040_ep *ep,
++			   u8 num, bool in)
++{
++	ep->udc = udc;
++	ep->num = num;
++	ep->in = in;
++	ep->ep.ops = &rp2040_ep_ops;
++	ep->ep.maxpacket = num ? RP2040_EPX_BUF_SIZE : RP2040_EP0_SIZE;
++	ep->ep.maxpacket_limit = ep->ep.maxpacket;
++	INIT_LIST_HEAD(&ep->queue);
++	rp2040_ep_reset_state(ep);
++
++	if (num == 0) {
++		strscpy(ep->name, "ep0", sizeof(ep->name));
++		ep->ep.name = ep->name;
++		ep->ep.caps.type_control = true;
++		ep->ep.caps.dir_in = true;
++		ep->ep.caps.dir_out = true;
++		return;
++	}
++
++	snprintf(ep->name, sizeof(ep->name), "ep%u%s", num, in ? "in" : "out");
++	ep->ep.name = ep->name;
++	ep->ep.caps.type_bulk = true;
++	ep->ep.caps.type_int = true;
++	ep->ep.caps.dir_in = in;
++	ep->ep.caps.dir_out = !in;
++	ep->buf_offset = udc->next_buf;
++	udc->next_buf += RP2040_EPX_BUF_SIZE;
++}
++
++static void rp2040_init_eps(struct rp2040_udc *udc)
++{
++	int epnum;
++	int idx = 0;
++
++	udc->next_buf = RP2040_DPRAM_EPX_DATA;
++	INIT_LIST_HEAD(&udc->gadget.ep_list);
++	rp2040_init_ep(udc, &udc->ep0, 0, false);
++	udc->gadget.ep0 = &udc->ep0.ep;
++
++	for (epnum = 1; epnum < RP2040_MAX_ENDPOINTS; epnum++) {
++		rp2040_init_ep(udc, &udc->eps[idx], epnum, true);
++		list_add_tail(&udc->eps[idx].ep.ep_list, &udc->gadget.ep_list);
++		idx++;
++		rp2040_init_ep(udc, &udc->eps[idx], epnum, false);
++		list_add_tail(&udc->eps[idx].ep.ep_list, &udc->gadget.ep_list);
++		idx++;
++	}
++}
++
++static int rp2040_udc_probe(struct platform_device *pdev)
++{
++	struct resource *res;
++	struct rp2040_udc *udc;
++	int ret;
++
++	udc = devm_kzalloc(&pdev->dev, sizeof(*udc), GFP_KERNEL);
++	if (!udc)
++		return -ENOMEM;
++
++	udc->dev = &pdev->dev;
++	spin_lock_init(&udc->lock);
++	platform_set_drvdata(pdev, udc);
++
++	udc->dpram = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(udc->dpram))
++		return PTR_ERR(udc->dpram);
++
++	udc->regs = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(udc->regs))
++		return PTR_ERR(udc->regs);
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "resets");
++	if (res) {
++		udc->resets = devm_ioremap(&pdev->dev, res->start,
++					    resource_size(res));
++		if (!udc->resets)
++			return -ENOMEM;
++	}
++
++	udc->irq = platform_get_irq(pdev, 0);
++	if (udc->irq < 0)
++		return udc->irq;
++
++	rp2040_init_eps(udc);
++
++	udc->gadget.ops = &rp2040_gadget_ops;
++	udc->gadget.name = DRIVER_NAME;
++	udc->gadget.max_speed = USB_SPEED_FULL;
++	udc->gadget.speed = USB_SPEED_UNKNOWN;
++	udc->gadget.is_selfpowered = 1;
++
++	ret = rp2040_usbctrl_unreset(udc);
++	if (ret)
++		return ret;
++
++	rp2040_hw_init(udc);
++
++	ret = devm_request_irq(&pdev->dev, udc->irq, rp2040_irq, 0,
++			       dev_name(&pdev->dev), udc);
++	if (ret)
++		return ret;
++
++	ret = usb_add_gadget_udc(&pdev->dev, &udc->gadget);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev, "RP2040/RP2350 USB device controller registered\n");
++
++	return 0;
++}
++
++static void rp2040_udc_remove(struct platform_device *pdev)
++{
++	struct rp2040_udc *udc = platform_get_drvdata(pdev);
++
++	usb_del_gadget_udc(&udc->gadget);
++	rp2040_clear_bits(udc, RP2040_USB_SIE_CTRL, SIE_CTRL_PULLUP_EN);
++	rp2040_write(udc, RP2040_USB_INTE, 0);
++	rp2040_write(udc, RP2040_USB_MAIN_CTRL, 0);
++}
++
++static const struct of_device_id rp2040_udc_of_match[] = {
++	{ .compatible = "raspberrypi,rp2040-usb" },
++	{ .compatible = "raspberrypi,rp2350-usb" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rp2040_udc_of_match);
++
++static struct platform_driver rp2040_udc_driver = {
++	.probe	= rp2040_udc_probe,
++	.remove	= rp2040_udc_remove,
++	.driver	= {
++		.name		= DRIVER_NAME,
++		.of_match_table	= rp2040_udc_of_match,
++	},
++};
++module_platform_driver(rp2040_udc_driver);
++
++MODULE_DESCRIPTION("Raspberry Pi RP2040/RP2350 USB device controller");
++MODULE_AUTHOR("Codex");
++MODULE_LICENSE("GPL");
+--
+2.49.0

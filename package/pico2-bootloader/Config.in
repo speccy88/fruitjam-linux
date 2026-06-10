@@ -41,4 +41,12 @@ config BR2_PACKAGE_PICO2_BOOTLOADER_LED_ACTIVE_LOW
 	help
 		Select this when driving the LED GPIO low turns the LED on.
 
+config BR2_PACKAGE_PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS
+	int "Linux rescue watchdog timeout in milliseconds"
+	default 0
+	help
+		If non-zero, the bootloader arms the RP2350 watchdog before
+		jumping to Linux. Userspace must disable it during init. If the
+		watchdog fires, the next bootloader pass enters BOOTSEL.
+
 endif

@@ -2,9 +2,9 @@
 
 This tree builds tiny Buildroot-based Linux images for RP2350 RISC-V (Hazard3)
 boards. The original target is the Raspberry Pi Pico 2 / SparkFun Pro Micro RP2350
-work; this branch adds an Adafruit Fruit Jam RP2350B UART-only milestone target.
+work; this branch adds an Adafruit Fruit Jam RP2350B bring-up target.
 
-## Adafruit Fruit Jam RP2350B UART milestone
+## Adafruit Fruit Jam RP2350B milestone
 
 The Fruit Jam target is named `adafruit_fruit_jam_rp2350`. It uses:
 
@@ -14,8 +14,26 @@ The Fruit Jam target is named `adafruit_fruit_jam_rp2350`. It uses:
 * CramFS root filesystem in flash.
 * Kernel copied to 8 MiB external PSRAM.
 * UART1 console on the Fruit Jam `TX`/`RX` pins (GPIO8/GPIO9), 115200 8N1.
+* USB CDC ACM console on `/dev/ttyGS0` when the gadget enumerates.
+* Berry installed as `/usr/bin/berry`, including `-e`, script execution, and REPL.
+* BusyBox `vi`.
+* PIO-backed `/dev/neopixels` for the five onboard NeoPixels, plus
+  `/root/neopixels.be` as a small Berry smoke-test program.
 * `fruitjamctl` GPIO diagnostics for red LED, buttons, USB-host power enable,
   and shared TLV320/ESP32-C6 reset while real kernel drivers are still pending.
+
+Validated on hardware:
+
+* USB CDC shell on `/dev/cu.usbmodem1101`.
+* Hardware UART shell/log path on `/dev/cu.usbserial-P97cvdxp`.
+* `berry -e 'print("berry ok")'`.
+* Berry REPL expression evaluation.
+* `berry /root/neopixels.be`, visually confirmed on the onboard NeoPixels.
+* `/bin/vi -> busybox`.
+
+Known open item: `fruitjamctl bootsel` is still experimental. It currently drops
+the USB CDC console, but has not yet reliably re-enumerated as the RP2350 ROM
+BOOTSEL device on the test board.
 
 Build and flash:
 

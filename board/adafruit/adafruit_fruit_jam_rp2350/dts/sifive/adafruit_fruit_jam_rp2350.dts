@@ -12,7 +12,7 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
-		bootargs = "earlycon=pl011,mmio32,0x40078000 console=ttyAMA0 root=mtd:cramfs rootfstype=cramfs ro";
+		bootargs = "earlycon=pl011,mmio32,0x40078000 console=ttyAMA0 console=ttyGS0 root=mtd:cramfs rootfstype=cramfs ro";
 	};
 
 	flash@10000000 {
@@ -86,6 +86,33 @@
 			interrupt-parent = <&plic0>;
 			interrupts = <34>;
 			reg = <0x40078000 0x100>;
+			status = "okay";
+		};
+
+		usb0: usb@50100000 {
+			compatible = "raspberrypi,rp2350-usb", "raspberrypi,rp2040-usb";
+			reg = <0x50100000 0x1000>,
+			      <0x50110000 0x118>,
+			      <0x40020000 0x00c>;
+			reg-names = "dpram", "regs", "resets";
+			interrupt-parent = <&plic0>;
+			interrupts = <14>;
+			status = "okay";
+		};
+
+		neopixels: neopixels@50200000 {
+			compatible = "adafruit,fruit-jam-rp2350-neopixel";
+			reg = <0x50200000 0x1000>,
+			      <0x40020000 0x00c>,
+			      <0x40028000 0x200>,
+			      <0x40038000 0x100>;
+			reg-names = "pio", "resets", "io-bank0", "pads-bank0";
+			raspberrypi,pio = <0>;
+			raspberrypi,sm = <0>;
+			raspberrypi,gpio = <32>;
+			raspberrypi,gpio-base = <16>;
+			raspberrypi,num-leds = <5>;
+			raspberrypi,clk-sys-hz = <150000000>;
 			status = "okay";
 		};
 

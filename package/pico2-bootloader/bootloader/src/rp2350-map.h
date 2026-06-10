@@ -8,6 +8,7 @@
  */
 
 #define CLOCKS_BASE			((volatile uint32_t *) 0x40010000)
+#define PSM_BASE			((volatile uint32_t *) 0x40018000)
 #define RESETS_BASE			((volatile uint32_t *) 0x40020000)
 #define IO_BANK0_BASE			((volatile uint32_t *) 0x40028000)
 #define PADS_BANK0_BASE			((volatile uint32_t *) 0x40038000)
@@ -21,5 +22,6 @@
 #define UART1_BASE			((volatile uint32_t *) 0x40078000)
 #define XIP_QMI_BASE			((volatile uint32_t *) 0x400D0000)
 #define XIP_CTRL_BASE			((volatile uint32_t *) 0x400C8000)
+#define WATCHDOG_BASE			((volatile uint32_t *) 0x400D8000)
 
 #endif // ADDRESS_MAP_H

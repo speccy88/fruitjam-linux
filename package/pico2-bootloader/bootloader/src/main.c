@@ -12,6 +12,9 @@
 #include <ctype.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/bootrom.h"
+#include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
 #else
 #include "rp2350-map.h"
 
@@ -45,6 +48,11 @@
 #ifndef PICO2_BOOTLOADER_LED_ACTIVE_LOW
 #define PICO2_BOOTLOADER_LED_ACTIVE_LOW	0
 #endif
+#ifndef PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS
+#define PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS 0
+#endif
+
+#define WATCHDOG_RESCUE_MAGIC	0x6ab73121u
 
 #define LED_PIN			PICO2_BOOTLOADER_LED_PIN
 #define RP2350_XIP_CSI_PIN	PICO2_BOOTLOADER_PSRAM_CS_PIN
@@ -75,6 +83,8 @@ static inline const void* get_payload_start_address(void);
 static int psram_setup_and_test(size_t *psram_size);
 static int test_executability(void* addr);
 static void jump_to_kernel(void *ram_addr, const void *data_addr);
+static void rescue_watchdog_check(void);
+static void rescue_watchdog_arm(void);
 
 int main(void) {
 	int ret = 0;
@@ -123,6 +133,7 @@ int main(void) {
 #endif
 
 	puts("\n\n\nRP2350 Bootloader starting...\n");
+	rescue_watchdog_check();
 	ret = psram_setup_and_test(&psram_size);
 	if (ret)
 		goto exit;
@@ -264,8 +275,163 @@ static void jump_to_kernel(void *ram_addr, const void *data_addr) {
 
 	printf("\nJumping to kernel at 0x%08x and DT at 0x%08x\n", ram_addr, data_addr);
 	printf("If you are using USB serial, please connect over the hardware serial port.\n");
+	rescue_watchdog_arm();
 	image_entry(0, data_addr);
 }
+
+#ifndef PICO_SDK
+#define WATCHDOG_CTRL_REG		0
+#define WATCHDOG_LOAD_REG		1
+#define WATCHDOG_REASON_REG		2
+#define WATCHDOG_SCRATCH4_REG		7
+#define WATCHDOG_CTRL_ENABLE		BIT(30)
+#define WATCHDOG_CTRL_PAUSE_MASK	(BIT(24) | BIT(25) | BIT(26))
+#define WATCHDOG_LOAD_MAX		0x00ffffffu
+#define PSM_WDSEL_REG			2
+#define PSM_WDSEL_BITS			0x01ffffffu
+#define PSM_WDSEL_ROSC			BIT(2)
+#define PSM_WDSEL_XOSC			BIT(3)
+
+#define BOOTROM_ENTRY_OFFSET		0x7dfcu
+#define BOOTROM_RT_FLAG_FUNC_RISCV	0x0001u
+#define BOOTROM_REBOOT_TYPE_BOOTSEL	0x0002u
+#define BOOTROM_REBOOT_NO_RETURN	0x0100u
+#define BOOTROM_TABLE_CODE(c1, c2)	((uint32_t)(c1) | ((uint32_t)(c2) << 8))
+#define BOOTROM_FUNC_RESET_USB_BOOT	BOOTROM_TABLE_CODE('U', 'B')
+#define BOOTROM_FUNC_REBOOT		BOOTROM_TABLE_CODE('R', 'B')
+
+typedef void *(*rom_table_lookup_fn)(uint32_t code, uint32_t mask);
+typedef void (*rom_reset_usb_boot_fn)(uint32_t gpio_activity_mask,
+				      uint32_t disable_interface_mask);
+typedef int (*rom_reboot_fn)(uint32_t flags, uint32_t delay_ms,
+			     uint32_t p0, uint32_t p1);
+
+static void watchdog_disable_rescue(void)
+{
+	WATCHDOG_BASE[WATCHDOG_CTRL_REG] &= ~WATCHDOG_CTRL_ENABLE;
+	WATCHDOG_BASE[WATCHDOG_SCRATCH4_REG] = 0;
+}
+
+static int watchdog_rescue_fired(void)
+{
+	return WATCHDOG_BASE[WATCHDOG_REASON_REG] &&
+	       WATCHDOG_BASE[WATCHDOG_SCRATCH4_REG] == WATCHDOG_RESCUE_MAGIC;
+}
+
+static void watchdog_start_tick(void)
+{
+	TICK_BASE[13] = (CLK_REF / MHZ) & 0x1ffu;
+	TICK_BASE[12] |= BIT(0);
+}
+
+static void *bootrom_func_lookup(uint32_t code)
+{
+	uint32_t ptr_size = (*(volatile uint8_t *)0x13 == 2) ? 2 : 4;
+	uint32_t lookup_entry = BOOTROM_ENTRY_OFFSET - ptr_size;
+	rom_table_lookup_fn lookup;
+
+	lookup = (rom_table_lookup_fn)(uintptr_t)*(volatile uint16_t *)lookup_entry;
+	if (!lookup)
+		return NULL;
+
+	return lookup(code, BOOTROM_RT_FLAG_FUNC_RISCV);
+}
+
+static void bootrom_reboot_bootsel(void)
+{
+	rom_reset_usb_boot_fn reset_usb_boot =
+		(rom_reset_usb_boot_fn)bootrom_func_lookup(BOOTROM_FUNC_RESET_USB_BOOT);
+	rom_reboot_fn reboot = (rom_reboot_fn)bootrom_func_lookup(BOOTROM_FUNC_REBOOT);
+	int ret;
+
+	printf("BOOTSEL ROM funcs: reset_usb_boot=0x%08x reboot=0x%08x\n",
+	       (uint32_t)reset_usb_boot, (uint32_t)reboot);
+
+	if (reset_usb_boot) {
+		puts("Calling RESET_USB_BOOT...\n");
+		reset_usb_boot(0, 0);
+		puts("RESET_USB_BOOT returned unexpectedly.\n");
+	}
+
+	if (reboot) {
+		puts("Calling REBOOT BOOTSEL...\n");
+		ret = reboot(BOOTROM_REBOOT_TYPE_BOOTSEL | BOOTROM_REBOOT_NO_RETURN,
+			     10, 0, 0);
+		printf("REBOOT BOOTSEL returned %d.\n", ret);
+	}
+
+	while (1)
+		nop();
+}
+
+static void rescue_watchdog_check(void)
+{
+	if (watchdog_rescue_fired()) {
+		puts("Linux rescue watchdog fired; entering BOOTSEL.\n");
+		watchdog_disable_rescue();
+		bootrom_reboot_bootsel();
+	}
+
+	watchdog_disable_rescue();
+}
+
+static void rescue_watchdog_arm(void)
+{
+	uint32_t load;
+
+	if (!PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS)
+		return;
+
+	load = (uint32_t)PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS * 1000u;
+	if (load > WATCHDOG_LOAD_MAX)
+		load = WATCHDOG_LOAD_MAX;
+
+	watchdog_start_tick();
+	WATCHDOG_BASE[WATCHDOG_CTRL_REG] &= ~WATCHDOG_CTRL_ENABLE;
+	PSM_BASE[PSM_WDSEL_REG] = PSM_WDSEL_BITS & ~(PSM_WDSEL_ROSC | PSM_WDSEL_XOSC);
+	WATCHDOG_BASE[WATCHDOG_SCRATCH4_REG] = WATCHDOG_RESCUE_MAGIC;
+	WATCHDOG_BASE[WATCHDOG_CTRL_REG] &= ~WATCHDOG_CTRL_PAUSE_MASK;
+	WATCHDOG_BASE[WATCHDOG_LOAD_REG] = load;
+	WATCHDOG_BASE[WATCHDOG_CTRL_REG] |= WATCHDOG_CTRL_ENABLE;
+}
+#else
+static void watchdog_disable_rescue(void)
+{
+	watchdog_hw->ctrl &= ~WATCHDOG_CTRL_ENABLE_BITS;
+	watchdog_hw->scratch[4] = 0;
+}
+
+static int watchdog_rescue_fired(void)
+{
+	return watchdog_hw->reason &&
+	       watchdog_hw->scratch[4] == WATCHDOG_RESCUE_MAGIC;
+}
+
+static void bootrom_reboot_bootsel(void)
+{
+	reset_usb_boot(0, 0);
+}
+
+static void rescue_watchdog_check(void)
+{
+	if (watchdog_rescue_fired()) {
+		puts("Linux rescue watchdog fired; entering BOOTSEL.\n");
+		watchdog_disable_rescue();
+		bootrom_reboot_bootsel();
+	}
+
+	watchdog_disable_rescue();
+}
+
+static void rescue_watchdog_arm(void)
+{
+	if (!PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS)
+		return;
+
+	watchdog_enable(PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS, false);
+	watchdog_hw->scratch[4] = WATCHDOG_RESCUE_MAGIC;
+}
+#endif
 
 static void hexdump(const void *data, size_t size) {
 	const uint8_t *data_ptr = (const uint8_t *)data;

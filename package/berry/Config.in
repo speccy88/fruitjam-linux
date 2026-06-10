@@ -1,0 +1,9 @@
+config BR2_PACKAGE_BERRY
+	bool "berry"
+	help
+		Small embeddable Berry scripting language interpreter.
+
+		This package builds a minimal no-MMU friendly command-line
+		interpreter for the RP2350 Fruit Jam image. It intentionally
+		leaves out readline, dynamic module loading, and the OS module
+		for the first bring-up pass.

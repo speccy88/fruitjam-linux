@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 10 Jun 2026 18:55:00 -0400
+Subject: [PATCH] misc: add Fruit Jam RP2350 audio clock driver
+
+Add a tiny board bring-up misc driver that programs RP2350 PIO1 to generate
+BCLK and WS for the Fruit Jam TLV320DAC3100.  Userspace controls it through
+/dev/fruitjam-audio with simple text commands:
+
+  start
+  stop
+
+This is not a full ALSA/I2S driver.  It is a small hardware-clock bridge for
+early TLV320 speaker tests while keeping userspace away from /dev/mem PIO,
+reset, and pad registers that fault on this no-MMU target.
+---
+ drivers/misc/Kconfig                |  10 ++
+ drivers/misc/Makefile               |   1 +
+ drivers/misc/fruitjam_audio_clock.c | 267 ++++++++++++++++++++++++++++
+ 3 files changed, 278 insertions(+)
+ create mode 100644 drivers/misc/fruitjam_audio_clock.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 0f58d5b5b8a1..bc7f3e7468ef 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -62,6 +62,16 @@ config RP2350_NEOPIXEL
+ 
+ 	  If unsure, say N.
+ 
++config FRUITJAM_AUDIO_CLOCK
++	tristate "Adafruit Fruit Jam RP2350 PIO audio clock"
++	depends on OF && HAS_IOMEM
++	help
++	  Say Y here to expose /dev/fruitjam-audio, a tiny bring-up
++	  interface that starts and stops an RP2350 PIO-generated BCLK/WS
++	  clock for the Fruit Jam TLV320DAC3100.
++
++	  If unsure, say N.
++
+ config IBM_ASM
+ 	tristate "Device driver for IBM RSA service processor"
+ 	depends on X86 && PCI && INPUT
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 510af3884413..7afda0c82c7e 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -9,6 +9,7 @@ obj-$(CONFIG_AD525X_DPOT)	+= ad525x_dpot.o
+ obj-$(CONFIG_RP2350_NEOPIXEL)	+= rp2350_neopixel.o
+ obj-$(CONFIG_FRUITJAM_AIRLIFT_GPIO) += fruitjam_airlift_gpio.o
+ obj-$(CONFIG_FRUITJAM_RP2350_ADC) += fruitjam_rp2350_adc.o
++obj-$(CONFIG_FRUITJAM_AUDIO_CLOCK) += fruitjam_audio_clock.o
+ obj-$(CONFIG_AD525X_DPOT_I2C)	+= ad525x_dpot-i2c.o
+ obj-$(CONFIG_AD525X_DPOT_SPI)	+= ad525x_dpot-spi.o
+ obj-$(CONFIG_ATMEL_SSC)		+= atmel-ssc.o
+diff --git a/drivers/misc/fruitjam_audio_clock.c b/drivers/misc/fruitjam_audio_clock.c
+new file mode 100644
+index 000000000000..71e9b3d9f014
+--- /dev/null
++++ b/drivers/misc/fruitjam_audio_clock.c
+@@ -0,0 +1,322 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Minimal Adafruit Fruit Jam RP2350 PIO audio clock helper.
++ *
++ * This exposes /dev/fruitjam-audio with "start" and "stop" text commands.
++ * PIO1 state machine 1 generates BCLK on GPIO26 and WS on GPIO27.  The first
++ * userspace audio milestone uses this clock as the TLV320DAC3100 PLL input and
++ * plays RTTTL through the codec beep generator.
++ */
++
++#include <linux/bitops.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++
++#define FJ_AUDIO_SAMPLE_RATE		16000u
++#define FJ_AUDIO_BITS_PER_FRAME		32u
++#define FJ_AUDIO_PIO_CYCLES_PER_BIT	3u
++#define FJ_AUDIO_PROGRAM_OFFSET		8u
++
++#define RP2350_PIO_CTRL			0x000
++#define RP2350_PIO_FDEBUG		0x008
++#define RP2350_PIO_INSTR_MEM		0x048
++#define RP2350_PIO_SM_BASE(sm)		(0x0c8 + ((sm) * 0x18))
++#define RP2350_PIO_SM_CLKDIV		0x00
++#define RP2350_PIO_SM_EXECCTRL		0x04
++#define RP2350_PIO_SM_SHIFTCTRL		0x08
++#define RP2350_PIO_SM_INSTR		0x10
++#define RP2350_PIO_SM_PINCTRL		0x14
++#define RP2350_PIO_GPIOBASE		0x168
++
++#define RP2350_RESETS_RESET		0x000
++#define RP2350_RESETS_DONE		0x008
++#define RP2350_RESET_PIO0		11
++
++#define RP2350_IO_GPIO_CTRL(gpio)	(0x004 + ((gpio) * 8))
++#define RP2350_PADS_GPIO(gpio)		(0x004 + ((gpio) * 4))
++#define RP2350_GPIO_FUNC_PIO0		6
++#define RP2350_PADS_DRIVE_4MA		BIT(4)
++
++#define PIO_CTRL_SM_ENABLE(sm)		BIT(sm)
++#define PIO_CTRL_SM_RESTART(sm)		BIT(4 + (sm))
++#define PIO_CTRL_CLKDIV_RESTART(sm)	BIT(8 + (sm))
++#define PIO_FDEBUG_TXSTALL(sm)		BIT(24 + (sm))
++#define PIO_FDEBUG_TXOVER(sm)		BIT(16 + (sm))
++#define PIO_FDEBUG_RXUNDER(sm)		BIT(8 + (sm))
++#define PIO_FDEBUG_RXSTALL(sm)		BIT(sm)
++
++#define PIO_EXECCTRL_WRAP_TOP(v)	(((v) & 0x1f) << 12)
++#define PIO_EXECCTRL_WRAP_BOTTOM(v)	(((v) & 0x1f) << 7)
++#define PIO_PINCTRL_SET_COUNT(v)	(((v) & 0x7) << 26)
++#define PIO_PINCTRL_SET_BASE(v)		(((v) & 0x1f) << 5)
++
++static const u16 fj_audio_clock_program[] = {
++	0xe02f, /* set x, 15 */
++	0xe000, /* set pins, 0 */
++	0xe001, /* set pins, 1 */
++	0x0041, /* jmp x--, 1 */
++	0xe02f, /* set x, 15 */
++	0xe002, /* set pins, 2 */
++	0xe003, /* set pins, 3 */
++	0x0045, /* jmp x--, 5 */
++};
++
++struct fj_audio {
++	struct device *dev;
++	struct miscdevice miscdev;
++	struct mutex lock;
++	void __iomem *pio;
++	void __iomem *resets;
++	void __iomem *io_bank0;
++	void __iomem *pads_bank0;
++	u32 pio_index;
++	u32 sm;
++	u32 bclk_gpio;
++	u32 ws_gpio;
++	u32 gpio_base;
++	u32 clk_sys_hz;
++	bool running;
++};
++
++static void __iomem *fj_audio_ioremap_byname(struct platform_device *pdev,
++					     const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return ERR_PTR(-EINVAL);
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++static u32 fj_audio_clkdiv(struct fj_audio *fj)
++{
++	u64 bit_hz = FJ_AUDIO_SAMPLE_RATE * FJ_AUDIO_BITS_PER_FRAME;
++	u64 denom = bit_hz * FJ_AUDIO_PIO_CYCLES_PER_BIT;
++	u64 scaled = div64_u64((u64)fj->clk_sys_hz * 256 + denom / 2, denom);
++	u32 div_int = scaled >> 8;
++	u32 div_frac = scaled & 0xff;
++
++	if (!div_int)
++		div_int = 1;
++	if (div_int > 0xffff)
++		div_int = 0xffff;
++
++	return (div_int << 16) | (div_frac << 8);
++}
++
++static void fj_audio_sm_disable(struct fj_audio *fj)
++{
++	u32 ctrl = readl(fj->pio + RP2350_PIO_CTRL);
++
++	ctrl &= ~PIO_CTRL_SM_ENABLE(fj->sm);
++	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
++	fj->running = false;
++}
++
++static void fj_audio_reset_pio(struct fj_audio *fj)
++{
++	u32 bit = BIT(RP2350_RESET_PIO0 + fj->pio_index);
++	u32 reset;
++	int i;
++
++	reset = readl(fj->resets + RP2350_RESETS_RESET);
++	reset &= ~bit;
++	writel(reset, fj->resets + RP2350_RESETS_RESET);
++
++	for (i = 0; i < 100000; i++) {
++		if (readl(fj->resets + RP2350_RESETS_DONE) & bit)
++			return;
++		cpu_relax();
++	}
++	dev_warn(fj->dev, "PIO%u reset-done timeout\n", fj->pio_index);
++}
++
++static void fj_audio_configure_gpio(struct fj_audio *fj)
++{
++	u32 func = RP2350_GPIO_FUNC_PIO0 + fj->pio_index;
++
++	writel(RP2350_PADS_DRIVE_4MA, fj->pads_bank0 + RP2350_PADS_GPIO(fj->bclk_gpio));
++	writel(RP2350_PADS_DRIVE_4MA, fj->pads_bank0 + RP2350_PADS_GPIO(fj->ws_gpio));
++	writel(func, fj->io_bank0 + RP2350_IO_GPIO_CTRL(fj->bclk_gpio));
++	writel(func, fj->io_bank0 + RP2350_IO_GPIO_CTRL(fj->ws_gpio));
++}
++
++static int fj_audio_start(struct fj_audio *fj)
++{
++	void __iomem *sm = fj->pio + RP2350_PIO_SM_BASE(fj->sm);
++	u32 local_bclk = fj->bclk_gpio - fj->gpio_base;
++	u32 ctrl;
++	int i;
++
++	if (fj->bclk_gpio < fj->gpio_base || fj->ws_gpio != fj->bclk_gpio + 1)
++		return -EINVAL;
++
++	fj_audio_reset_pio(fj);
++	fj_audio_configure_gpio(fj);
++	fj_audio_sm_disable(fj);
++
++	for (i = 0; i < ARRAY_SIZE(fj_audio_clock_program); i++)
++		writel(fj_audio_clock_program[i],
++		       fj->pio + RP2350_PIO_INSTR_MEM +
++		       (FJ_AUDIO_PROGRAM_OFFSET + i) * 4);
++
++	writel(fj->gpio_base, fj->pio + RP2350_PIO_GPIOBASE);
++	writel(fj_audio_clkdiv(fj), sm + RP2350_PIO_SM_CLKDIV);
++	writel(PIO_EXECCTRL_WRAP_TOP(FJ_AUDIO_PROGRAM_OFFSET + 7) |
++	       PIO_EXECCTRL_WRAP_BOTTOM(FJ_AUDIO_PROGRAM_OFFSET),
++	       sm + RP2350_PIO_SM_EXECCTRL);
++	writel(0, sm + RP2350_PIO_SM_SHIFTCTRL);
++	writel(PIO_PINCTRL_SET_COUNT(2) | PIO_PINCTRL_SET_BASE(local_bclk),
++	       sm + RP2350_PIO_SM_PINCTRL);
++
++	writel(0xe083, sm + RP2350_PIO_SM_INSTR); /* set pindirs, 3 */
++	writel(0xe000, sm + RP2350_PIO_SM_INSTR); /* set pins, 0 */
++	writel(FJ_AUDIO_PROGRAM_OFFSET, sm + RP2350_PIO_SM_INSTR); /* jmp offset */
++	writel(PIO_FDEBUG_TXSTALL(fj->sm) | PIO_FDEBUG_TXOVER(fj->sm) |
++	       PIO_FDEBUG_RXUNDER(fj->sm) | PIO_FDEBUG_RXSTALL(fj->sm),
++	       fj->pio + RP2350_PIO_FDEBUG);
++
++	ctrl = readl(fj->pio + RP2350_PIO_CTRL);
++	ctrl |= PIO_CTRL_SM_RESTART(fj->sm) | PIO_CTRL_CLKDIV_RESTART(fj->sm);
++	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
++	ctrl |= PIO_CTRL_SM_ENABLE(fj->sm);
++	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
++	fj->running = true;
++	return 0;
++}
++
++static ssize_t fj_audio_write(struct file *file, const char __user *ubuf,
++			      size_t count, loff_t *ppos)
++{
++	struct fj_audio *fj = file->private_data;
++	char buf[32];
++	int ret = 0;
++
++	if (!count)
++		return 0;
++	if (count >= sizeof(buf))
++		return -E2BIG;
++	if (copy_from_user(buf, ubuf, count))
++		return -EFAULT;
++	buf[count] = '\0';
++	strim(buf);
++
++	mutex_lock(&fj->lock);
++	if (!strcmp(buf, "start"))
++		ret = fj_audio_start(fj);
++	else if (!strcmp(buf, "stop"))
++		fj_audio_sm_disable(fj);
++	else
++		ret = -EINVAL;
++	mutex_unlock(&fj->lock);
++
++	return ret ? ret : count;
++}
++
++static int fj_audio_open(struct inode *inode, struct file *file)
++{
++	struct miscdevice *miscdev = file->private_data;
++	struct fj_audio *fj = container_of(miscdev, struct fj_audio, miscdev);
++
++	file->private_data = fj;
++	return 0;
++}
++
++static const struct file_operations fj_audio_fops = {
++	.owner = THIS_MODULE,
++	.open = fj_audio_open,
++	.write = fj_audio_write,
++	.llseek = noop_llseek,
++};
++
++static int fj_audio_probe(struct platform_device *pdev)
++{
++	struct fj_audio *fj;
++	int ret;
++
++	fj = devm_kzalloc(&pdev->dev, sizeof(*fj), GFP_KERNEL);
++	if (!fj)
++		return -ENOMEM;
++	fj->dev = &pdev->dev;
++	mutex_init(&fj->lock);
++
++	fj->pio = fj_audio_ioremap_byname(pdev, "pio");
++	if (IS_ERR(fj->pio))
++		return PTR_ERR(fj->pio);
++	fj->resets = fj_audio_ioremap_byname(pdev, "resets");
++	if (IS_ERR(fj->resets))
++		return PTR_ERR(fj->resets);
++	fj->io_bank0 = fj_audio_ioremap_byname(pdev, "io-bank0");
++	if (IS_ERR(fj->io_bank0))
++		return PTR_ERR(fj->io_bank0);
++	fj->pads_bank0 = fj_audio_ioremap_byname(pdev, "pads-bank0");
++	if (IS_ERR(fj->pads_bank0))
++		return PTR_ERR(fj->pads_bank0);
++
++	fj->pio_index = 1;
++	fj->sm = 1;
++	fj->bclk_gpio = 26;
++	fj->ws_gpio = 27;
++	fj->gpio_base = 16;
++	fj->clk_sys_hz = 150000000;
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,pio", &fj->pio_index);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,sm", &fj->sm);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,bclk-gpio", &fj->bclk_gpio);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,ws-gpio", &fj->ws_gpio);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,gpio-base", &fj->gpio_base);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,clk-sys-hz", &fj->clk_sys_hz);
++
++	fj->miscdev.minor = MISC_DYNAMIC_MINOR;
++	fj->miscdev.name = "fruitjam-audio";
++	fj->miscdev.fops = &fj_audio_fops;
++	fj->miscdev.parent = &pdev->dev;
++
++	ret = misc_register(&fj->miscdev);
++	if (ret)
++		return ret;
++
++	platform_set_drvdata(pdev, fj);
++	dev_info(&pdev->dev, "Fruit Jam audio clock ready on /dev/fruitjam-audio\n");
++	return 0;
++}
++
++static void fj_audio_remove(struct platform_device *pdev)
++{
++	struct fj_audio *fj = platform_get_drvdata(pdev);
++
++	fj_audio_sm_disable(fj);
++	misc_deregister(&fj->miscdev);
++}
++
++static const struct of_device_id fj_audio_of_match[] = {
++	{ .compatible = "adafruit,fruit-jam-rp2350-audio-clock" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fj_audio_of_match);
++
++static struct platform_driver fj_audio_driver = {
++	.probe = fj_audio_probe,
++	.remove = fj_audio_remove,
++	.driver = {
++		.name = "fruitjam-audio-clock",
++		.of_match_table = fj_audio_of_match,
++	},
++};
++module_platform_driver(fj_audio_driver);
++
++MODULE_AUTHOR("Codex");
++MODULE_DESCRIPTION("Adafruit Fruit Jam RP2350 PIO audio clock helper");
++MODULE_LICENSE("GPL");
+-- 
+2.39.5

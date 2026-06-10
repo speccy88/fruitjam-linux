@@ -9,6 +9,7 @@ BusyBox, CramFS in flash, and an 8 MiB PSRAM kernel load address.
 
 * CPU mode: RP2350B Hazard3 RISC-V (`rp2350-riscv` UF2 family), not Cortex-M33.
 * External flash: 16 MiB XIP flash mapped at `0x10000000`.
+* Flash rootfs partition: CramFS at 6 MiB, sized to 10 MiB through the end of flash.
 * External PSRAM: 8 MiB mapped at `0x11000000`.
 * PSRAM chip select: QMI/XIP CS1 on GPIO47. This matches Adafruit's CircuitPython
   Fruit Jam board definition (`CIRCUITPY_PSRAM_CHIP_SELECT (&pin_GPIO47)`) and must
@@ -23,6 +24,12 @@ BusyBox, CramFS in flash, and an 8 MiB PSRAM kernel load address.
   bring-up diagnostics.
 * NeoPixels: GPIO32 is driven by the `rp2350_neopixel` PIO driver and exposed as
   `/dev/neopixels`.
+* GPIO sysfs: `gpiochip0` exposes GPIO0..GPIO45 through `/sys/class/gpio`.
+  GPIO47 is intentionally not exposed because it is the PSRAM chip-select line.
+* microSD: SPI-mode card access uses PL022 SPI0 on GPIO34/GPIO35/GPIO36 with
+  GPIO39 as a gpiolib chip select, mounted at `/mnt/sd`.
+* Audio first step: `/dev/fruitjam-audio` drives PIO1 BCLK/WS on GPIO26/GPIO27,
+  and `fruitjam-rtttl` plays RTTTL through the TLV320DAC3100 beep generator.
 
 Validated on the Fruit Jam board:
 
@@ -34,6 +41,38 @@ Validated on the Fruit Jam board:
 * `/root/neopixels.be` runs with `berry /root/neopixels.be` and lights the five
   onboard NeoPixels.
 * BusyBox `vi` is enabled as `/bin/vi`.
+* `fruitjamctl bootsel` reboots into the RP2350 ROM BOOTSEL loader.
+* `/proc/mtd` reports the CramFS partition as
+  `mtd0: 00a00000 00001000 "cramfs"`.
+* Sysfs GPIO exports work for GPIO29 output and GPIO0/GPIO4/GPIO5 button inputs:
+  GPIO29 reads back output writes, while the released buttons read high.
+* Loopback services start automatically: BusyBox httpd on TCP/80, tiny
+  `fruitjam-telnetd` on TCP/23, tiny `fruitjam-ftpd` on TCP/21, and BusyBox
+  tftpd on UDP/69.
+* Serial login shells use standalone `/usr/bin/hush`; telnet sessions use the
+  smaller `/usr/bin/fruitjam-shell` command loop to preserve no-MMU allocation
+  headroom.
+* `fruitjam-services status` reports service processes and TCP/UDP listeners
+  without spawning `ps` or `netstat`, and CGI still runs after status/telnet
+  checks.
+* `wget -O - http://127.0.0.1/index.html` serves the bundled status page, and
+  `wget -O - http://127.0.0.1/cgi-bin/env.cgi` returns `Fruit Jam CGI OK`.
+* `telnet 127.0.0.1 23` spawns `fruitjam-shell` and successfully echoed
+  `TELNET_OK`.
+* microSD enumerates as `/dev/mmcblk0` and `/dev/mmcblk0p1`; `/mnt/sd` mounts
+  as VFAT, accepts writes, unmounts, remounts, and preserves the test file.
+* `airliftctl` talks to the onboard ESP32-C6 AirLift over RP2350 PL022/spidev
+  hardware SPI. The installed NINA firmware reported `3.1.0`; WiFi join,
+  DHCP address reporting, and outbound HTTP via
+  `airliftctl tcp-get example.com /` were verified on hardware.
+* `airliftctl mqtt-pub` and `mosquitto_pub --airlift` provide a userspace AirLift
+  MQTT QoS 0 publish path for button actions when `MQTT_TRANSPORT=airlift` is
+  set in the button config. A local broker received both a direct
+  `fruitjam/test` AirLift publish and a synthetic `fruitjam/buttons/button2`
+  publish from the button FIFO path.
+* `/sys/class/misc/fruitjam-audio` registers, `/dev/fruitjam-audio` accepts
+  `start` and `stop`, `fruitjam-i2c ping 0x18` acks, and
+  `/usr/bin/fruitjam-rtttl` reports the default tune played with exit status 0.
 
 ## Build
 
@@ -127,6 +166,130 @@ The `bootsel` command requests a restart into the RP2350 ROM BOOTSEL loader. It
 has been verified on Fruit Jam hardware by running `fruitjamctl bootsel` from the
 Linux console and confirming `picotool info -a` reports `boot type: bootsel`.
 
+## Sysfs GPIO
+
+The image includes a small RP2350 SIO GPIO driver for bring-up. It is intentionally
+simple and exists so legacy sysfs GPIO works before a full RP2350 pinctrl stack is
+available:
+
+```sh
+echo 29 > /sys/class/gpio/export
+echo out > /sys/class/gpio/gpio29/direction
+echo 0 > /sys/class/gpio/gpio29/value
+cat /sys/class/gpio/gpio29/value
+echo 1 > /sys/class/gpio/gpio29/value
+cat /sys/class/gpio/gpio29/value
+```
+
+GPIO29 is the active-low red LED, so raw value `0` turns it on and raw value `1`
+turns it off. GPIO0/GPIO4/GPIO5 are configured with pull-ups when exported as
+inputs, so released buttons read `1` and pressed buttons should read `0`.
+
+## Button event logging
+
+`fruitjam-services all` starts `fruitjam-buttons daemon`, which watches
+GPIO0/GPIO4/GPIO5 and exposes a small test FIFO:
+
+```sh
+echo test button1 > /run/fruitjam-buttons.fifo
+echo test button2 > /run/fruitjam-buttons.fifo
+fruitjam-buttonlog dump /mnt/sd/fruitjam/buttons.db 10
+cat /mnt/sd/fruitjam/buttons.log
+```
+
+Events are stored in `/mnt/sd/fruitjam/buttons.db` using a tiny fixed-schema
+SQLite 3 file writer, and mirrored as text in `/mnt/sd/fruitjam/buttons.log` for
+easy inspection on the target. The full SQLite CLI/library is intentionally not
+included: the no-MMU image could not reliably allocate the large SQLite-linked
+binary while BusyBox services were running.
+
+To publish button events through AirLift after joining WiFi, create or edit
+`/mnt/sd/fruitjam/buttons.conf`:
+
+```sh
+MQTT_HOST=broker.local
+MQTT_PORT=1883
+MQTT_TOPIC=fruitjam/buttons
+MQTT_CLIENT_ID=fruitjam-rp2350
+MQTT_TRANSPORT=airlift
+```
+
+The daemon calls `mosquitto_pub --airlift`, which execs `airliftctl mqtt-pub`
+and sends one MQTT 3.1.1 QoS 0 publish over the ESP32-C6 NINA TCP socket API.
+
+## I2C
+
+The image exposes GPIO20/GPIO21 as a Linux GPIO-backed I2C master:
+
+```sh
+ls -l /dev/i2c-0
+cat /sys/class/i2c-dev/i2c-0/name
+fruitjam-i2c ping 0x18
+fruitjam-i2c scan
+```
+
+On the tested Fruit Jam board, `/sys/class/i2c-dev/i2c-0/name` reported
+`i2c-gpio0`, and `fruitjam-i2c scan` found address `0x18`, matching the
+TLV320DAC3100 control interface.
+
+## Audio
+
+The first audio milestone is a tiny clock/control path, not a full ALSA driver:
+
+```sh
+cat /sys/class/misc/fruitjam-audio/dev
+ls -l /dev/fruitjam-audio
+echo start > /dev/fruitjam-audio
+echo stop > /dev/fruitjam-audio
+fruitjam-rtttl
+fruitjam-rtttl 'ok:d=8,o=5,b=120:c,e,g,c6'
+```
+
+`/dev/fruitjam-audio` starts a PIO1 state machine that generates BCLK on GPIO26
+and WS on GPIO27. `fruitjam-rtttl` uses that clock as the TLV320DAC3100 PLL
+input, configures the codec over `/dev/i2c-0`, and plays notes through the
+TLV320 beep generator. GPIO24 DIN and GPIO25 MCLK are still reserved for a later
+full PCM/I2S data path.
+
+## AirLift networking
+
+The onboard ESP32-C6 AirLift is controlled through the NINA SPI command protocol:
+
+```sh
+airliftctl fw
+airliftctl status
+airliftctl join <ssid> <passphrase>
+airliftctl ip
+airliftctl tcp-get example.com /
+airliftctl mqtt-pub <broker-host> 1883 fruitjam/test hello
+```
+
+This is a userspace coprocessor socket helper. It proves that the AirLift can join
+WiFi and open outbound TCP connections, but it does not create a Linux `wlan0`
+interface, so BusyBox `wget` and normal Linux sockets still only use loopback
+until a kernel netdev driver or userspace bridge exists. The Adafruit NINA
+`3.3.0` Fruit Jam firmware update has not been integrated into this image yet.
+
+## microSD
+
+The image includes the SPI/MMC and VFAT pieces needed for the onboard microSD
+slot:
+
+```sh
+cat /proc/partitions
+ls -l /dev/mmc*
+cat /proc/mounts
+echo fruitjam_sd_final > /mnt/sd/fruitjam-linux-final.txt
+cat /mnt/sd/fruitjam-linux-final.txt
+umount /mnt/sd
+mount /mnt/sd
+cat /mnt/sd/fruitjam-linux-final.txt
+```
+
+The SD slot uses hardware SPI for SCK/MOSI/MISO and a GPIO chip select for CS.
+Do not switch GPIO39 back to native PL022 chip select without a hardware test:
+that path returned zero OCR from the card during bring-up.
+
 ## Berry and NeoPixels
 
 Berry is installed as `/usr/bin/berry` with expression execution, script execution,
@@ -153,8 +316,9 @@ test
 * HSTX DVI output is not implemented.
 * USB host 5 V power can be enabled by `fruitjamctl`, but USB host and USB
   keyboard input protocol support are not implemented.
-* microSD block support is not enabled or tested.
-* Buttons are readable through `fruitjamctl`; WiFi/AirLift, I2S audio, DVI, and
-  USB host input still need real Linux support.
+* Buttons, GPIO29, microSD block access, button SQLite logging, GPIO20/GPIO21
+  I2C, AirLift userspace socket access, and first-step TLV320 RTTTL audio work,
+  but WiFi/AirLift Linux netdev support, full PCM/I2S audio, DVI, and USB host
+  input still need real Linux support.
 * RP2350 atomics are only safe in internal SRAM; see `docs/risks.md` before moving
   lock-heavy structures or userspace runtimes into PSRAM.

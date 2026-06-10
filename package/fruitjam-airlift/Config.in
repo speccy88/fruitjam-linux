@@ -1,0 +1,8 @@
+config BR2_PACKAGE_FRUITJAM_AIRLIFT
+	bool "Adafruit Fruit Jam AirLift utility"
+	help
+		Small no-MMU friendly userspace helper for the Fruit Jam ESP32-C6
+		AirLift coprocessor. It configures the board pins with /dev/mem,
+		uses the kernel PL022/spidev SPI path for byte transfers, and speaks
+		the NINA command protocol for firmware, MAC, scan, join, and status
+		bring-up.

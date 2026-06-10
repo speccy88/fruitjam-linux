@@ -2,62 +2,27 @@
 /*
  * Minimal Adafruit Fruit Jam RP2350B board-control helper.
  *
- * This intentionally stays in userspace and uses /dev/mem because the current
- * RP2350 no-MMU Linux port does not yet provide upstreamable GPIO, pinctrl,
- * LED, input, USB-host, I2S, or HSTX DVI kernel drivers. It is a small bridge
- * for bring-up diagnostics: keep UART booting, make the red LED/buttons useful,
- * and let testers enable the USB-host 5V switch while proper drivers are built.
+ * The no-MMU Linux image exposes the RP2350 SIO GPIOs through sysfs. Keep this
+ * helper on that path so status/control works without direct /dev/mem access.
  */
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdint.h>
+#include <linux/reboot.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#include <linux/reboot.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-#define BIT(n) (1u << (n))
 
-#define SIO_BASE        0xd0000000u
-#define SIO_SIZE        0x1000u
-#define SIO_GPIO_IN     0x004u
-#define SIO_GPIO_OUT    0x010u
-#define SIO_GPIO_OUT_SET 0x014u
-#define SIO_GPIO_OUT_CLR 0x018u
-#define SIO_GPIO_OE_SET 0x038u
-#define SIO_GPIO_OE_CLR 0x03cu
-
-#define IO_BANK0_BASE   0x40028000u
-#define IO_BANK0_SIZE   0x1000u
-#define IO_GPIO_CTRL(gpio) (0x004u + ((uint32_t)(gpio) * 8u))
-
-#define PADS_BANK0_BASE 0x40038000u
-#define PADS_BANK0_SIZE 0x1000u
-#define PADS_GPIO(gpio) (0x004u + ((uint32_t)(gpio) * 4u))
-
-#define GPIO_FUNC_SIO   5u
-#define PADS_IE         BIT(6)
-#define PADS_PUE        BIT(3)
-#define PADS_DRIVE_4MA  BIT(4)
-
-#define FRUITJAM_BUTTON1_GPIO       0u
-#define FRUITJAM_BUTTON2_GPIO       4u
-#define FRUITJAM_BUTTON3_GPIO       5u
+#define FRUITJAM_BUTTON1_GPIO        0u
+#define FRUITJAM_BUTTON2_GPIO        4u
+#define FRUITJAM_BUTTON3_GPIO        5u
 #define FRUITJAM_USB_HOST_POWER_GPIO 11u
-#define FRUITJAM_PERIPH_RESET_GPIO  22u
-#define FRUITJAM_LED_GPIO           29u
-
-struct maps {
-	int fd;
-	volatile uint32_t *sio;
-	volatile uint32_t *io;
-	volatile uint32_t *pads;
-};
+#define FRUITJAM_PERIPH_RESET_GPIO   22u
+#define FRUITJAM_LED_GPIO            29u
 
 struct button {
 	const char *name;
@@ -86,76 +51,117 @@ static void usage(FILE *out)
 		"                        control shared TLV320/ESP32-C6 reset GPIO22\n");
 }
 
-static volatile uint32_t *map_regs(int fd, uint32_t base, uint32_t size)
+static int write_text_file(const char *path, const char *text)
 {
-	void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, base);
+	int fd = open(path, O_WRONLY | O_TRUNC);
+	ssize_t ret;
 
-	if (map == MAP_FAILED)
-		return NULL;
-
-	return (volatile uint32_t *)map;
-}
-
-static int maps_open(struct maps *maps)
-{
-	memset(maps, 0, sizeof(*maps));
-	maps->fd = open("/dev/mem", O_RDWR | O_SYNC);
-	if (maps->fd < 0) {
-		fprintf(stderr, "fruitjamctl: open /dev/mem: %s\n", strerror(errno));
+	if (fd < 0) {
+		fprintf(stderr, "fruitjamctl: open %s: %s\n", path, strerror(errno));
 		return -1;
 	}
-
-	maps->sio = map_regs(maps->fd, SIO_BASE, SIO_SIZE);
-	maps->io = map_regs(maps->fd, IO_BANK0_BASE, IO_BANK0_SIZE);
-	maps->pads = map_regs(maps->fd, PADS_BANK0_BASE, PADS_BANK0_SIZE);
-	if (!maps->sio || !maps->io || !maps->pads) {
-		fprintf(stderr, "fruitjamctl: mmap RP2350 registers failed: %s\n", strerror(errno));
+	ret = write(fd, text, strlen(text));
+	close(fd);
+	if (ret != (ssize_t)strlen(text)) {
+		fprintf(stderr, "fruitjamctl: write %s: %s\n", path,
+			ret < 0 ? strerror(errno) : "short write");
 		return -1;
 	}
-
 	return 0;
 }
 
-static void gpio_func_sio(struct maps *maps, unsigned int gpio)
+static int export_gpio(unsigned int gpio)
 {
-	maps->io[IO_GPIO_CTRL(gpio) / 4] = GPIO_FUNC_SIO;
+	char buf[16];
+	int fd = open("/sys/class/gpio/export", O_WRONLY);
+	ssize_t ret;
+
+	if (fd < 0) {
+		fprintf(stderr, "fruitjamctl: open /sys/class/gpio/export: %s\n",
+			strerror(errno));
+		return -1;
+	}
+
+	snprintf(buf, sizeof(buf), "%u", gpio);
+	ret = write(fd, buf, strlen(buf));
+	close(fd);
+	if (ret < 0 && errno != EBUSY) {
+		fprintf(stderr, "fruitjamctl: export gpio%u: %s\n", gpio, strerror(errno));
+		return -1;
+	}
+	return 0;
 }
 
-static void gpio_input_pullup(struct maps *maps, unsigned int gpio)
+static int gpio_path(unsigned int gpio, const char *leaf, char *path, size_t len)
 {
-	maps->pads[PADS_GPIO(gpio) / 4] = PADS_IE | PADS_PUE;
-	gpio_func_sio(maps, gpio);
-	maps->sio[SIO_GPIO_OE_CLR / 4] = BIT(gpio);
+	int ret = snprintf(path, len, "/sys/class/gpio/gpio%u/%s", gpio, leaf);
+
+	return ret > 0 && (size_t)ret < len ? 0 : -1;
 }
 
-static void gpio_output(struct maps *maps, unsigned int gpio, int high)
+static int gpio_direction(unsigned int gpio, const char *direction)
 {
-	maps->pads[PADS_GPIO(gpio) / 4] = PADS_DRIVE_4MA;
-	gpio_func_sio(maps, gpio);
-	maps->sio[high ? SIO_GPIO_OUT_SET / 4 : SIO_GPIO_OUT_CLR / 4] = BIT(gpio);
-	maps->sio[SIO_GPIO_OE_SET / 4] = BIT(gpio);
+	char path[64];
+
+	if (export_gpio(gpio) < 0)
+		return -1;
+	if (gpio_path(gpio, "direction", path, sizeof(path)) < 0)
+		return -1;
+	return write_text_file(path, direction);
 }
 
-static int gpio_read(struct maps *maps, unsigned int gpio)
+static int gpio_output(unsigned int gpio, int high)
 {
-	return !!(maps->sio[SIO_GPIO_IN / 4] & BIT(gpio));
+	char path[64];
+
+	if (gpio_direction(gpio, "out") < 0)
+		return -1;
+	if (gpio_path(gpio, "value", path, sizeof(path)) < 0)
+		return -1;
+	return write_text_file(path, high ? "1" : "0");
 }
 
-static int gpio_out_read(struct maps *maps, unsigned int gpio)
+static int gpio_input(unsigned int gpio)
 {
-	return !!(maps->sio[SIO_GPIO_OUT / 4] & BIT(gpio));
+	return gpio_direction(gpio, "in");
 }
 
-static void fruitjam_init(struct maps *maps)
+static int gpio_read(unsigned int gpio)
+{
+	char path[64];
+	char c;
+	int fd;
+
+	if (export_gpio(gpio) < 0)
+		return -1;
+	if (gpio_path(gpio, "value", path, sizeof(path)) < 0)
+		return -1;
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		fprintf(stderr, "fruitjamctl: open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	if (read(fd, &c, 1) != 1) {
+		fprintf(stderr, "fruitjamctl: read %s: %s\n", path, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return c == '0' ? 0 : 1;
+}
+
+static int fruitjam_init(void)
 {
 	size_t i;
+	int ret = 0;
 
 	for (i = 0; i < ARRAY_SIZE(buttons); i++)
-		gpio_input_pullup(maps, buttons[i].gpio);
+		ret |= gpio_input(buttons[i].gpio);
 
-	gpio_output(maps, FRUITJAM_LED_GPIO, 1); /* active-low LED off */
-	gpio_output(maps, FRUITJAM_USB_HOST_POWER_GPIO, 1);
-	gpio_output(maps, FRUITJAM_PERIPH_RESET_GPIO, 1);
+	ret |= gpio_output(FRUITJAM_LED_GPIO, 1); /* active-low LED off */
+	ret |= gpio_output(FRUITJAM_USB_HOST_POWER_GPIO, 1);
+	ret |= gpio_output(FRUITJAM_PERIPH_RESET_GPIO, 1);
+	return ret ? -1 : 0;
 }
 
 static int reboot_bootsel(void)
@@ -165,27 +171,48 @@ static int reboot_bootsel(void)
 		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
 }
 
-static void print_buttons(struct maps *maps)
+static int print_buttons(void)
 {
 	size_t i;
+	int ret = 0;
 
 	for (i = 0; i < ARRAY_SIZE(buttons); i++) {
-		int released = gpio_read(maps, buttons[i].gpio);
+		int released = gpio_read(buttons[i].gpio);
 
+		if (released < 0) {
+			ret = -1;
+			printf("%s gpio%u error\n", buttons[i].name, buttons[i].gpio);
+			continue;
+		}
 		printf("%s gpio%u %s\n", buttons[i].name, buttons[i].gpio,
 		       released ? "released" : "pressed");
 	}
+	return ret;
 }
 
-static void print_status(struct maps *maps)
+static int print_named_level(const char *name, unsigned int gpio,
+			     const char *high_name, const char *low_name)
 {
-	printf("red-led gpio%u %s\n", FRUITJAM_LED_GPIO,
-	       gpio_out_read(maps, FRUITJAM_LED_GPIO) ? "off" : "on");
-	printf("usb-host-5v gpio%u %s\n", FRUITJAM_USB_HOST_POWER_GPIO,
-	       gpio_out_read(maps, FRUITJAM_USB_HOST_POWER_GPIO) ? "on" : "off");
-	printf("periph-reset gpio%u %s\n", FRUITJAM_PERIPH_RESET_GPIO,
-	       gpio_out_read(maps, FRUITJAM_PERIPH_RESET_GPIO) ? "deasserted" : "asserted");
-	print_buttons(maps);
+	int value = gpio_read(gpio);
+
+	if (value < 0) {
+		printf("%s gpio%u error\n", name, gpio);
+		return -1;
+	}
+	printf("%s gpio%u %s\n", name, gpio, value ? high_name : low_name);
+	return 0;
+}
+
+static int print_status(void)
+{
+	int ret = 0;
+
+	ret |= print_named_level("red-led", FRUITJAM_LED_GPIO, "off", "on");
+	ret |= print_named_level("usb-host-5v", FRUITJAM_USB_HOST_POWER_GPIO, "on", "off");
+	ret |= print_named_level("periph-reset", FRUITJAM_PERIPH_RESET_GPIO,
+				 "deasserted", "asserted");
+	ret |= print_buttons();
+	return ret ? -1 : 0;
 }
 
 static int require_arg(int argc, char **argv)
@@ -200,8 +227,6 @@ static int require_arg(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-	struct maps maps;
-
 	if (argc < 2) {
 		usage(stderr);
 		return 2;
@@ -215,61 +240,54 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (maps_open(&maps) < 0)
-		return 1;
+	if (!strcmp(argv[1], "init"))
+		return fruitjam_init() < 0 ? 1 : 0;
+	if (!strcmp(argv[1], "status"))
+		return print_status() < 0 ? 1 : 0;
+	if (!strcmp(argv[1], "buttons"))
+		return print_buttons() < 0 ? 1 : 0;
 
-	if (!strcmp(argv[1], "init")) {
-		fruitjam_init(&maps);
-		return 0;
-	}
-	if (!strcmp(argv[1], "status")) {
-		print_status(&maps);
-		return 0;
-	}
-	if (!strcmp(argv[1], "buttons")) {
-		print_buttons(&maps);
-		return 0;
-	}
 	if (!strcmp(argv[1], "led")) {
 		if (require_arg(argc, argv) < 0)
 			return 2;
 		if (!strcmp(argv[2], "on"))
-			gpio_output(&maps, FRUITJAM_LED_GPIO, 0);
-		else if (!strcmp(argv[2], "off"))
-			gpio_output(&maps, FRUITJAM_LED_GPIO, 1);
-		else if (!strcmp(argv[2], "toggle"))
-			gpio_output(&maps, FRUITJAM_LED_GPIO,
-				    !gpio_out_read(&maps, FRUITJAM_LED_GPIO));
-		else
-			return usage(stderr), 2;
-		return 0;
+			return gpio_output(FRUITJAM_LED_GPIO, 0) < 0 ? 1 : 0;
+		if (!strcmp(argv[2], "off"))
+			return gpio_output(FRUITJAM_LED_GPIO, 1) < 0 ? 1 : 0;
+		if (!strcmp(argv[2], "toggle")) {
+			int value = gpio_read(FRUITJAM_LED_GPIO);
+
+			if (value < 0)
+				return 1;
+			return gpio_output(FRUITJAM_LED_GPIO, !value) < 0 ? 1 : 0;
+		}
+		return usage(stderr), 2;
 	}
+
 	if (!strcmp(argv[1], "usb-power")) {
 		if (require_arg(argc, argv) < 0)
 			return 2;
 		if (!strcmp(argv[2], "on"))
-			gpio_output(&maps, FRUITJAM_USB_HOST_POWER_GPIO, 1);
-		else if (!strcmp(argv[2], "off"))
-			gpio_output(&maps, FRUITJAM_USB_HOST_POWER_GPIO, 0);
-		else
-			return usage(stderr), 2;
-		return 0;
+			return gpio_output(FRUITJAM_USB_HOST_POWER_GPIO, 1) < 0 ? 1 : 0;
+		if (!strcmp(argv[2], "off"))
+			return gpio_output(FRUITJAM_USB_HOST_POWER_GPIO, 0) < 0 ? 1 : 0;
+		return usage(stderr), 2;
 	}
+
 	if (!strcmp(argv[1], "periph-reset")) {
 		if (require_arg(argc, argv) < 0)
 			return 2;
 		if (!strcmp(argv[2], "assert"))
-			gpio_output(&maps, FRUITJAM_PERIPH_RESET_GPIO, 0);
-		else if (!strcmp(argv[2], "deassert"))
-			gpio_output(&maps, FRUITJAM_PERIPH_RESET_GPIO, 1);
-		else if (!strcmp(argv[2], "pulse")) {
-			gpio_output(&maps, FRUITJAM_PERIPH_RESET_GPIO, 0);
+			return gpio_output(FRUITJAM_PERIPH_RESET_GPIO, 0) < 0 ? 1 : 0;
+		if (!strcmp(argv[2], "deassert"))
+			return gpio_output(FRUITJAM_PERIPH_RESET_GPIO, 1) < 0 ? 1 : 0;
+		if (!strcmp(argv[2], "pulse")) {
+			if (gpio_output(FRUITJAM_PERIPH_RESET_GPIO, 0) < 0)
+				return 1;
 			usleep(10000);
-			gpio_output(&maps, FRUITJAM_PERIPH_RESET_GPIO, 1);
-		} else {
-			return usage(stderr), 2;
+			return gpio_output(FRUITJAM_PERIPH_RESET_GPIO, 1) < 0 ? 1 : 0;
 		}
-		return 0;
+		return usage(stderr), 2;
 	}
 
 	usage(stderr);

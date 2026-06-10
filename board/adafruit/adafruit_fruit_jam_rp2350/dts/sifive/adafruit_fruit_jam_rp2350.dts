@@ -8,11 +8,20 @@
 
 	aliases {
 		serial0 = &uart1;
+		i2c0 = &i2c_gpio0;
+		spi0 = &spi1; /* Preserve AirLift as /dev/spidev0.0. */
+		spi1 = &spi0;
 	};
 
 	chosen {
 		stdout-path = "serial0:115200n8";
 		bootargs = "earlycon=pl011,mmio32,0x40078000 console=ttyAMA0 console=ttyGS0 root=mtd:cramfs rootfstype=cramfs ro";
+	};
+
+	clk_sys: clk-sys {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <150000000>;
 	};
 
 	flash@10000000 {
@@ -26,7 +35,7 @@
 
 			partition@600000 {
 				label = "cramfs";
-				reg = <0x600000 0x200000>; /* rootfs.cramfs at 6 MiB */
+				reg = <0x600000 0xa00000>; /* rootfs.cramfs at 6 MiB, up to end of 16 MiB flash */
 				read-only;
 			};
 		};
@@ -39,9 +48,20 @@
 		adafruit,neopixel-gpio = <32>;
 		adafruit,usb-host-gpios = <1 2 11>;
 		adafruit,peripheral-reset-gpio = <22>;
+		adafruit,i2c-gpios = <20 21>;
 		adafruit,i2s-gpios = <24 25 26 27 23>;
 		adafruit,dvi-gpios = <12 13 14 15 16 17 18 19>;
 		adafruit,sd-spi-gpios = <34 35 36 39 33>;
+	};
+
+	i2c_gpio0: i2c-gpio0 {
+		compatible = "i2c-gpio";
+		sda-gpios = <&gpio0 20 6>; /* active-high open-drain */
+		scl-gpios = <&gpio0 21 6>; /* active-high open-drain */
+		i2c-gpio,delay-us = <5>; /* ~100 kHz */
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
 	};
 
 	memory@11000000 {
@@ -100,9 +120,32 @@
 			status = "okay";
 		};
 
-		neopixels: neopixels@50200000 {
-			compatible = "adafruit,fruit-jam-rp2350-neopixel";
-			reg = <0x50200000 0x1000>,
+		gpio0: gpio@d0000000 {
+			compatible = "raspberrypi,rp2350-sio-gpio";
+			reg = <0xd0000000 0x1000>,
+			      <0x40028000 0x1000>,
+			      <0x40038000 0x1000>;
+			reg-names = "sio", "io-bank0", "pads-bank0";
+			gpio-controller;
+			#gpio-cells = <2>;
+			ngpios = <46>; /* GPIO47 is PSRAM CS1 and must not be exported. */
+			status = "okay";
+		};
+
+		adc0: adc@400a0000 {
+			compatible = "adafruit,fruit-jam-rp2350-adc";
+			reg = <0x400a0000 0x100>,
+			      <0x40020000 0x00c>,
+			      <0x40028000 0x200>,
+			      <0x40038000 0x100>;
+			reg-names = "adc", "resets", "io-bank0", "pads-bank0";
+			raspberrypi,adc-base-gpio = <40>;
+			status = "okay";
+		};
+
+			neopixels: neopixels@50200000 {
+				compatible = "adafruit,fruit-jam-rp2350-neopixel";
+				reg = <0x50200000 0x1000>,
 			      <0x40020000 0x00c>,
 			      <0x40028000 0x200>,
 			      <0x40038000 0x100>;
@@ -113,12 +156,79 @@
 			raspberrypi,gpio-base = <16>;
 			raspberrypi,num-leds = <5>;
 			raspberrypi,clk-sys-hz = <150000000>;
-			status = "okay";
-		};
+				status = "okay";
+			};
 
-		plic0: interrupt-controller@0 {
-			reg = <0x0 0x0>;
-			interrupts-extended = <&cpu0_intc 11>;
+			airlift_gpio: airlift-gpio@40028000 {
+				compatible = "adafruit,fruit-jam-rp2350-airlift-gpio";
+				reg = <0xd0000000 0x1000>,
+				      <0x40028000 0x1000>,
+				      <0x40038000 0x1000>;
+				reg-names = "sio", "io-bank0", "pads-bank0";
+				status = "okay";
+			};
+
+			audio_clock: audio-clock@50300000 {
+				compatible = "adafruit,fruit-jam-rp2350-audio-clock";
+				reg = <0x50300000 0x1000>,
+				      <0x40020000 0x00c>,
+				      <0x40028000 0x200>,
+				      <0x40038000 0x100>;
+				reg-names = "pio", "resets", "io-bank0", "pads-bank0";
+				raspberrypi,pio = <1>;
+				raspberrypi,sm = <1>;
+				raspberrypi,bclk-gpio = <26>;
+				raspberrypi,ws-gpio = <27>;
+				raspberrypi,gpio-base = <16>;
+				raspberrypi,clk-sys-hz = <150000000>;
+				status = "okay";
+			};
+
+			spi0: spi@40080000 {
+				compatible = "arm,pl022", "arm,primecell";
+				arm,primecell-periphid = <0x00041022>;
+				reg = <0x40080000 0x1000>;
+				interrupt-parent = <&plic0>;
+				interrupts = <31>;
+				clocks = <&clk_sys>, <&clk_sys>;
+				clock-names = "sspclk", "apb_pclk";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				num-cs = <1>;
+				cs-gpios = <&gpio0 39 1>;
+				status = "okay";
+
+				sdcard@0 {
+					compatible = "mmc-spi-slot";
+					reg = <0>;
+					spi-max-frequency = <8000000>;
+					broken-cd;
+					disable-wp;
+				};
+			};
+
+			spi1: spi@40088000 {
+				compatible = "arm,pl022", "arm,primecell";
+				arm,primecell-periphid = <0x00041022>;
+				reg = <0x40088000 0x1000>;
+				interrupt-parent = <&plic0>;
+				interrupts = <32>;
+				clocks = <&clk_sys>, <&clk_sys>;
+				clock-names = "sspclk", "apb_pclk";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				status = "okay";
+
+				airlift@0 {
+					compatible = "silabs,em3581";
+					reg = <0>;
+					spi-max-frequency = <8000000>;
+				};
+			};
+
+			plic0: interrupt-controller@0 {
+				reg = <0x0 0x0>;
+				interrupts-extended = <&cpu0_intc 11>;
 			interrupt-controller;
 			compatible = "generic,simple-intc";
 			#address-cells = <0x00>;

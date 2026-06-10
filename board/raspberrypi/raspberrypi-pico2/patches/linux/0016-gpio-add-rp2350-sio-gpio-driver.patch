@@ -1,0 +1,328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 10 Jun 2026 12:00:00 -0400
+Subject: [PATCH] gpio: add RP2350 SIO GPIO driver
+
+Add a small RP2350 SIO GPIO controller for the no-MMU Fruit Jam bring-up.
+This is intentionally narrow: it exposes normal SIO GPIOs through gpiolib
+so legacy sysfs GPIO works, and it also programs the per-pin function and
+pad state because there is no RP2350 pinctrl driver in this image yet.
+---
+ drivers/gpio/Kconfig           |  10 ++
+ drivers/gpio/Makefile          |   1 +
+ drivers/gpio/gpio-rp2350-sio.c | 271 +++++++++++++++++++++++++++++++++
+ 3 files changed, 282 insertions(+)
+ create mode 100644 drivers/gpio/gpio-rp2350-sio.c
+
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+index 5d7b322d82d9..36f8d95fc4d1 100644
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -23,6 +23,16 @@ config OF_GPIO
+ 	depends on OF
+ 	depends on HAS_IOMEM
+ 
++config GPIO_RP2350_SIO
++	tristate "Raspberry Pi RP2350 SIO GPIO controller"
++	depends on OF && HAS_IOMEM
++	help
++	  Say Y here to expose RP2350 SIO GPIO pins through gpiolib.
++	  The driver configures IO_BANK0 and PADS_BANK0 directly as a
++	  bring-up helper until a proper RP2350 pinctrl driver exists.
++
++	  If unsure, say N.
++
+ config GPIO_ACPI
+ 	def_bool y
+ 	depends on ACPI
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+index 2dc6b7da3c9d..c4d6a9a0d6e3 100644
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -143,6 +143,7 @@ obj-$(CONFIG_GPIO_PXA)			+= gpio-pxa.o
+ obj-$(CONFIG_GPIO_RASPBERRYPI_EXP)	+= gpio-raspberrypi-exp.o
+ obj-$(CONFIG_GPIO_RC5T583)		+= gpio-rc5t583.o
+ obj-$(CONFIG_GPIO_RCAR)			+= gpio-rcar.o
++obj-$(CONFIG_GPIO_RP2350_SIO)		+= gpio-rp2350-sio.o
+ obj-$(CONFIG_GPIO_RDA)			+= gpio-rda.o
+ obj-$(CONFIG_GPIO_RDC321X)		+= gpio-rdc321x.o
+ obj-$(CONFIG_GPIO_REALTEK_OTTO)		+= gpio-realtek-otto.o
+diff --git a/drivers/gpio/gpio-rp2350-sio.c b/drivers/gpio/gpio-rp2350-sio.c
+new file mode 100644
+index 000000000000..d5335398e641
+--- /dev/null
++++ b/drivers/gpio/gpio-rp2350-sio.c
+@@ -0,0 +1,271 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Raspberry Pi RP2350 SIO GPIO controller.
++ */
++
++#include <linux/bitops.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/gpio/driver.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/spinlock.h>
++
++#define RP2350_SIO_GPIO_IN		0x004
++#define RP2350_SIO_GPIO_HI_IN		0x008
++#define RP2350_SIO_GPIO_OUT		0x010
++#define RP2350_SIO_GPIO_HI_OUT		0x014
++#define RP2350_SIO_GPIO_OUT_SET		0x018
++#define RP2350_SIO_GPIO_HI_OUT_SET	0x01c
++#define RP2350_SIO_GPIO_OUT_CLR		0x020
++#define RP2350_SIO_GPIO_HI_OUT_CLR	0x024
++#define RP2350_SIO_GPIO_OE		0x030
++#define RP2350_SIO_GPIO_HI_OE		0x034
++#define RP2350_SIO_GPIO_OE_SET		0x038
++#define RP2350_SIO_GPIO_HI_OE_SET	0x03c
++#define RP2350_SIO_GPIO_OE_CLR		0x040
++#define RP2350_SIO_GPIO_HI_OE_CLR	0x044
++
++#define RP2350_IO_GPIO_CTRL(gpio)	(0x004 + ((gpio) * 8))
++#define RP2350_PADS_GPIO(gpio)		(0x004 + ((gpio) * 4))
++
++#define RP2350_GPIO_FUNC_SIO		5
++#define RP2350_PADS_IE			BIT(6)
++#define RP2350_PADS_PUE			BIT(3)
++#define RP2350_PADS_DRIVE_4MA		BIT(4)
++
++#define RP2350_DEFAULT_NGPIO		46
++
++struct rp2350_sio_gpio {
++	struct gpio_chip chip;
++	spinlock_t lock;
++	void __iomem *sio;
++	void __iomem *io_bank0;
++	void __iomem *pads_bank0;
++};
++
++static inline struct rp2350_sio_gpio *to_rp2350_sio(struct gpio_chip *gc)
++{
++	return gpiochip_get_data(gc);
++}
++
++static u32 rp2350_gpio_mask(unsigned int gpio)
++{
++	return BIT(gpio & 31);
++}
++
++static void __iomem *rp2350_sio_reg(struct rp2350_sio_gpio *sio,
++				    unsigned int gpio, u32 lo, u32 hi)
++{
++	return sio->sio + (gpio < 32 ? lo : hi);
++}
++
++static bool rp2350_needs_pullup(unsigned int gpio)
++{
++	return gpio == 0 || gpio == 4 || gpio == 5 || gpio == 20 || gpio == 21;
++}
++
++static void rp2350_gpio_func_sio(struct rp2350_sio_gpio *sio, unsigned int gpio)
++{
++	writel(RP2350_GPIO_FUNC_SIO, sio->io_bank0 + RP2350_IO_GPIO_CTRL(gpio));
++}
++
++static void rp2350_gpio_pad_input(struct rp2350_sio_gpio *sio, unsigned int gpio)
++{
++	u32 pad = RP2350_PADS_IE;
++
++	if (rp2350_needs_pullup(gpio))
++		pad |= RP2350_PADS_PUE;
++
++	writel(pad, sio->pads_bank0 + RP2350_PADS_GPIO(gpio));
++}
++
++static void rp2350_gpio_pad_output(struct rp2350_sio_gpio *sio, unsigned int gpio)
++{
++	writel(RP2350_PADS_DRIVE_4MA, sio->pads_bank0 + RP2350_PADS_GPIO(gpio));
++}
++
++static int rp2350_gpio_request(struct gpio_chip *gc, unsigned int offset)
++{
++	struct rp2350_sio_gpio *sio = to_rp2350_sio(gc);
++	unsigned long flags;
++
++	spin_lock_irqsave(&sio->lock, flags);
++	rp2350_gpio_pad_input(sio, offset);
++	rp2350_gpio_func_sio(sio, offset);
++	writel(rp2350_gpio_mask(offset),
++	       rp2350_sio_reg(sio, offset, RP2350_SIO_GPIO_OE_CLR,
++			      RP2350_SIO_GPIO_HI_OE_CLR));
++	spin_unlock_irqrestore(&sio->lock, flags);
++
++	return 0;
++}
++
++static int rp2350_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
++{
++	struct rp2350_sio_gpio *sio = to_rp2350_sio(gc);
++	u32 value;
++
++	value = readl(rp2350_sio_reg(sio, offset, RP2350_SIO_GPIO_OE,
++				     RP2350_SIO_GPIO_HI_OE));
++	if (value & rp2350_gpio_mask(offset))
++		return GPIO_LINE_DIRECTION_OUT;
++
++	return GPIO_LINE_DIRECTION_IN;
++}
++
++static int rp2350_gpio_direction_input(struct gpio_chip *gc, unsigned int offset)
++{
++	struct rp2350_sio_gpio *sio = to_rp2350_sio(gc);
++	unsigned long flags;
++
++	spin_lock_irqsave(&sio->lock, flags);
++	rp2350_gpio_pad_input(sio, offset);
++	rp2350_gpio_func_sio(sio, offset);
++	writel(rp2350_gpio_mask(offset),
++	       rp2350_sio_reg(sio, offset, RP2350_SIO_GPIO_OE_CLR,
++			      RP2350_SIO_GPIO_HI_OE_CLR));
++	spin_unlock_irqrestore(&sio->lock, flags);
++
++	return 0;
++}
++
++static void rp2350_gpio_set_unlocked(struct rp2350_sio_gpio *sio,
++				     unsigned int offset, int value)
++{
++	u32 lo = value ? RP2350_SIO_GPIO_OUT_SET : RP2350_SIO_GPIO_OUT_CLR;
++	u32 hi = value ? RP2350_SIO_GPIO_HI_OUT_SET : RP2350_SIO_GPIO_HI_OUT_CLR;
++
++	writel(rp2350_gpio_mask(offset), rp2350_sio_reg(sio, offset, lo, hi));
++}
++
++static int rp2350_gpio_direction_output(struct gpio_chip *gc,
++					unsigned int offset, int value)
++{
++	struct rp2350_sio_gpio *sio = to_rp2350_sio(gc);
++	unsigned long flags;
++
++	spin_lock_irqsave(&sio->lock, flags);
++	rp2350_gpio_pad_output(sio, offset);
++	rp2350_gpio_func_sio(sio, offset);
++	rp2350_gpio_set_unlocked(sio, offset, value);
++	writel(rp2350_gpio_mask(offset),
++	       rp2350_sio_reg(sio, offset, RP2350_SIO_GPIO_OE_SET,
++			      RP2350_SIO_GPIO_HI_OE_SET));
++	spin_unlock_irqrestore(&sio->lock, flags);
++
++	return 0;
++}
++
++static int rp2350_gpio_get(struct gpio_chip *gc, unsigned int offset)
++{
++	struct rp2350_sio_gpio *sio = to_rp2350_sio(gc);
++	void __iomem *value_reg;
++	u32 value;
++
++	if (readl(rp2350_sio_reg(sio, offset, RP2350_SIO_GPIO_OE,
++				 RP2350_SIO_GPIO_HI_OE)) &
++	    rp2350_gpio_mask(offset))
++		value_reg = rp2350_sio_reg(sio, offset, RP2350_SIO_GPIO_OUT,
++					   RP2350_SIO_GPIO_HI_OUT);
++	else
++		value_reg = rp2350_sio_reg(sio, offset, RP2350_SIO_GPIO_IN,
++					   RP2350_SIO_GPIO_HI_IN);
++
++	value = readl(value_reg);
++	return !!(value & rp2350_gpio_mask(offset));
++}
++
++static int rp2350_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
++{
++	struct rp2350_sio_gpio *sio = to_rp2350_sio(gc);
++	unsigned long flags;
++
++	spin_lock_irqsave(&sio->lock, flags);
++	rp2350_gpio_set_unlocked(sio, offset, value);
++	spin_unlock_irqrestore(&sio->lock, flags);
++
++	return 0;
++}
++
++static void __iomem *rp2350_ioremap_byname(struct platform_device *pdev,
++					   const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return ERR_PTR(-EINVAL);
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++static int rp2350_sio_gpio_probe(struct platform_device *pdev)
++{
++	struct rp2350_sio_gpio *sio;
++	u32 ngpio = RP2350_DEFAULT_NGPIO;
++	int ret;
++
++	sio = devm_kzalloc(&pdev->dev, sizeof(*sio), GFP_KERNEL);
++	if (!sio)
++		return -ENOMEM;
++
++	spin_lock_init(&sio->lock);
++
++	sio->sio = rp2350_ioremap_byname(pdev, "sio");
++	if (IS_ERR(sio->sio))
++		return PTR_ERR(sio->sio);
++	sio->io_bank0 = rp2350_ioremap_byname(pdev, "io-bank0");
++	if (IS_ERR(sio->io_bank0))
++		return PTR_ERR(sio->io_bank0);
++	sio->pads_bank0 = rp2350_ioremap_byname(pdev, "pads-bank0");
++	if (IS_ERR(sio->pads_bank0))
++		return PTR_ERR(sio->pads_bank0);
++
++	device_property_read_u32(&pdev->dev, "ngpios", &ngpio);
++	if (!ngpio || ngpio > RP2350_DEFAULT_NGPIO)
++		ngpio = RP2350_DEFAULT_NGPIO;
++
++	sio->chip.label = dev_name(&pdev->dev);
++	sio->chip.parent = &pdev->dev;
++	sio->chip.owner = THIS_MODULE;
++	sio->chip.request = rp2350_gpio_request;
++	sio->chip.get_direction = rp2350_gpio_get_direction;
++	sio->chip.direction_input = rp2350_gpio_direction_input;
++	sio->chip.direction_output = rp2350_gpio_direction_output;
++	sio->chip.get = rp2350_gpio_get;
++	sio->chip.set_rv = rp2350_gpio_set;
++	sio->chip.base = 0;
++	sio->chip.ngpio = ngpio;
++	sio->chip.can_sleep = false;
++
++	ret = devm_gpiochip_add_data(&pdev->dev, &sio->chip, sio);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev, "registered GPIO0..GPIO%u\n", ngpio - 1);
++	return 0;
++}
++
++static const struct of_device_id rp2350_sio_gpio_of_match[] = {
++	{ .compatible = "raspberrypi,rp2350-sio-gpio" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rp2350_sio_gpio_of_match);
++
++static struct platform_driver rp2350_sio_gpio_driver = {
++	.probe = rp2350_sio_gpio_probe,
++	.driver = {
++		.name = "rp2350-sio-gpio",
++		.of_match_table = rp2350_sio_gpio_of_match,
++	},
++};
++module_platform_driver(rp2350_sio_gpio_driver);
++
++MODULE_AUTHOR("Codex");
++MODULE_DESCRIPTION("Raspberry Pi RP2350 SIO GPIO driver");
++MODULE_LICENSE("GPL");
+-- 
+2.39.5

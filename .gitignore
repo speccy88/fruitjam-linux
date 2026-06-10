@@ -4,3 +4,5 @@ package/pico2-bootloader/bootloader/*.bin
 package/pico2-bootloader/bootloader/demo/build
 .DS_Store
 buildroot-output-docker-images/
+.fruitjam.env
+__pycache__/

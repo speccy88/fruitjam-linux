@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 10 Jun 2026 14:00:00 -0400
+Subject: [PATCH] misc: add Fruit Jam RP2350 ADC helper
+
+Expose the RP2350B ADC on Fruit Jam through a tiny board-specific sysfs
+helper.  This keeps ADC register access in the kernel because the current
+no-MMU userspace /dev/mem path faults on the ADC register window.
+---
+ drivers/misc/Kconfig              |  10 ++
+ drivers/misc/Makefile             |   1 +
+ drivers/misc/fruitjam_rp2350_adc.c | 312 +++++++++++++++++++++++++++++
+ 3 files changed, 262 insertions(+)
+ create mode 100644 drivers/misc/fruitjam_rp2350_adc.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 00ebd1f2b8be..dbf42d24e9de 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -72,6 +72,16 @@ config FRUITJAM_AIRLIFT_GPIO
+ 
+ 	  If unsure, say N.
+ 
++config FRUITJAM_RP2350_ADC
++	tristate "Adafruit Fruit Jam RP2350 ADC sysfs helper"
++	depends on OF && HAS_IOMEM
++	help
++	  Say Y here to expose Fruit Jam RP2350B ADC readings as sysfs
++	  attributes.  Channel 0 maps to the board A0 header pin on GPIO40;
++	  channels 1-7 map to GPIO41-GPIO47.
++
++	  If unsure, say N.
++
+ config IBM_ASM
+ 	tristate "Device driver for IBM RSA service processor"
+ 	depends on X86 && PCI && INPUT
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 65fd4ad6fc75..ee0e2ce4dffc 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -9,6 +9,7 @@ obj-$(CONFIG_IBMVMC)		+= ibmvmc.o
+ obj-$(CONFIG_AD525X_DPOT)	+= ad525x_dpot.o
+ obj-$(CONFIG_RP2350_NEOPIXEL)	+= rp2350_neopixel.o
+ obj-$(CONFIG_FRUITJAM_AIRLIFT_GPIO) += fruitjam_airlift_gpio.o
++obj-$(CONFIG_FRUITJAM_RP2350_ADC) += fruitjam_rp2350_adc.o
+ obj-$(CONFIG_AD525X_DPOT_I2C)	+= ad525x_dpot-i2c.o
+ obj-$(CONFIG_AD525X_DPOT_SPI)	+= ad525x_dpot-spi.o
+ obj-$(CONFIG_ATMEL_SSC)		+= atmel-ssc.o
+diff --git a/drivers/misc/fruitjam_rp2350_adc.c b/drivers/misc/fruitjam_rp2350_adc.c
+new file mode 100644
+index 000000000000..f7f034fd805a
+--- /dev/null
++++ b/drivers/misc/fruitjam_rp2350_adc.c
+@@ -0,0 +1,312 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Adafruit Fruit Jam RP2350B ADC helper.
++ */
++
++#include <linux/bitops.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/slab.h>
++
++#define FJ_ADC_CS			0x000
++#define FJ_ADC_RESULT			0x004
++#define FJ_ADC_FCS			0x008
++#define FJ_ADC_CS_EN			BIT(0)
++#define FJ_ADC_CS_TS_EN			BIT(1)
++#define FJ_ADC_CS_START_ONCE		BIT(2)
++#define FJ_ADC_CS_READY			BIT(8)
++#define FJ_ADC_CS_ERR			BIT(9)
++#define FJ_ADC_CS_ERR_STICKY		BIT(10)
++#define FJ_ADC_CS_AINSEL_LSB		12
++#define FJ_ADC_RESULT_MASK		0x0fff
++
++#define FJ_RESETS_RESET			0x000
++#define FJ_RESETS_RESET_DONE		0x008
++#define FJ_RESETS_ADC			0
++
++#define FJ_IO_GPIO_CTRL(gpio)		(0x004 + ((gpio) * 8))
++#define FJ_PADS_GPIO(gpio)		(0x004 + ((gpio) * 4))
++#define FJ_GPIO_FUNC_NULL		0x1f
++#define FJ_PADS_PDE			BIT(2)
++#define FJ_PADS_PUE			BIT(3)
++#define FJ_PADS_IE			BIT(6)
++#define FJ_PADS_OD			BIT(7)
++#define FJ_PADS_ISO			BIT(8)
++
++#define FJ_ADC_USER_CHANNELS		8
++#define FJ_ADC_TEMP_CHANNEL		8
++#define FJ_ADC_DEFAULT_BASE_GPIO	40
++#define FJ_ADC_MV_REF			3300
++#define FJ_ADC_TIMEOUT			100000
++
++struct fruitjam_adc {
++	struct device *dev;
++	struct mutex lock;
++	void __iomem *adc;
++	void __iomem *resets;
++	void __iomem *io_bank0;
++	void __iomem *pads_bank0;
++	u32 base_gpio;
++};
++
++static void __iomem *fj_ioremap_byname(struct platform_device *pdev,
++				       const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return ERR_PTR(-EINVAL);
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++static int fj_adc_wait_ready(struct fruitjam_adc *fj)
++{
++	int i;
++
++	for (i = 0; i < FJ_ADC_TIMEOUT; i++) {
++		if (readl(fj->adc + FJ_ADC_CS) & FJ_ADC_CS_READY)
++			return 0;
++		cpu_relax();
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int fj_adc_reset(struct fruitjam_adc *fj)
++{
++	u32 value;
++	int i;
++
++	value = readl(fj->resets + FJ_RESETS_RESET);
++	writel(value | BIT(FJ_RESETS_ADC), fj->resets + FJ_RESETS_RESET);
++
++	value = readl(fj->resets + FJ_RESETS_RESET);
++	writel(value & ~BIT(FJ_RESETS_ADC), fj->resets + FJ_RESETS_RESET);
++
++	for (i = 0; i < FJ_ADC_TIMEOUT; i++) {
++		if (readl(fj->resets + FJ_RESETS_RESET_DONE) & BIT(FJ_RESETS_ADC))
++			return 0;
++		cpu_relax();
++	}
++
++	return -ETIMEDOUT;
++}
++
++static void fj_adc_gpio_init(struct fruitjam_adc *fj, unsigned int channel)
++{
++	u32 gpio = fj->base_gpio + channel;
++	u32 pad;
++
++	writel(FJ_GPIO_FUNC_NULL, fj->io_bank0 + FJ_IO_GPIO_CTRL(gpio));
++	pad = readl(fj->pads_bank0 + FJ_PADS_GPIO(gpio));
++	pad &= ~(FJ_PADS_PDE | FJ_PADS_PUE | FJ_PADS_IE |
++		 FJ_PADS_OD | FJ_PADS_ISO);
++	writel(pad, fj->pads_bank0 + FJ_PADS_GPIO(gpio));
++}
++
++static int fj_adc_read_channel(struct fruitjam_adc *fj, unsigned int channel,
++			       u16 *sample)
++{
++	u32 cs;
++	int ret;
++
++	if (channel > FJ_ADC_TEMP_CHANNEL)
++		return -EINVAL;
++
++	mutex_lock(&fj->lock);
++
++	if (channel < FJ_ADC_USER_CHANNELS)
++		fj_adc_gpio_init(fj, channel);
++
++	cs = FJ_ADC_CS_EN | FJ_ADC_CS_ERR_STICKY |
++	     (channel << FJ_ADC_CS_AINSEL_LSB);
++	if (channel == FJ_ADC_TEMP_CHANNEL)
++		cs |= FJ_ADC_CS_TS_EN;
++
++	writel(cs, fj->adc + FJ_ADC_CS);
++	ret = fj_adc_wait_ready(fj);
++	if (ret)
++		goto out;
++
++	writel(readl(fj->adc + FJ_ADC_CS) | FJ_ADC_CS_START_ONCE,
++	       fj->adc + FJ_ADC_CS);
++	ret = fj_adc_wait_ready(fj);
++	if (ret)
++		goto out;
++
++	cs = readl(fj->adc + FJ_ADC_CS);
++	if (cs & FJ_ADC_CS_ERR) {
++		ret = -EIO;
++		goto out;
++	}
++
++	*sample = readl(fj->adc + FJ_ADC_RESULT) & FJ_ADC_RESULT_MASK;
++
++out:
++	mutex_unlock(&fj->lock);
++	return ret;
++}
++
++static ssize_t fj_adc_show_raw(struct device *dev, unsigned int channel, char *buf)
++{
++	struct fruitjam_adc *fj = dev_get_drvdata(dev);
++	u16 sample;
++	int ret;
++
++	ret = fj_adc_read_channel(fj, channel, &sample);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "%u\n", sample);
++}
++
++static ssize_t fj_adc_show_mv(struct device *dev, unsigned int channel, char *buf)
++{
++	struct fruitjam_adc *fj = dev_get_drvdata(dev);
++	u16 sample;
++	u32 mv;
++	int ret;
++
++	ret = fj_adc_read_channel(fj, channel, &sample);
++	if (ret)
++		return ret;
++
++	mv = (sample * FJ_ADC_MV_REF + 2047) / 4095;
++	return sysfs_emit(buf, "%u\n", mv);
++}
++
++#define FJ_ADC_RAW_ATTR(_ch)						\
++static ssize_t raw##_ch##_show(struct device *dev,			\
++			       struct device_attribute *attr, char *buf)	\
++{									\
++	return fj_adc_show_raw(dev, _ch, buf);				\
++}									\
++static DEVICE_ATTR_RO(raw##_ch)
++
++#define FJ_ADC_MV_ATTR(_ch)						\
++static ssize_t millivolts##_ch##_show(struct device *dev,		\
++				      struct device_attribute *attr,	\
++				      char *buf)			\
++{									\
++	return fj_adc_show_mv(dev, _ch, buf);				\
++}									\
++static DEVICE_ATTR_RO(millivolts##_ch)
++
++FJ_ADC_RAW_ATTR(0);
++FJ_ADC_RAW_ATTR(1);
++FJ_ADC_RAW_ATTR(2);
++FJ_ADC_RAW_ATTR(3);
++FJ_ADC_RAW_ATTR(4);
++FJ_ADC_RAW_ATTR(5);
++FJ_ADC_RAW_ATTR(6);
++FJ_ADC_RAW_ATTR(7);
++FJ_ADC_RAW_ATTR(8);
++FJ_ADC_MV_ATTR(0);
++FJ_ADC_MV_ATTR(1);
++FJ_ADC_MV_ATTR(2);
++FJ_ADC_MV_ATTR(3);
++FJ_ADC_MV_ATTR(4);
++FJ_ADC_MV_ATTR(5);
++FJ_ADC_MV_ATTR(6);
++FJ_ADC_MV_ATTR(7);
++FJ_ADC_MV_ATTR(8);
++
++static struct attribute *fj_adc_attrs[] = {
++	&dev_attr_raw0.attr,
++	&dev_attr_raw1.attr,
++	&dev_attr_raw2.attr,
++	&dev_attr_raw3.attr,
++	&dev_attr_raw4.attr,
++	&dev_attr_raw5.attr,
++	&dev_attr_raw6.attr,
++	&dev_attr_raw7.attr,
++	&dev_attr_raw8.attr,
++	&dev_attr_millivolts0.attr,
++	&dev_attr_millivolts1.attr,
++	&dev_attr_millivolts2.attr,
++	&dev_attr_millivolts3.attr,
++	&dev_attr_millivolts4.attr,
++	&dev_attr_millivolts5.attr,
++	&dev_attr_millivolts6.attr,
++	&dev_attr_millivolts7.attr,
++	&dev_attr_millivolts8.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(fj_adc);
++
++static int fj_adc_probe(struct platform_device *pdev)
++{
++	struct fruitjam_adc *fj;
++	int ret;
++
++	fj = devm_kzalloc(&pdev->dev, sizeof(*fj), GFP_KERNEL);
++	if (!fj)
++		return -ENOMEM;
++
++	fj->dev = &pdev->dev;
++	mutex_init(&fj->lock);
++	device_property_read_u32(&pdev->dev, "raspberrypi,adc-base-gpio",
++				 &fj->base_gpio);
++	if (!fj->base_gpio)
++		fj->base_gpio = FJ_ADC_DEFAULT_BASE_GPIO;
++
++	fj->adc = fj_ioremap_byname(pdev, "adc");
++	if (IS_ERR(fj->adc))
++		return PTR_ERR(fj->adc);
++	fj->resets = fj_ioremap_byname(pdev, "resets");
++	if (IS_ERR(fj->resets))
++		return PTR_ERR(fj->resets);
++	fj->io_bank0 = fj_ioremap_byname(pdev, "io-bank0");
++	if (IS_ERR(fj->io_bank0))
++		return PTR_ERR(fj->io_bank0);
++	fj->pads_bank0 = fj_ioremap_byname(pdev, "pads-bank0");
++	if (IS_ERR(fj->pads_bank0))
++		return PTR_ERR(fj->pads_bank0);
++
++	platform_set_drvdata(pdev, fj);
++
++	ret = fj_adc_reset(fj);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "ADC reset failed\n");
++	writel(0, fj->adc + FJ_ADC_FCS);
++	writel(FJ_ADC_CS_EN | FJ_ADC_CS_ERR_STICKY, fj->adc + FJ_ADC_CS);
++	ret = fj_adc_wait_ready(fj);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "ADC did not become ready\n");
++
++	ret = device_add_groups(&pdev->dev, fj_adc_groups);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev, "Fruit Jam RP2350 ADC ready, GPIO%u maps to raw0\n",
++		 fj->base_gpio);
++	return 0;
++}
++
++static const struct of_device_id fj_adc_of_match[] = {
++	{ .compatible = "adafruit,fruit-jam-rp2350-adc" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fj_adc_of_match);
++
++static struct platform_driver fj_adc_driver = {
++	.probe = fj_adc_probe,
++	.driver = {
++		.name = "fruitjam-rp2350-adc",
++		.of_match_table = fj_adc_of_match,
++	},
++};
++module_platform_driver(fj_adc_driver);
++
++MODULE_AUTHOR("Codex");
++MODULE_DESCRIPTION("Adafruit Fruit Jam RP2350 ADC sysfs helper");
++MODULE_LICENSE("GPL");
+-- 
+2.39.5

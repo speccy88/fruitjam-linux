@@ -1,3 +1,5 @@
 source "$BR2_EXTERNAL_RPI_PICO2_PATH/package/pico2-bootloader/Config.in"
 source "$BR2_EXTERNAL_RPI_PICO2_PATH/package/fruitjam-utils/Config.in"
+source "$BR2_EXTERNAL_RPI_PICO2_PATH/package/fruitjam-airlift/Config.in"
+source "$BR2_EXTERNAL_RPI_PICO2_PATH/package/fruitjam-netbox/Config.in"
 source "$BR2_EXTERNAL_RPI_PICO2_PATH/package/berry/Config.in"

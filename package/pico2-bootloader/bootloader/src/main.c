@@ -75,6 +75,7 @@ extern size_t __payload_load_start[];
 
 static inline void set_uart_pinmux(void);
 static inline void set_xip_cs1_pinmux(void);
+static inline void set_sd_spi_pinmux(void);
 
 static int wait_for_input(const char *msg);
 static void hexdump(const void *data, size_t size);
@@ -117,8 +118,11 @@ int main(void) {
 #else
 	set_reset(RESETS_UART1, 0);
 #endif
+	set_reset(RESETS_SPI0, 0);
+	set_reset(RESETS_SPI1, 0);
 
 	set_uart_pinmux();
+	set_sd_spi_pinmux();
 
 	set_config(LED_PIN, PADS_CLEAR);
 	set_pinfunc(LED_PIN, GPIO_FUNC_SIO);
@@ -196,6 +200,24 @@ static inline void set_uart_pinmux(void) {
 static inline void set_xip_cs1_pinmux(void) {
 	set_config(RP2350_XIP_CSI_PIN, PADS_CLEAR);
 	set_pinfunc(RP2350_XIP_CSI_PIN, GPIO_FUNC_XIP_CS1);
+}
+
+static inline void set_sd_spi_pinmux(void) {
+	set_config(34, PADS_CLEAR); /* SD SCK */
+	set_config(35, PADS_CLEAR); /* SD MOSI */
+	set_config(36, PADS_IE);    /* SD MISO */
+	set_config(39, PADS_CLEAR); /* SD CS */
+	set_pinfunc(34, GPIO_FUNC_SPI);
+	set_pinfunc(35, GPIO_FUNC_SPI);
+	set_pinfunc(36, GPIO_FUNC_SPI);
+	set_pinfunc(39, GPIO_FUNC_SPI);
+}
+#else
+static inline void set_sd_spi_pinmux(void) {
+	gpio_set_function(34, GPIO_FUNC_SPI);
+	gpio_set_function(35, GPIO_FUNC_SPI);
+	gpio_set_function(36, GPIO_FUNC_SPI);
+	gpio_set_function(39, GPIO_FUNC_SPI);
 }
 #endif
 

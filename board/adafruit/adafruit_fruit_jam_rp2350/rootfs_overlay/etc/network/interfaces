@@ -1,0 +1,6 @@
+auto lo
+iface lo inet loopback
+
+# AirLift currently exposes control/status through airliftctl, not a kernel
+# netdev. If a USB Ethernet gadget or AirLift netdev is added later, put its
+# DHCP stanza here.

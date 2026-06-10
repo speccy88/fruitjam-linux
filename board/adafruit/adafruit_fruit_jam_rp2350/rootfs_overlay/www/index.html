@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fruit Jam Hardware Playground</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">RP2350 Linux</p>
+      <h1>Fruit Jam Hardware Playground</h1>
+    </div>
+    <div class="actions">
+      <button id="refresh" type="button">Refresh</button>
+      <a class="ghost" href="/cgi-bin/env.cgi">CGI env</a>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="status-panel">
+      <div class="status-card">
+        <span class="label">Berry CGI</span>
+        <strong id="berryStatus">checking</strong>
+      </div>
+      <div class="status-card">
+        <span class="label">NeoPixels</span>
+        <strong id="neoStatus">checking</strong>
+      </div>
+      <div class="status-card">
+        <span class="label">I2C</span>
+        <strong id="i2cStatus">checking</strong>
+      </div>
+      <div class="status-card">
+        <span class="label">Audio</span>
+        <strong id="audioStatus">checking</strong>
+      </div>
+      <div class="status-card">
+        <span class="label">SD</span>
+        <strong id="sdStatus">checking</strong>
+      </div>
+    </section>
+
+    <section class="panel wide">
+      <div class="panel-head">
+        <div>
+          <h2>NeoPixels</h2>
+          <p>Five onboard LEDs through Berry and `/dev/neopixels`.</p>
+        </div>
+        <div class="button-row">
+          <button id="rainbow" type="button">Rainbow</button>
+          <button id="warm" type="button">Warm</button>
+          <button id="clearPixels" type="button">Clear</button>
+          <button id="applyPixels" class="primary" type="button">Apply</button>
+        </div>
+      </div>
+      <div id="pixelGrid" class="pixel-grid"></div>
+      <p class="hint" id="pixelResult">Waiting for a color update.</p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Buttons</h2>
+          <p>GPIO0, GPIO4, GPIO5 live state.</p>
+        </div>
+      </div>
+      <div id="buttons" class="button-state"></div>
+      <div class="button-row">
+        <button data-test-button="button1" type="button">Test B1</button>
+        <button data-test-button="button2" type="button">Test B2</button>
+        <button data-test-button="button3" type="button">Test B3</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>RTTTL Audio</h2>
+          <p>Play through the TLV320 beep path.</p>
+        </div>
+      </div>
+      <label class="field">
+        <span>Tune</span>
+        <input id="rtttl" type="text" value="fruit:d=8,o=5,b=120:c,e,g,c6,g,e,c">
+      </label>
+      <button id="playTune" class="primary" type="button">Play tune</button>
+      <pre id="rtttlOutput" class="output">Ready.</pre>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>I2C</h2>
+          <p>Scan GPIO20/GPIO21 `/dev/i2c-0`.</p>
+        </div>
+        <button id="scanI2c" type="button">Scan</button>
+      </div>
+      <div id="i2cDevices" class="chips"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>ADC</h2>
+          <p>Read RP2350 ADC channels.</p>
+        </div>
+      </div>
+      <div class="split-row">
+        <select id="adcChannel">
+          <option value="0">ADC0 GPIO40</option>
+          <option value="1">ADC1 GPIO41</option>
+          <option value="2">ADC2 GPIO42</option>
+          <option value="3">ADC3 GPIO43</option>
+          <option value="4">ADC4 GPIO44</option>
+          <option value="5">ADC5 GPIO45</option>
+          <option value="temp">Temperature</option>
+        </select>
+        <button id="readAdc" type="button">Read</button>
+      </div>
+      <pre id="adcOutput" class="output">No ADC reading yet.</pre>
+    </section>
+
+    <section class="panel wide">
+      <div class="panel-head">
+        <div>
+          <h2>Activity</h2>
+          <p>Recent CGI calls and hardware responses.</p>
+        </div>
+        <button id="clearLog" type="button">Clear log</button>
+      </div>
+      <pre id="log" class="log"></pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

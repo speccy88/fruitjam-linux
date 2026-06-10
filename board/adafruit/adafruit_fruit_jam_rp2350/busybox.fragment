@@ -1,5 +1,5 @@
-CONFIG_FEATURE_PREFER_APPLETS=y
-CONFIG_FEATURE_SH_STANDALONE=y
+# CONFIG_FEATURE_PREFER_APPLETS is not set
+# CONFIG_FEATURE_SH_STANDALONE is not set
 
 CONFIG_VI=y
 CONFIG_FEATURE_VI_MAX_LEN=2048
@@ -20,9 +20,19 @@ CONFIG_FEATURE_VI_READONLY=y
 CONFIG_FEATURE_VI_UNDO_QUEUE_MAX=0
 # CONFIG_FEATURE_VI_VERBOSE_STATUS is not set
 
-# Keep the no-MMU BusyBox BFLT below the 512 KiB allocation cliff.  Console,
-# basic file tools, shell, dmesg, grep, mount, ps, kill, and vi stay enabled;
-# these are convenience applets that are expensive on this board.
+# Keep the no-MMU BusyBox BFLT small enough that additional shells can start
+# after services are running. Applets below are supplied by fruitjam-netbox as
+# standalone binaries so they do not inflate /bin/sh.
+# CONFIG_CAT is not set
+# CONFIG_ECHO is not set
+# CONFIG_LS is not set
+# CONFIG_MKDIR is not set
+# CONFIG_MOUNT is not set
+# CONFIG_PRINTF is not set
+# CONFIG_PS is not set
+# CONFIG_SLEEP is not set
+# CONFIG_UMOUNT is not set
+# CONFIG_VI is not set
 # CONFIG_BC is not set
 # CONFIG_FEATURE_DC_BIG is not set
 # CONFIG_FEATURE_BC_INTERACTIVE is not set
@@ -121,6 +131,8 @@ CONFIG_FEATURE_VI_UNDO_QUEUE_MAX=0
 # CONFIG_FEATURE_IP_ROUTE is not set
 # CONFIG_NC is not set
 # CONFIG_NC_SERVER is not set
+# CONFIG_NC_EXTRA is not set
+# CONFIG_NC_110_COMPAT is not set
 # CONFIG_NETSTAT is not set
 # CONFIG_FEATURE_NETSTAT_PRG is not set
 # CONFIG_PING is not set
@@ -129,7 +141,26 @@ CONFIG_FEATURE_VI_UNDO_QUEUE_MAX=0
 # CONFIG_FEATURE_TELNET_TTYPE is not set
 # CONFIG_FEATURE_TELNET_AUTOLOGIN is not set
 # CONFIG_FEATURE_TELNET_WIDTH is not set
+# CONFIG_TELNETD is not set
+# CONFIG_FEATURE_TELNETD_STANDALONE is not set
+CONFIG_FEATURE_TELNETD_PORT_DEFAULT=23
+# CONFIG_HTTPD is not set
+CONFIG_FEATURE_HTTPD_PORT_DEFAULT=80
+# CONFIG_FEATURE_HTTPD_CGI is not set
+# CONFIG_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR is not set
+# CONFIG_FEATURE_HTTPD_SET_REMOTE_PORT_TO_ENV is not set
+# CONFIG_FTPD is not set
+# CONFIG_FEATURE_FTPD_WRITE is not set
+# CONFIG_TFTPD is not set
+# CONFIG_TFTP is not set
+# CONFIG_FEATURE_TFTP_GET is not set
+# CONFIG_FEATURE_TFTP_PUT is not set
+# CONFIG_FEATURE_TFTP_BLOCKSIZE is not set
+# CONFIG_TCPSVD is not set
+# CONFIG_UDPSVD is not set
+# CONFIG_INETD is not set
 # CONFIG_WGET is not set
 # CONFIG_FEATURE_WGET_FTP is not set
+# CONFIG_FEATURE_WGET_TIMEOUT is not set
 # CONFIG_UDHCPC is not set
 # CONFIG_FEATURE_UDHCPC_SANITIZEOPT is not set

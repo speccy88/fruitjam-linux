@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 10 Jun 2026 07:00:00 -0400
+Subject: [PATCH] misc: add Fruit Jam AirLift GPIO helper
+
+Add a small board-specific misc driver for the Fruit Jam ESP32-C6 AirLift
+control pins.  The no-MMU RP2350 bring-up image does not yet have generic
+GPIO or pinctrl drivers, and userspace /dev/mem stores fault on this port.
+This helper keeps pin muxing and GPIO control in the kernel while leaving
+SPI byte transfers on the standard PL022/spidev path.
+---
+ drivers/misc/Kconfig                 |  10 ++
+ drivers/misc/Makefile                |   1 +
+ drivers/misc/fruitjam_airlift_gpio.c | 320 +++++++++++++++++++++++++++
+ 3 files changed, 331 insertions(+)
+ create mode 100644 drivers/misc/fruitjam_airlift_gpio.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 0f58d5b5b8a1..00ebd1f2b8be 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -62,6 +62,16 @@ config RP2350_NEOPIXEL
+ 
+ 	  If unsure, say N.
+ 
++config FRUITJAM_AIRLIFT_GPIO
++	tristate "Adafruit Fruit Jam AirLift GPIO misc device"
++	depends on OF && HAS_IOMEM
++	help
++	  Say Y here to expose /dev/airlift-gpio for the Adafruit Fruit Jam
++	  RP2350B ESP32-C6 AirLift control pins.  This small board helper
++	  configures SPI pin muxing and controls CS, READY, BUSY, and reset.
++
++	  If unsure, say N.
++
+ config IBM_ASM
+ 	tristate "Device driver for IBM RSA service processor"
+ 	depends on X86 && PCI && INPUT
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 510af3884413..65fd4ad6fc75 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -8,6 +8,7 @@ obj-$(CONFIG_IBM_ASM)		+= ibmasm/
+ obj-$(CONFIG_IBMVMC)		+= ibmvmc.o
+ obj-$(CONFIG_AD525X_DPOT)	+= ad525x_dpot.o
+ obj-$(CONFIG_RP2350_NEOPIXEL)	+= rp2350_neopixel.o
++obj-$(CONFIG_FRUITJAM_AIRLIFT_GPIO) += fruitjam_airlift_gpio.o
+ obj-$(CONFIG_AD525X_DPOT_I2C)	+= ad525x_dpot-i2c.o
+ obj-$(CONFIG_AD525X_DPOT_SPI)	+= ad525x_dpot-spi.o
+ obj-$(CONFIG_ATMEL_SSC)		+= atmel-ssc.o
+diff --git a/drivers/misc/fruitjam_airlift_gpio.c b/drivers/misc/fruitjam_airlift_gpio.c
+new file mode 100644
+index 000000000000..22e8428e44df
+--- /dev/null
++++ b/drivers/misc/fruitjam_airlift_gpio.c
+@@ -0,0 +1,320 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Adafruit Fruit Jam RP2350B AirLift GPIO helper.
++ */
++
++#include <linux/bitops.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++
++#define FJ_SIO_GPIO_IN		0x004
++#define FJ_SIO_GPIO_HI_IN	0x008
++#define FJ_SIO_GPIO_OUT		0x010
++#define FJ_SIO_GPIO_HI_OUT	0x014
++#define FJ_SIO_GPIO_OUT_SET	0x018
++#define FJ_SIO_GPIO_HI_OUT_SET	0x01c
++#define FJ_SIO_GPIO_OUT_CLR	0x020
++#define FJ_SIO_GPIO_HI_OUT_CLR	0x024
++#define FJ_SIO_GPIO_OE_SET	0x038
++#define FJ_SIO_GPIO_HI_OE_SET	0x03c
++#define FJ_SIO_GPIO_OE_CLR	0x040
++#define FJ_SIO_GPIO_HI_OE_CLR	0x044
++
++#define FJ_IO_GPIO_CTRL(gpio)	(0x004 + ((gpio) * 8))
++#define FJ_PADS_GPIO(gpio)	(0x004 + ((gpio) * 4))
++
++#define FJ_GPIO_FUNC_SPI	1
++#define FJ_GPIO_FUNC_SIO	5
++#define FJ_PADS_IE		BIT(6)
++#define FJ_PADS_PUE		BIT(3)
++#define FJ_PADS_DRIVE_4MA	BIT(4)
++
++#define FJ_AIRLIFT_RESET_GPIO	22
++#define FJ_AIRLIFT_READY_GPIO	3
++#define FJ_AIRLIFT_IRQ_GPIO	23
++#define FJ_AIRLIFT_MISO_GPIO	28
++#define FJ_AIRLIFT_SCK_GPIO	30
++#define FJ_AIRLIFT_MOSI_GPIO	31
++#define FJ_AIRLIFT_CS_GPIO	46
++
++#define FJ_SD_CARD_DETECT_GPIO	33
++#define FJ_SD_SCK_GPIO		34
++#define FJ_SD_MOSI_GPIO		35
++#define FJ_SD_MISO_GPIO		36
++#define FJ_SD_CS_GPIO		39
++
++struct fruitjam_airlift_gpio {
++	struct device *dev;
++	struct miscdevice miscdev;
++	struct mutex lock;
++	void __iomem *sio;
++	void __iomem *io_bank0;
++	void __iomem *pads_bank0;
++	bool cs_asserted;
++};
++
++static u32 fj_gpio_mask(unsigned int gpio)
++{
++	return BIT(gpio & 31);
++}
++
++static void __iomem *fj_sio_reg(struct fruitjam_airlift_gpio *ag,
++				unsigned int gpio, u32 lo, u32 hi)
++{
++	return ag->sio + (gpio < 32 ? lo : hi);
++}
++
++static void fj_gpio_set(struct fruitjam_airlift_gpio *ag, unsigned int gpio, bool high)
++{
++	u32 lo = high ? FJ_SIO_GPIO_OUT_SET : FJ_SIO_GPIO_OUT_CLR;
++	u32 hi = high ? FJ_SIO_GPIO_HI_OUT_SET : FJ_SIO_GPIO_HI_OUT_CLR;
++
++	writel(fj_gpio_mask(gpio), fj_sio_reg(ag, gpio, lo, hi));
++}
++
++static bool fj_gpio_get(struct fruitjam_airlift_gpio *ag, unsigned int gpio)
++{
++	u32 value = readl(fj_sio_reg(ag, gpio, FJ_SIO_GPIO_IN, FJ_SIO_GPIO_HI_IN));
++
++	return !!(value & fj_gpio_mask(gpio));
++}
++
++static bool fj_gpio_out_get(struct fruitjam_airlift_gpio *ag, unsigned int gpio)
++{
++	u32 value = readl(fj_sio_reg(ag, gpio, FJ_SIO_GPIO_OUT, FJ_SIO_GPIO_HI_OUT));
++
++	return !!(value & fj_gpio_mask(gpio));
++}
++
++static void fj_gpio_oe(struct fruitjam_airlift_gpio *ag, unsigned int gpio, bool output)
++{
++	u32 lo = output ? FJ_SIO_GPIO_OE_SET : FJ_SIO_GPIO_OE_CLR;
++	u32 hi = output ? FJ_SIO_GPIO_HI_OE_SET : FJ_SIO_GPIO_HI_OE_CLR;
++
++	writel(fj_gpio_mask(gpio), fj_sio_reg(ag, gpio, lo, hi));
++}
++
++static void fj_gpio_func(struct fruitjam_airlift_gpio *ag, unsigned int gpio, u32 func)
++{
++	writel(func, ag->io_bank0 + FJ_IO_GPIO_CTRL(gpio));
++}
++
++static void fj_gpio_output(struct fruitjam_airlift_gpio *ag, unsigned int gpio, bool high)
++{
++	writel(FJ_PADS_DRIVE_4MA, ag->pads_bank0 + FJ_PADS_GPIO(gpio));
++	fj_gpio_func(ag, gpio, FJ_GPIO_FUNC_SIO);
++	fj_gpio_set(ag, gpio, high);
++	fj_gpio_oe(ag, gpio, true);
++}
++
++static void fj_gpio_input(struct fruitjam_airlift_gpio *ag, unsigned int gpio, bool pullup)
++{
++	writel(FJ_PADS_IE | (pullup ? FJ_PADS_PUE : 0), ag->pads_bank0 + FJ_PADS_GPIO(gpio));
++	fj_gpio_func(ag, gpio, FJ_GPIO_FUNC_SIO);
++	fj_gpio_oe(ag, gpio, false);
++}
++
++static void fj_gpio_spi_output(struct fruitjam_airlift_gpio *ag, unsigned int gpio)
++{
++	writel(FJ_PADS_DRIVE_4MA, ag->pads_bank0 + FJ_PADS_GPIO(gpio));
++	fj_gpio_func(ag, gpio, FJ_GPIO_FUNC_SPI);
++}
++
++static void fj_gpio_spi_input(struct fruitjam_airlift_gpio *ag, unsigned int gpio)
++{
++	writel(FJ_PADS_IE, ag->pads_bank0 + FJ_PADS_GPIO(gpio));
++	fj_gpio_func(ag, gpio, FJ_GPIO_FUNC_SPI);
++}
++
++static void fj_airlift_configure(struct fruitjam_airlift_gpio *ag)
++{
++	fj_gpio_spi_input(ag, FJ_AIRLIFT_MISO_GPIO);
++	fj_gpio_spi_output(ag, FJ_AIRLIFT_SCK_GPIO);
++	fj_gpio_spi_output(ag, FJ_AIRLIFT_MOSI_GPIO);
++	fj_gpio_output(ag, FJ_AIRLIFT_CS_GPIO, true);
++	fj_gpio_input(ag, FJ_AIRLIFT_READY_GPIO, true);
++	fj_gpio_input(ag, FJ_AIRLIFT_IRQ_GPIO, true);
++	fj_gpio_output(ag, FJ_AIRLIFT_RESET_GPIO, true);
++	ag->cs_asserted = false;
++}
++
++static void fj_sd_configure(struct fruitjam_airlift_gpio *ag)
++{
++	/*
++	 * Configure the Fruit Jam microSD slot for RP2350 SPI0.  CS stays on
++	 * SIO and is driven through the SPI core's cs-gpios binding.
++	 */
++	fj_gpio_input(ag, FJ_SD_CARD_DETECT_GPIO, true);
++	fj_gpio_output(ag, FJ_SD_CS_GPIO, true);
++	fj_gpio_spi_input(ag, FJ_SD_MISO_GPIO);
++	fj_gpio_spi_output(ag, FJ_SD_SCK_GPIO);
++	fj_gpio_spi_output(ag, FJ_SD_MOSI_GPIO);
++	/* SPI core drives SD CS through gpiolib. */
++}
++
++static void fj_board_configure(struct fruitjam_airlift_gpio *ag)
++{
++	fj_sd_configure(ag);
++	fj_airlift_configure(ag);
++}
++
++static void fj_airlift_reset(struct fruitjam_airlift_gpio *ag)
++{
++	fj_gpio_output(ag, FJ_AIRLIFT_CS_GPIO, true);
++	ag->cs_asserted = false;
++	fj_gpio_output(ag, FJ_AIRLIFT_RESET_GPIO, false);
++	msleep(10);
++	fj_gpio_output(ag, FJ_AIRLIFT_RESET_GPIO, true);
++	msleep(750);
++}
++
++static ssize_t fj_airlift_read(struct file *file, char __user *buf,
++			       size_t count, loff_t *ppos)
++{
++	struct fruitjam_airlift_gpio *ag = container_of(file->private_data,
++			struct fruitjam_airlift_gpio, miscdev);
++	char tmp[96];
++	int len;
++
++	mutex_lock(&ag->lock);
++	len = scnprintf(tmp, sizeof(tmp),
++			"ready %u\nirq %u\nbusy %u\ncs %u\nreset %u\n",
++			fj_gpio_get(ag, FJ_AIRLIFT_READY_GPIO),
++			fj_gpio_get(ag, FJ_AIRLIFT_IRQ_GPIO),
++			fj_gpio_get(ag, FJ_AIRLIFT_READY_GPIO),
++			ag->cs_asserted,
++			fj_gpio_out_get(ag, FJ_AIRLIFT_RESET_GPIO));
++	mutex_unlock(&ag->lock);
++
++	return simple_read_from_buffer(buf, count, ppos, tmp, len);
++}
++
++static ssize_t fj_airlift_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	struct fruitjam_airlift_gpio *ag = container_of(file->private_data,
++			struct fruitjam_airlift_gpio, miscdev);
++	char cmd[32];
++
++	if (count >= sizeof(cmd))
++		return -EINVAL;
++	if (copy_from_user(cmd, buf, count))
++		return -EFAULT;
++	cmd[count] = '\0';
++	strim(cmd);
++
++	mutex_lock(&ag->lock);
++	if (!strcmp(cmd, "init")) {
++		fj_board_configure(ag);
++	} else if (!strcmp(cmd, "reset")) {
++		fj_airlift_reset(ag);
++	} else if (!strcmp(cmd, "cs 1")) {
++		fj_gpio_set(ag, FJ_AIRLIFT_CS_GPIO, false);
++		ag->cs_asserted = true;
++	} else if (!strcmp(cmd, "cs 0")) {
++		fj_gpio_set(ag, FJ_AIRLIFT_CS_GPIO, true);
++		ag->cs_asserted = false;
++	} else {
++		mutex_unlock(&ag->lock);
++		return -EINVAL;
++	}
++	mutex_unlock(&ag->lock);
++
++	return count;
++}
++
++static const struct file_operations fj_airlift_fops = {
++	.owner = THIS_MODULE,
++	.read = fj_airlift_read,
++	.write = fj_airlift_write,
++	.llseek = default_llseek,
++};
++
++static void __iomem *fj_airlift_ioremap(struct platform_device *pdev,
++					const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return ERR_PTR(-EINVAL);
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++static int fj_airlift_probe(struct platform_device *pdev)
++{
++	struct fruitjam_airlift_gpio *ag;
++	int ret;
++
++	ag = devm_kzalloc(&pdev->dev, sizeof(*ag), GFP_KERNEL);
++	if (!ag)
++		return -ENOMEM;
++
++	ag->dev = &pdev->dev;
++	mutex_init(&ag->lock);
++
++	ag->sio = fj_airlift_ioremap(pdev, "sio");
++	if (IS_ERR(ag->sio))
++		return PTR_ERR(ag->sio);
++	ag->io_bank0 = fj_airlift_ioremap(pdev, "io-bank0");
++	if (IS_ERR(ag->io_bank0))
++		return PTR_ERR(ag->io_bank0);
++	ag->pads_bank0 = fj_airlift_ioremap(pdev, "pads-bank0");
++	if (IS_ERR(ag->pads_bank0))
++		return PTR_ERR(ag->pads_bank0);
++
++	ag->miscdev.minor = MISC_DYNAMIC_MINOR;
++	ag->miscdev.name = "airlift-gpio";
++	ag->miscdev.fops = &fj_airlift_fops;
++	ag->miscdev.parent = &pdev->dev;
++
++	fj_board_configure(ag);
++	platform_set_drvdata(pdev, ag);
++
++	ret = misc_register(&ag->miscdev);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev, "registered /dev/airlift-gpio\n");
++	return 0;
++}
++
++static void fj_airlift_remove(struct platform_device *pdev)
++{
++	struct fruitjam_airlift_gpio *ag = platform_get_drvdata(pdev);
++
++	misc_deregister(&ag->miscdev);
++}
++
++static const struct of_device_id fj_airlift_of_match[] = {
++	{ .compatible = "adafruit,fruit-jam-rp2350-airlift-gpio" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fj_airlift_of_match);
++
++static struct platform_driver fj_airlift_driver = {
++	.probe = fj_airlift_probe,
++	.remove = fj_airlift_remove,
++	.driver = {
++		.name = "fruitjam-airlift-gpio",
++		.of_match_table = fj_airlift_of_match,
++	},
++};
++module_platform_driver(fj_airlift_driver);
++
++MODULE_AUTHOR("Codex");
++MODULE_DESCRIPTION("Adafruit Fruit Jam RP2350B AirLift GPIO helper");
++MODULE_LICENSE("GPL");

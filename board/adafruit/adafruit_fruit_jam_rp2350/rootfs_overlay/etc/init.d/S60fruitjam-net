@@ -1,0 +1,23 @@
+#!/bin/sh
+
+case "$1" in
+	start|"")
+		/usr/bin/fruitjam-services init
+		;;
+	all)
+		/usr/bin/fruitjam-services all
+		;;
+	stop)
+		/usr/bin/fruitjam-services stop
+		;;
+	restart|reload)
+		/usr/bin/fruitjam-services restart
+		;;
+	status)
+		/usr/bin/fruitjam-services status
+		;;
+	*)
+		echo "usage: $0 {start|all|stop|restart|status}"
+		exit 1
+		;;
+esac

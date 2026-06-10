@@ -1,0 +1,8 @@
+config BR2_PACKAGE_FRUITJAM_NETBOX
+	bool "fruitjam-netbox"
+	help
+	  Build a small BusyBox-derived network applet binary for the
+	  Fruit Jam no-MMU image. Keeping httpd, nc, ftpd, tftpd,
+	  telnetd, wget, ifconfig, and netstat in a separate binary
+	  keeps each exec below the RP2350 Linux 256 KiB allocation
+	  class.

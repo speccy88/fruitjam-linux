@@ -123,9 +123,9 @@ shared TLV320/ESP32-C6 reset line, and enable USB host 5 V power. This does not
 make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
 bridge so hardware validation can proceed over UART and USB CDC.
 
-The `bootsel` command is experimental. It requests a restart into the RP2350 ROM
-BOOTSEL loader. Current testing shows it drops the USB CDC console, but it has not
-yet reliably re-enumerated as a `picotool` BOOTSEL device.
+The `bootsel` command requests a restart into the RP2350 ROM BOOTSEL loader. It
+has been verified on Fruit Jam hardware by running `fruitjamctl bootsel` from the
+Linux console and confirming `picotool info -a` reports `boot type: bootsel`.
 
 ## Berry and NeoPixels
 
@@ -156,7 +156,5 @@ test
 * microSD block support is not enabled or tested.
 * Buttons are readable through `fruitjamctl`; WiFi/AirLift, I2S audio, DVI, and
   USB host input still need real Linux support.
-* Software BOOTSEL is not yet reliable enough to remove the physical BOOTSEL/reset
-  recovery path.
 * RP2350 atomics are only safe in internal SRAM; see `docs/risks.md` before moving
   lock-heavy structures or userspace runtimes into PSRAM.

@@ -30,10 +30,8 @@ Validated on hardware:
 * Berry REPL expression evaluation.
 * `berry /root/neopixels.be`, visually confirmed on the onboard NeoPixels.
 * `/bin/vi -> busybox`.
-
-Known open item: `fruitjamctl bootsel` is still experimental. It currently drops
-the USB CDC console, but has not yet reliably re-enumerated as the RP2350 ROM
-BOOTSEL device on the test board.
+* `fruitjamctl bootsel`, verified by `picotool info -a` reporting
+  `boot type: bootsel`.
 
 Build and flash:
 

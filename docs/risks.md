@@ -27,8 +27,8 @@ Practical rules:
   console; use a 3.3 V hardware UART adapter.
 * `fruitjamctl` touches low-risk GPIOs through `/dev/mem` for diagnostics. It is
   not a substitute for proper kernel GPIO/LED/input/USB-host/I2S/HSTX drivers.
-* `fruitjamctl bootsel` is still experimental. Keep the physical BOOTSEL/reset
-  recovery path available until software BOOTSEL is proven reliable.
+* `fruitjamctl bootsel` uses the RP2350 bootrom watchdog-vector protocol and has
+  been verified to re-enumerate as ROM BOOTSEL with `picotool info -a`.
 * microSD, HSTX DVI, I2S audio, AirLift networking, and USB keyboard support are
   not implemented yet. Their pin mappings are documented to guide later work only.
 * The NeoPixel driver uses PIO directly and is intentionally narrow: five onboard

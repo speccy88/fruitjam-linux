@@ -44,6 +44,8 @@ Acceptance test:
 4. Enter the Berry REPL and evaluate `1+2`.
 5. Confirm `/bin/vi` exists and points to BusyBox.
 6. Run `berry /root/neopixels.be` and visually confirm the five-pixel pattern.
+7. Run `fruitjamctl bootsel` and confirm `picotool info -a` reports
+   `boot type: bootsel`.
 
 Status: achieved on Fruit Jam hardware.
 
@@ -53,8 +55,6 @@ Status: achieved on Fruit Jam hardware.
 * Validate every pin in `docs/pinmap-fruitjam.md` against schematic and hardware.
 * Replace `fruitjamctl` `/dev/mem` diagnostics with real GPIO/LED/input drivers once RP2350 GPIO/pinctrl support exists.
 * Add more robust early boot diagnostics if useful while keeping UART stable.
-* Finish software BOOTSEL. Current `fruitjamctl bootsel` attempts drop USB CDC but
-  have not reliably re-enumerated as the RP2350 ROM BOOTSEL device.
 
 ## Milestone D: microSD support
 

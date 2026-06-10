@@ -4,20 +4,20 @@ Date: Wed, 10 Jun 2026 00:00:00 -0400
 Subject: [PATCH] riscv: rp2350: add bootsel restart command
 
 Allow userspace to request the RP2350 USB BOOTSEL loader with the
-standard restart2 command string "bootsel". Linux marks the watchdog
-scratch register and resets through the watchdog; the first-stage
-bootloader then enters BOOTSEL from a clean runtime.
+standard restart2 command string "bootsel". Linux sets up the RP2350
+bootrom watchdog vector used by rom_reboot(REBOOT_TYPE_BOOTSEL), then
+resets through the watchdog.
 ---
- arch/riscv/kernel/reset.c | 58 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 58 insertions(+)
+ arch/riscv/kernel/reset.c | 90 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 90 insertions(+)
 
 diff --git a/arch/riscv/kernel/reset.c b/arch/riscv/kernel/reset.c
-index f927fcefe6b0..80741b9baf26 100644
+index f927fcefe6b0..0c340cf444a2 100644
 --- a/arch/riscv/kernel/reset.c
 +++ b/arch/riscv/kernel/reset.c
-@@ -4,7 +4,63 @@
+@@ -4,7 +4,95 @@
   */
-
+ 
  #include <linux/reboot.h>
 +#include <linux/io.h>
 +#include <linux/string.h>
@@ -25,47 +25,79 @@ index f927fcefe6b0..80741b9baf26 100644
 +
 +#ifdef CONFIG_ARCH_RP2350
 +#define RP2350_WATCHDOG_PHYS		0x400d8000
-+#define RP2350_PSM_PHYS			0x4001a000
-+#define RP2350_WATCHDOG_MMIO_SIZE	0x4000
++#define RP2350_PSM_PHYS			0x40018000
++#define RP2350_SYSCFG_PHYS		0x40008000
++#define RP2350_TICKS_PHYS		0x40108000
++#define RP2350_WATCHDOG_MMIO_SIZE	0x1000
 +#define RP2350_PSM_MMIO_SIZE		0x1000
++#define RP2350_SYSCFG_MMIO_SIZE		0x1000
++#define RP2350_TICKS_MMIO_SIZE		0x1000
 +
-+#define RP2350_WATCHDOG_CTRL_REG	0
-+#define RP2350_WATCHDOG_LOAD_REG	1
-+#define RP2350_WATCHDOG_SCRATCH4_REG	7
++#define RP2350_WATCHDOG_CTRL		0x00
++#define RP2350_WATCHDOG_LOAD		0x04
++#define RP2350_WATCHDOG_SCRATCH2	0x14
++#define RP2350_WATCHDOG_SCRATCH3	0x18
++#define RP2350_WATCHDOG_SCRATCH4	0x1c
++#define RP2350_WATCHDOG_SCRATCH5	0x20
++#define RP2350_WATCHDOG_SCRATCH6	0x24
++#define RP2350_WATCHDOG_SCRATCH7	0x28
 +#define RP2350_WATCHDOG_CTRL_ENABLE	BIT(30)
-+#define RP2350_WATCHDOG_CTRL_TRIGGER	BIT(31)
-+#define RP2350_WATCHDOG_CTRL_PAUSE_MASK	(BIT(24) | BIT(25) | BIT(26))
-+#define RP2350_WATCHDOG_RESCUE_MAGIC	0x6ab73121
 +
-+#define RP2350_PSM_WDSEL_REG		2
++#define RP2350_PSM_WDSEL		0x08
 +#define RP2350_PSM_WDSEL_BITS		0x01ffffff
-+#define RP2350_PSM_WDSEL_ROSC		BIT(2)
-+#define RP2350_PSM_WDSEL_XOSC		BIT(3)
++#define RP2350_PSM_WDSEL_PROC_COLD	BIT(0)
++#define RP2350_SYSCFG_AUXCTRL		0x14
++#define RP2350_SYSCFG_AUXCTRL_CLK		BIT(0)
++#define RP2350_TICKS_WATCHDOG_CTRL	0x30
++#define RP2350_TICKS_WATCHDOG_CYCLES	0x34
++#define RP2350_TICKS_WATCHDOG_ENABLE	BIT(0)
++
++#define RP2350_BOOTROM_VECTOR_MAGIC	0xb007c0d3
++#define RP2350_BOOTROM_VECTOR_PC_MOD	0xfffffffe
++#define RP2350_BOOTROM_BOOT_TYPE_BOOTSEL	2
++#define RP2350_BOOTSEL_FLAGS		0
++#define RP2350_BOOTSEL_GPIO_CONFIG	0
++#define RP2350_WATCHDOG_DELAY_US	10000
 +
 +static void rp2350_restart_bootsel(void)
 +{
 +	void __iomem *watchdog = ioremap(RP2350_WATCHDOG_PHYS,
 +					 RP2350_WATCHDOG_MMIO_SIZE);
 +	void __iomem *psm = ioremap(RP2350_PSM_PHYS, RP2350_PSM_MMIO_SIZE);
++	void __iomem *syscfg = ioremap(RP2350_SYSCFG_PHYS,
++				       RP2350_SYSCFG_MMIO_SIZE);
++	void __iomem *ticks = ioremap(RP2350_TICKS_PHYS, RP2350_TICKS_MMIO_SIZE);
 +
-+	if (!watchdog || !psm)
++	if (!watchdog || !psm || !syscfg || !ticks)
 +		goto spin;
 +
 +	/*
-+	 * Ask the first-stage bootloader to enter BOOTSEL from a clean runtime.
-+	 * Direct ROM calls from the live Linux kernel can leave USB half-alive.
++	 * Match the RP2350 bootrom reboot protocol for REBOOT_TYPE_BOOTSEL.
++	 * The ROM consumes scratch[4..7] as its vector and scratch[2..3] as
++	 * BOOTSEL parameters before any flash bootloader is entered.
 +	 */
-+	writel(RP2350_WATCHDOG_CTRL_ENABLE,
-+	       watchdog + 0x3000 + RP2350_WATCHDOG_CTRL_REG * 4);
-+	writel(RP2350_PSM_WDSEL_BITS &
-+	       ~(RP2350_PSM_WDSEL_ROSC | RP2350_PSM_WDSEL_XOSC),
-+	       psm + RP2350_PSM_WDSEL_REG * 4);
-+	writel(RP2350_WATCHDOG_RESCUE_MAGIC,
-+	       watchdog + RP2350_WATCHDOG_SCRATCH4_REG * 4);
-+	writel(RP2350_WATCHDOG_CTRL_PAUSE_MASK,
-+	       watchdog + RP2350_WATCHDOG_CTRL_REG * 4);
-+	writel(RP2350_WATCHDOG_CTRL_TRIGGER,
-+	       watchdog + 0x2000 + RP2350_WATCHDOG_CTRL_REG * 4);
++	writel(0, watchdog + RP2350_WATCHDOG_CTRL);
++	writel(RP2350_PSM_WDSEL_BITS & ~RP2350_PSM_WDSEL_PROC_COLD,
++	       psm + RP2350_PSM_WDSEL);
++	writel(RP2350_BOOTSEL_FLAGS, watchdog + RP2350_WATCHDOG_SCRATCH2);
++	writel(RP2350_BOOTSEL_GPIO_CONFIG, watchdog + RP2350_WATCHDOG_SCRATCH3);
++	writel(RP2350_BOOTROM_VECTOR_MAGIC,
++	       watchdog + RP2350_WATCHDOG_SCRATCH4);
++	writel(RP2350_BOOTROM_VECTOR_PC_MOD,
++	       watchdog + RP2350_WATCHDOG_SCRATCH5);
++	writel(RP2350_BOOTROM_BOOT_TYPE_BOOTSEL,
++	       watchdog + RP2350_WATCHDOG_SCRATCH6);
++	writel(RP2350_BOOTROM_VECTOR_MAGIC,
++	       watchdog + RP2350_WATCHDOG_SCRATCH7);
++
++	writel(12, ticks + RP2350_TICKS_WATCHDOG_CYCLES);
++	writel(RP2350_TICKS_WATCHDOG_ENABLE,
++	       ticks + RP2350_TICKS_WATCHDOG_CTRL);
++	writel(readl(syscfg + RP2350_SYSCFG_AUXCTRL) |
++	       RP2350_SYSCFG_AUXCTRL_CLK,
++	       syscfg + RP2350_SYSCFG_AUXCTRL);
++	writel(RP2350_WATCHDOG_DELAY_US, watchdog + RP2350_WATCHDOG_LOAD);
++	writel(RP2350_WATCHDOG_CTRL_ENABLE, watchdog + RP2350_WATCHDOG_CTRL);
 +
 +spin:
 +	while (1)
@@ -76,11 +108,11 @@ index f927fcefe6b0..80741b9baf26 100644
 +{
 +}
 +#endif
-
+ 
  static void default_power_off(void)
  {
-@@ -17,6 +73,8 @@
-
+@@ -17,6 +105,8 @@
+ 
  void machine_restart(char *cmd)
  {
 +	if (cmd && !strcmp(cmd, "bootsel"))

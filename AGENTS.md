@@ -17,12 +17,8 @@ Validated on Adafruit Fruit Jam hardware:
 * BusyBox `vi` is enabled.
 * `/dev/neopixels` works through the RP2350 PIO NeoPixel driver.
 * `/root/neopixels.be` lights the five onboard NeoPixels.
-
-Known open item:
-
-* `fruitjamctl bootsel` is experimental. It drops USB CDC on the test board but
-  has not reliably re-enumerated as a `picotool` BOOTSEL device. Keep the
-  physical BOOTSEL/reset recovery path available.
+* `fruitjamctl bootsel` reboots into the RP2350 ROM BOOTSEL loader, verified
+  with `picotool info -a`.
 
 ## Hardware Ports
 
@@ -202,7 +198,7 @@ contiguous memory on this no-MMU system.
 6. Create a GitHub release tag.
 7. Attach `flash-image.uf2`.
 8. In release notes, state both what was hardware-tested and what remains
-   experimental.
+   incomplete.
 
 Recommended release asset name:
 

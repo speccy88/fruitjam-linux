@@ -177,10 +177,32 @@
 				reg-names = "pio", "resets", "io-bank0", "pads-bank0";
 				raspberrypi,pio = <1>;
 				raspberrypi,sm = <1>;
+				raspberrypi,mclk-sm = <0>;
+				raspberrypi,din-gpio = <24>;
+				raspberrypi,mclk-gpio = <25>;
 				raspberrypi,bclk-gpio = <26>;
 				raspberrypi,ws-gpio = <27>;
 				raspberrypi,gpio-base = <16>;
 				raspberrypi,clk-sys-hz = <150000000>;
+				raspberrypi,mclk-hz = <15000000>;
+				status = "okay";
+			};
+
+			dvi: dvi@400c0000 {
+				compatible = "adafruit,fruit-jam-rp2350-dvi";
+				reg = <0x400c0000 0x100>,
+				      <0x50600000 0x100>,
+				      <0x50000000 0x1000>,
+				      <0x40020000 0x00c>,
+				      <0x40028000 0x200>,
+				      <0x40038000 0x100>,
+				      <0x40068000 0x100>,
+				      <0x40010000 0x100>;
+				reg-names = "hstx-ctrl", "hstx-fifo", "dma",
+					    "resets", "io-bank0", "pads-bank0",
+					    "busctrl", "clocks";
+				interrupt-parent = <&plic0>;
+				interrupts = <10>;
 				status = "okay";
 			};
 

@@ -176,6 +176,55 @@ define FRUITJAM_NETBOX_CONFIG_HUSH
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_FEATURE_SH_MATH)
 endef
 
+define FRUITJAM_NETBOX_CONFIG_COREBOX
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_BASENAME)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CHGRP)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CHMOD)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CHOWN)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CP)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CUT)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DATE)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DD)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DF)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DIRNAME)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DMESG)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_EGREP)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_ENV)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_FALSE)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_FGREP)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_GETOPT)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_GREP)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_HALT)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_HEAD)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_HOSTNAME)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_KILL)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_LN)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_MKNOD)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_MORE)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_MV)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_PING)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_POWEROFF)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_PRINTENV)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_PWD)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_REBOOT)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_RM)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_RMDIR)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_SED)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_STTY)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_SYNC)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TAIL)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TEE)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TEST)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TOUCH)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TR)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TRUE)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_UNAME)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_WC)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_WHICH)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_XARGS)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_YES)
+endef
+
 define FRUITJAM_NETBOX_CONFIG_NETSTAT
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_NETSTAT)
 endef
@@ -235,6 +284,7 @@ endef
 define FRUITJAM_NETBOX_BUILD_CMDS
 	$(call FRUITJAM_NETBOX_BUILD_ONE,INITBOX,fruitjam-busybox)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,HUSH,fruitjam-hush)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,COREBOX,fruitjam-corebox)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,CAT,fruitjam-cat)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,ECHO,fruitjam-echo)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,LS,fruitjam-ls)
@@ -262,6 +312,16 @@ endef
 define FRUITJAM_NETBOX_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 4755 $(@D)/fruitjam-busybox $(TARGET_DIR)/bin/busybox
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-hush $(TARGET_DIR)/usr/bin/hush
+	find $(TARGET_DIR)/bin $(TARGET_DIR)/sbin $(TARGET_DIR)/usr/bin \
+		$(TARGET_DIR)/usr/sbin -type l | while read link; do \
+		target=$$(readlink "$$link"); \
+		case "$$target" in busybox|../bin/busybox|../../bin/busybox) \
+			rm -f "$$link";; \
+		esac; \
+	done
+	ln -sf busybox $(TARGET_DIR)/bin/sh
+	ln -sf ../usr/bin/hush $(TARGET_DIR)/bin/hush
+	ln -sf ../bin/busybox $(TARGET_DIR)/sbin/init
 	rm -f $(TARGET_DIR)/bin/netbox \
 		$(TARGET_DIR)/bin/cat \
 		$(TARGET_DIR)/bin/echo \
@@ -276,6 +336,19 @@ define FRUITJAM_NETBOX_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/bin/killall \
 		$(TARGET_DIR)/sbin/ifconfig \
 		$(TARGET_DIR)/bin/netstat
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-corebox $(TARGET_DIR)/bin/corebox
+	for app in chgrp chmod chown cp date dd df dmesg egrep false fgrep \
+		getopt grep hostname kill ln mknod more mv ping printenv pwd rm \
+		rmdir sed stty sync touch true uname; do \
+		ln -sf corebox $(TARGET_DIR)/bin/$$app; \
+	done
+	for app in basename cut dirname env head tail tee test tr wc which xargs \
+		yes; do \
+		ln -sf ../../bin/corebox $(TARGET_DIR)/usr/bin/$$app; \
+	done
+	for app in halt poweroff reboot; do \
+		ln -sf ../bin/corebox $(TARGET_DIR)/sbin/$$app; \
+	done
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-cat $(TARGET_DIR)/bin/cat
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-echo $(TARGET_DIR)/bin/echo
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-ls $(TARGET_DIR)/bin/ls

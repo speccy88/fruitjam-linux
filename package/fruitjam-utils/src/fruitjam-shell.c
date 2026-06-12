@@ -59,6 +59,23 @@ static int split_args(char *line, char **argv, int max_args)
 	return argc;
 }
 
+static int read_interactive_line(char *line, size_t line_size)
+{
+	if (line_size == 0)
+		return 0;
+
+	/*
+	 * Keep the remote shell line-oriented. Echoing and flushing every byte is
+	 * very slow through the AirLift bridge and wastes scarce no-MMU memory on
+	 * in-flight socket traffic.
+	 */
+	if (!fgets(line, line_size, stdin)) {
+		line[0] = '\0';
+		return 0;
+	}
+	return 1;
+}
+
 static void exec_child(char **argv)
 {
 	char path[96];
@@ -118,7 +135,7 @@ int main(void)
 		int argc;
 
 		prompt();
-		if (!fgets(line, sizeof(line), stdin))
+		if (!read_interactive_line(line, sizeof(line)))
 			break;
 		cmd = trim(line);
 		if (!*cmd)

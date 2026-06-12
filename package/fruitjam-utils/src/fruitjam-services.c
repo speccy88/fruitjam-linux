@@ -9,10 +9,16 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -20,15 +26,18 @@
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-static const char *www_root = "/www";
-static const char *ftp_root = "/tmp/ftp";
+static const char *ftp_root = "/mnt/sd";
 static const char *tftp_root = "/tmp/tftp";
+static const char *const wifi_conf_paths[] = {
+	"/mnt/sd/fruitjam/wifi.conf",
+	"/etc/fruitjam-wifi.conf",
+};
 static int runtime_initialized;
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-services {init|httpd|telnetd|ftpd|tftpd|dropbear|buttonlog|buttons|core|all|stop|restart|status}\n");
+		"usage: fruitjam-services {init|httpd|telnetd|airlift-shell|airlift-inbound|ftpd|tftpd|dropbear|buttonlog|buttons|core|all|sd-refresh|stop|restart|status}\n");
 }
 
 static int write_text_file(const char *path, const char *text)
@@ -42,6 +51,65 @@ static int write_text_file(const char *path, const char *text)
 	fputs(text, fp);
 	fclose(fp);
 	return 0;
+}
+
+static int write_small_file(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY);
+	ssize_t ret;
+
+	if (fd < 0)
+		return -1;
+	ret = write(fd, text, strlen(text));
+	close(fd);
+	return ret == (ssize_t)strlen(text) ? 0 : -1;
+}
+
+static int gpio_path(unsigned int gpio, const char *leaf, char *path, size_t len)
+{
+	int ret = snprintf(path, len, "/sys/class/gpio/gpio%u/%s", gpio, leaf);
+
+	return ret > 0 && (size_t)ret < len ? 0 : -1;
+}
+
+static int gpio_export(unsigned int gpio)
+{
+	char path[64];
+	char text[12];
+	int fd;
+	ssize_t ret;
+	int i;
+
+	fd = open("/sys/class/gpio/export", O_WRONLY);
+	if (fd < 0)
+		return -1;
+	snprintf(text, sizeof(text), "%u", gpio);
+	ret = write(fd, text, strlen(text));
+	close(fd);
+	if (ret < 0 && errno != EBUSY)
+		return -1;
+	if (gpio_path(gpio, "value", path, sizeof(path)) < 0)
+		return -1;
+	for (i = 0; i < 50; i++) {
+		if (access(path, F_OK) == 0)
+			return 0;
+		usleep(2000);
+	}
+	return 0;
+}
+
+static void gpio_output_high(unsigned int gpio)
+{
+	char path[64];
+
+	if (gpio_export(gpio) < 0)
+		return;
+	if (gpio_path(gpio, "direction", path, sizeof(path)) == 0) {
+		if (write_small_file(path, "high") < 0)
+			write_small_file(path, "out");
+	}
+	if (gpio_path(gpio, "value", path, sizeof(path)) == 0)
+		write_small_file(path, "1");
 }
 
 static int mkdir_p(const char *path)
@@ -67,6 +135,149 @@ static int mkdir_p(const char *path)
 	if (mkdir(tmp, 0755) < 0 && errno != EEXIST)
 		return -1;
 	return 0;
+}
+
+static int dir_read_ok(const char *path)
+{
+	DIR *dir = opendir(path);
+	int saved;
+
+	if (!dir)
+		return errno == ENOENT ? 0 : -1;
+	errno = 0;
+	while (readdir(dir) != NULL)
+		;
+	saved = errno;
+	closedir(dir);
+	return saved == 0 ? 0 : -1;
+}
+
+static int sd_is_mounted(void)
+{
+	FILE *fp = fopen("/proc/mounts", "r");
+	char line[192];
+	char device[64];
+	char mountpoint[64];
+	char type[24];
+
+	if (!fp)
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		if (sscanf(line, "%63s %63s %23s", device, mountpoint, type) != 3)
+			continue;
+		if (!strcmp(mountpoint, "/mnt/sd")) {
+			fclose(fp);
+			return !strcmp(device, "/dev/mmcblk0p1") && !strcmp(type, "vfat");
+		}
+	}
+	fclose(fp);
+	return 0;
+}
+
+static int wait_for_sd_device(void)
+{
+	int i;
+
+	for (i = 0; i < 30; i++) {
+		if (access("/dev/mmcblk0p1", F_OK) == 0 && access("/mnt/sd", F_OK) == 0)
+			return 0;
+		usleep(100000);
+	}
+	return -1;
+}
+
+static int mount_sd(void)
+{
+	if (mount("/dev/mmcblk0p1", "/mnt/sd", "vfat", MS_SYNCHRONOUS, NULL) < 0) {
+		fprintf(stderr, "fruitjam-services: mount /mnt/sd: %s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+static int refresh_sd_mount(void)
+{
+	if (wait_for_sd_device() < 0)
+		return 0;
+
+	if (sd_is_mounted()) {
+		fprintf(stderr, "fruitjam-services: refreshing /mnt/sd\n");
+		if (umount("/mnt/sd") < 0 && errno != EINVAL) {
+			fprintf(stderr, "fruitjam-services: umount /mnt/sd: %s\n", strerror(errno));
+			return -1;
+		}
+	} else {
+		fprintf(stderr, "fruitjam-services: mounting /mnt/sd\n");
+	}
+
+	return mount_sd();
+}
+
+static int repair_sd_mount_if_needed(void)
+{
+	if (wait_for_sd_device() < 0)
+		return 0;
+	if (!sd_is_mounted())
+		return refresh_sd_mount();
+	if (dir_read_ok("/mnt/sd") == 0 && dir_read_ok("/mnt/sd/wavs") == 0)
+		return 0;
+
+	fprintf(stderr, "fruitjam-services: remounting /mnt/sd after directory read error\n");
+	return refresh_sd_mount();
+}
+
+static int configure_loopback(void)
+{
+	struct ifreq ifr;
+	struct sockaddr_in *addr;
+	int fd;
+	int ret = 0;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		fprintf(stderr, "fruitjam-services: loopback socket: %s\n", strerror(errno));
+		return -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+	addr = (struct sockaddr_in *)&ifr.ifr_addr;
+	addr->sin_family = AF_INET;
+	addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (ioctl(fd, SIOCSIFADDR, &ifr) < 0 && errno != EEXIST) {
+		fprintf(stderr, "fruitjam-services: loopback address: %s\n", strerror(errno));
+		ret = -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+	if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0) {
+		fprintf(stderr, "fruitjam-services: loopback flags read: %s\n", strerror(errno));
+		ret = -1;
+	} else {
+		ifr.ifr_flags |= IFF_UP | IFF_RUNNING | IFF_LOOPBACK;
+		if (ioctl(fd, SIOCSIFFLAGS, &ifr) < 0) {
+			fprintf(stderr, "fruitjam-services: loopback flags write: %s\n",
+				strerror(errno));
+			ret = -1;
+		}
+	}
+
+	close(fd);
+	return ret;
+}
+
+static int sd_refresh_worker(void)
+{
+	int i;
+
+	for (i = 0; i < 12; i++) {
+		usleep(i == 0 ? 5000000 : 2500000);
+		if (refresh_sd_mount() == 0 && sd_is_mounted() &&
+		    dir_read_ok("/mnt/sd") == 0 && dir_read_ok("/mnt/sd/wavs") == 0)
+			return 0;
+	}
+	return 1;
 }
 
 static int spawn_wait(char *const argv[])
@@ -117,11 +328,101 @@ static int spawn_bg(char *const argv[])
 	return 0;
 }
 
+static int spawn_bg_log(char *const argv[], const char *log_path)
+{
+	pid_t pid = vfork();
+
+	if (pid < 0) {
+		fprintf(stderr, "fruitjam-services: vfork %s: %s\n", argv[0], strerror(errno));
+		return -1;
+	}
+	if (pid == 0) {
+		int null_fd = open("/dev/null", O_RDONLY);
+		int log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+		if (null_fd >= 0) {
+			dup2(null_fd, STDIN_FILENO);
+			if (null_fd > STDERR_FILENO)
+				close(null_fd);
+		}
+		if (log_fd >= 0) {
+			dup2(log_fd, STDOUT_FILENO);
+			dup2(log_fd, STDERR_FILENO);
+			if (log_fd > STDERR_FILENO)
+				close(log_fd);
+		}
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	return 0;
+}
+
+static void trim_line(char *s)
+{
+	size_t len = strlen(s);
+
+	while (len && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
+		       s[len - 1] == ' ' || s[len - 1] == '\t'))
+		s[--len] = '\0';
+	while (*s == ' ' || *s == '\t')
+		memmove(s, s + 1, strlen(s));
+}
+
+static int read_wifi_config_file(const char *path, char *ssid, size_t ssid_len,
+				 char *password, size_t password_len)
+{
+	FILE *fp = fopen(path, "r");
+	char line[160];
+
+	ssid[0] = '\0';
+	password[0] = '\0';
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		char *eq;
+		char *key = line;
+		char *value;
+
+		trim_line(line);
+		if (!line[0] || line[0] == '#')
+			continue;
+		eq = strchr(line, '=');
+		if (!eq)
+			continue;
+		*eq = '\0';
+		value = eq + 1;
+		trim_line(key);
+		trim_line(value);
+		if (!strcmp(key, "SSID")) {
+			strncpy(ssid, value, ssid_len - 1);
+			ssid[ssid_len - 1] = '\0';
+		} else if (!strcmp(key, "PASSWORD")) {
+			strncpy(password, value, password_len - 1);
+			password[password_len - 1] = '\0';
+		}
+	}
+	fclose(fp);
+	return ssid[0] && password[0] ? 0 : -1;
+}
+
+static int read_wifi_config(char *ssid, size_t ssid_len,
+			    char *password, size_t password_len)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(wifi_conf_paths); i++) {
+		if (read_wifi_config_file(wifi_conf_paths[i], ssid, ssid_len,
+					  password, password_len) == 0)
+			return 0;
+	}
+	ssid[0] = '\0';
+	password[0] = '\0';
+	return -1;
+}
+
 static int init_runtime(void)
 {
-	char *const ifconfig[] = {
-		"/sbin/ifconfig", "lo", "127.0.0.1", "up", NULL
-	};
 	int ret = 0;
 
 	if (runtime_initialized)
@@ -139,11 +440,16 @@ static int init_runtime(void)
 		fprintf(stderr, "fruitjam-services: mkdir /run/dropbear: %s\n", strerror(errno));
 		ret = -1;
 	}
+	gpio_output_high(11); /* USB host 5 V power on */
+	gpio_output_high(22); /* shared TLV320/ESP32-C6 reset deasserted */
+
+	if (repair_sd_mount_if_needed() != 0)
+		ret = -1;
 
 	write_text_file("/tmp/tftp/README.txt", "Fruit Jam TFTP area\n");
-	write_text_file("/tmp/ftp/README.txt", "Fruit Jam FTP area\n");
+	write_text_file("/mnt/sd/README.txt", "Fruit Jam SD FTP area\n");
 
-	if (spawn_wait(ifconfig) != 0)
+	if (configure_loopback() != 0)
 		ret = -1;
 	if (ret == 0)
 		runtime_initialized = 1;
@@ -153,11 +459,11 @@ static int init_runtime(void)
 static int start_http(void)
 {
 	char *const argv[] = {
-		"/usr/sbin/httpd", "-h", (char *)www_root, "-p", "80", NULL
+		"/usr/sbin/fruitjam-httpd", "80", NULL
 	};
 
 	init_runtime();
-	return spawn_wait(argv);
+	return spawn_bg_log(argv, "/tmp/fruitjam-httpd.log");
 }
 
 static int start_tftp(void)
@@ -189,6 +495,52 @@ static int start_telnet(void)
 
 	init_runtime();
 	return spawn_bg(argv);
+}
+
+static int start_airlift_shell(void)
+{
+	char ssid[40];
+	char password[80];
+	char *const argv[] = {
+		"/usr/bin/airliftctl", "serve-inbound", NULL
+	};
+
+	if (access("/usr/bin/airliftctl", X_OK) < 0)
+		return 0;
+
+	init_runtime();
+	{
+		char *const probe[] = {
+			"/usr/bin/airliftctl", "probe", NULL
+		};
+
+		if (spawn_wait(probe) != 0) {
+			fprintf(stderr, "fruitjam-services: AirLift probe failed\n");
+			return -1;
+		}
+	}
+	if (read_wifi_config(ssid, sizeof(ssid), password, sizeof(password)) == 0) {
+		char *const join[] = {
+			"/usr/bin/airliftctl", "join", ssid, password, NULL
+		};
+
+		if (spawn_wait(join) != 0) {
+			fprintf(stderr, "fruitjam-services: AirLift WiFi join failed\n");
+			return -1;
+		}
+	}
+	return spawn_bg_log(argv, "/tmp/airlift-inbound.log");
+}
+
+static int start_airlift_background(void)
+{
+	char *const argv[] = {
+		"/usr/bin/fruitjam-services", "airlift-inbound", NULL
+	};
+
+	if (access("/usr/bin/airliftctl", X_OK) < 0)
+		return 0;
+	return spawn_bg_log(argv, "/tmp/airlift-start.log");
 }
 
 static int start_dropbear(void)
@@ -285,9 +637,9 @@ static int read_comm(pid_t pid, char *comm, size_t comm_len)
 static void signal_services(int sig)
 {
 	static const char *const names[] = {
-		"httpd", "telnetd", "fruitjam-telnet", "dropbear", "tcpsvd",
+		"httpd", "fruitjam-httpd", "telnetd", "fruitjam-telnet", "dropbear", "tcpsvd",
 		"udpsvd", "ftpd", "tftpd", "fruitjam-ftpd", "fruitjam-buttons",
-		"fruitjam-button"
+		"fruitjam-button", "airliftctl"
 	};
 	DIR *dir = opendir("/proc");
 	struct dirent *de;
@@ -310,7 +662,7 @@ static void signal_services(int sig)
 static int stop_services(void)
 {
 	signal_services(SIGTERM);
-	usleep(150000);
+	usleep(700000);
 	signal_services(SIGKILL);
 	return 0;
 }
@@ -330,7 +682,16 @@ static int start_all(void)
 {
 	int ret = 0;
 
-	ret |= start_core();
+	/*
+	 * Keep the default boot service set below the fragile no-MMU allocation
+	 * classes. AirLift's inbound server provides the external HTTP, telnet,
+	 * and FTP surface directly, so the heavier loopback daemons are left for
+	 * an explicit "fruitjam-services core" when they are needed. AirLift
+	 * startup also probes/joins WiFi, so launch it through a logged worker
+	 * and let the serial/USB shells come up even if the ESP32-C6 misbehaves.
+	 */
+	ret |= init_runtime();
+	ret |= start_airlift_background();
 	ret |= start_buttons();
 	return ret;
 }
@@ -338,9 +699,9 @@ static int start_all(void)
 static void print_matching_processes(void)
 {
 	static const char *const names[] = {
-		"httpd", "telnetd", "fruitjam-telnet", "dropbear", "tcpsvd",
+		"httpd", "fruitjam-httpd", "telnetd", "fruitjam-telnet", "dropbear", "tcpsvd",
 		"udpsvd", "ftpd", "tftpd", "fruitjam-ftpd", "fruitjam-buttons",
-		"fruitjam-button"
+		"fruitjam-button", "airliftctl"
 	};
 	DIR *dir = opendir("/proc");
 	struct dirent *de;
@@ -433,6 +794,8 @@ int main(int argc, char **argv)
 		return start_http();
 	if (!strcmp(argv[1], "telnetd"))
 		return start_telnet();
+	if (!strcmp(argv[1], "airlift-shell") || !strcmp(argv[1], "airlift-inbound"))
+		return start_airlift_shell();
 	if (!strcmp(argv[1], "ftpd"))
 		return start_ftp();
 	if (!strcmp(argv[1], "tftpd"))
@@ -447,6 +810,8 @@ int main(int argc, char **argv)
 		return start_core();
 	if (!strcmp(argv[1], "all"))
 		return start_all();
+	if (!strcmp(argv[1], "sd-refresh"))
+		return sd_refresh_worker();
 	if (!strcmp(argv[1], "stop"))
 		return stop_services();
 	if (!strcmp(argv[1], "restart")) {

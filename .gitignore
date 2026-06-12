@@ -5,4 +5,6 @@ package/pico2-bootloader/bootloader/demo/build
 .DS_Store
 buildroot-output-docker-images/
 .fruitjam.env
+.fruitjam-wifi.conf
+board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/etc/fruitjam-wifi.conf
 __pycache__/

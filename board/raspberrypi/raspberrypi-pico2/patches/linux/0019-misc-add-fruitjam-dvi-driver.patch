@@ -1,0 +1,729 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 12 Jun 2026 20:25:00 -0400
+Subject: [PATCH] misc: add Fruit Jam RP2350 HSTX DVI driver
+
+Add a tiny board bring-up misc driver for the Fruit Jam HSTX DVI connector.
+It can program RP2350 HSTX for 640x480 RGB332 DVI output, feed scanlines with
+two ping-pong DMA channels, and expose a raw framebuffer-style character
+device at /dev/fruitjam-dvi.
+
+This is deliberately smaller than a full fbdev/DRM stack. The framebuffer is
+static kernel storage to avoid large no-MMU runtime allocations, and userspace
+can write either simple commands such as "pattern" and "clear" or raw RGB332
+bytes into the visible buffer. Output is idle by default so the display DMA
+path cannot starve early userspace during boot.
+---
+ drivers/misc/Kconfig            |  12 +
+ drivers/misc/Makefile           |   1 +
+ drivers/misc/fruitjam_dvi.c     | 667 ++++++++++++++++++++++++++++++++
+ 3 files changed, 680 insertions(+)
+ create mode 100644 drivers/misc/fruitjam_dvi.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index bc7f3e7468ef..7a9a9f0dbb26 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -75,1 +75,14 @@ config FRUITJAM_AUDIO_CLOCK
+-config IBM_ASM
++config FRUITJAM_DVI
++	tristate "Adafruit Fruit Jam RP2350 HSTX DVI"
++	depends on OF && HAS_IOMEM
++	help
++	  Say Y here to expose /dev/fruitjam-dvi, a tiny bring-up
++	  interface for the Fruit Jam DVI connector. It programs RP2350 HSTX
++	  for a 640x480 RGB332 signal and feeds it with two DMA channels.
++
++	  This is not a full fbdev or DRM driver; it is a first display path
++	  for board validation and simple dashboards.
++
++	  If unsure, say N.
++
++config IBM_ASM
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 7afda0c82c7e..8626aa93b661 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_RP2350_NEOPIXEL)	+= rp2350_neopixel.o
+ obj-$(CONFIG_FRUITJAM_AIRLIFT_GPIO) += fruitjam_airlift_gpio.o
+ obj-$(CONFIG_FRUITJAM_RP2350_ADC) += fruitjam_rp2350_adc.o
+ obj-$(CONFIG_FRUITJAM_AUDIO_CLOCK) += fruitjam_audio_clock.o
++obj-$(CONFIG_FRUITJAM_DVI) += fruitjam_dvi.o
+ obj-$(CONFIG_AD525X_DPOT_I2C)	+= ad525x_dpot-i2c.o
+ obj-$(CONFIG_AD525X_DPOT_SPI)	+= ad525x_dpot-spi.o
+ obj-$(CONFIG_ATMEL_SSC)		+= atmel-ssc.o
+diff --git a/drivers/misc/fruitjam_dvi.c b/drivers/misc/fruitjam_dvi.c
+new file mode 100644
+index 000000000000..f1a4d8cd1d4d
+--- /dev/null
++++ b/drivers/misc/fruitjam_dvi.c
+@@ -0,0 +1,667 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Minimal Adafruit Fruit Jam RP2350 HSTX DVI helper.
++ *
++ * This is a bring-up display path, not a full fbdev/DRM driver. It exposes
++ * /dev/fruitjam-dvi as a raw 640x480 RGB332 buffer and accepts short text
++ * commands such as "pattern", "show", "start", "forever", and "stop".
++ *
++ * The HSTX/DMA programming follows Raspberry Pi's RP2350
++ * hstx/dvi_out_hstx_encoder Pico SDK example.
++ */
++
++#include <asm/page.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/fs.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++
++#define FJ_DVI_WIDTH			640u
++#define FJ_DVI_HEIGHT			480u
++#define FJ_DVI_FB_SIZE			(FJ_DVI_WIDTH * FJ_DVI_HEIGHT)
++
++#define FJ_DVI_DMACH_PING		0u
++#define FJ_DVI_DMACH_PONG		1u
++#define FJ_DVI_DREQ_HSTX		52u
++#define FJ_DVI_TEST_FRAMES		120u
++#define FJ_DVI_SHOW_FRAMES		60u
++
++#define RP2350_CLOCKS_HSTX_CTRL		0x054
++#define RP2350_CLOCKS_HSTX_DIV		0x058
++#define RP2350_CLOCKS_CTRL_ENABLE	BIT(11)
++#define RP2350_CLOCKS_CTRL_AUXSRC(v)	(((v) & 0x7) << 5)
++#define RP2350_CLOCKS_DIV_INT(v)	((v) << 16)
++
++#define RP2350_RESETS_RESET		0x000
++#define RP2350_RESETS_DONE		0x008
++#define RP2350_RESET_DMA		2u
++#define RP2350_RESET_HSTX		3u
++
++#define RP2350_IO_GPIO_CTRL(gpio)	(0x004 + ((gpio) * 8))
++#define RP2350_PADS_GPIO(gpio)		(0x004 + ((gpio) * 4))
++#define RP2350_GPIO_FUNC_HSTX		0u
++#define RP2350_PADS_DRIVE_4MA		BIT(4)
++#define RP2350_PADS_SLEWFAST		BIT(0)
++
++#define RP2350_BUSCTRL_PRIORITY		0x000
++#define RP2350_BUSCTRL_DMA_W		BIT(12)
++#define RP2350_BUSCTRL_DMA_R		BIT(8)
++
++#define HSTX_CTRL_CSR			0x000
++#define HSTX_CTRL_BIT(n)		(0x004 + ((n) * 4))
++#define HSTX_CTRL_EXPAND_SHIFT		0x024
++#define HSTX_CTRL_EXPAND_TMDS		0x028
++#define HSTX_CTRL_CSR_CLKDIV(v)		(((v) & 0xf) << 28)
++#define HSTX_CTRL_CSR_N_SHIFTS(v)	(((v) & 0x1f) << 16)
++#define HSTX_CTRL_CSR_SHIFT(v)		(((v) & 0x1f) << 8)
++#define HSTX_CTRL_CSR_EXPAND_EN		BIT(1)
++#define HSTX_CTRL_CSR_EN		BIT(0)
++#define HSTX_CTRL_BIT_CLK		BIT(17)
++#define HSTX_CTRL_BIT_INV		BIT(16)
++#define HSTX_CTRL_BIT_SEL_P(v)		(((v) & 0x1f) << 0)
++#define HSTX_CTRL_BIT_SEL_N(v)		(((v) & 0x1f) << 8)
++#define HSTX_EXPAND_SHIFT_ENC_N(v)	(((v) & 0x1f) << 24)
++#define HSTX_EXPAND_SHIFT_ENC(v)	(((v) & 0x1f) << 16)
++#define HSTX_EXPAND_SHIFT_RAW_N(v)	(((v) & 0x1f) << 8)
++#define HSTX_EXPAND_SHIFT_RAW(v)	(((v) & 0x1f) << 0)
++#define HSTX_EXPAND_TMDS_L2_NBITS(v)	(((v) & 0x7) << 21)
++#define HSTX_EXPAND_TMDS_L2_ROT(v)	(((v) & 0x1f) << 16)
++#define HSTX_EXPAND_TMDS_L1_NBITS(v)	(((v) & 0x7) << 13)
++#define HSTX_EXPAND_TMDS_L1_ROT(v)	(((v) & 0x1f) << 8)
++#define HSTX_EXPAND_TMDS_L0_NBITS(v)	(((v) & 0x7) << 5)
++#define HSTX_EXPAND_TMDS_L0_ROT(v)	(((v) & 0x1f) << 0)
++
++#define HSTX_FIFO_FIFO			0x004
++
++#define DMA_CH_STRIDE			0x040
++#define DMA_CH_READ_ADDR(ch)		((ch) * DMA_CH_STRIDE + 0x000)
++#define DMA_CH_WRITE_ADDR(ch)		((ch) * DMA_CH_STRIDE + 0x004)
++#define DMA_CH_TRANS_COUNT(ch)		((ch) * DMA_CH_STRIDE + 0x008)
++#define DMA_CH_CTRL_TRIG(ch)		((ch) * DMA_CH_STRIDE + 0x00c)
++#define DMA_INTR			0x400
++#define DMA_INTE0			0x404
++#define DMA_INTS0			0x40c
++#define DMA_MULTI_CHAN_TRIGGER		0x450
++#define DMA_CHAN_ABORT			0x464
++#define DMA_CTRL_TREQ(v)		(((v) & 0x3f) << 17)
++#define DMA_CTRL_CHAIN_TO(v)		(((v) & 0xf) << 13)
++#define DMA_CTRL_INCR_READ		BIT(4)
++#define DMA_CTRL_SIZE_WORD		(2u << 2)
++#define DMA_CTRL_EN			BIT(0)
++
++#define TMDS_CTRL_00			0x354u
++#define TMDS_CTRL_01			0x0abu
++#define TMDS_CTRL_10			0x154u
++#define TMDS_CTRL_11			0x2abu
++#define SYNC_V0_H0			(TMDS_CTRL_00 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20))
++#define SYNC_V0_H1			(TMDS_CTRL_01 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20))
++#define SYNC_V1_H0			(TMDS_CTRL_10 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20))
++#define SYNC_V1_H1			(TMDS_CTRL_11 | (TMDS_CTRL_00 << 10) | (TMDS_CTRL_00 << 20))
++
++#define MODE_H_FRONT_PORCH		16u
++#define MODE_H_SYNC_WIDTH		96u
++#define MODE_H_BACK_PORCH		48u
++#define MODE_H_ACTIVE_PIXELS		FJ_DVI_WIDTH
++#define MODE_V_FRONT_PORCH		10u
++#define MODE_V_SYNC_WIDTH		2u
++#define MODE_V_BACK_PORCH		33u
++#define MODE_V_ACTIVE_LINES		FJ_DVI_HEIGHT
++#define MODE_H_TOTAL_PIXELS		(MODE_H_FRONT_PORCH + MODE_H_SYNC_WIDTH + MODE_H_BACK_PORCH + MODE_H_ACTIVE_PIXELS)
++#define MODE_V_TOTAL_LINES		(MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH + MODE_V_BACK_PORCH + MODE_V_ACTIVE_LINES)
++#define MODE_V_ACTIVE_START		(MODE_V_TOTAL_LINES - MODE_V_ACTIVE_LINES)
++
++#define HSTX_CMD_RAW_REPEAT		(0x1u << 12)
++#define HSTX_CMD_TMDS			(0x2u << 12)
++#define HSTX_CMD_NOP			(0xfu << 12)
++
++static u32 fj_dvi_vblank_vsync_off[] = {
++	HSTX_CMD_RAW_REPEAT | MODE_H_FRONT_PORCH,
++	SYNC_V1_H1,
++	HSTX_CMD_RAW_REPEAT | MODE_H_SYNC_WIDTH,
++	SYNC_V1_H0,
++	HSTX_CMD_RAW_REPEAT | (MODE_H_BACK_PORCH + MODE_H_ACTIVE_PIXELS),
++	SYNC_V1_H1,
++	HSTX_CMD_NOP,
++};
++
++static u32 fj_dvi_vblank_vsync_on[] = {
++	HSTX_CMD_RAW_REPEAT | MODE_H_FRONT_PORCH,
++	SYNC_V0_H1,
++	HSTX_CMD_RAW_REPEAT | MODE_H_SYNC_WIDTH,
++	SYNC_V0_H0,
++	HSTX_CMD_RAW_REPEAT | (MODE_H_BACK_PORCH + MODE_H_ACTIVE_PIXELS),
++	SYNC_V0_H1,
++	HSTX_CMD_NOP,
++};
++
++static u32 fj_dvi_active_line[] = {
++	HSTX_CMD_RAW_REPEAT | MODE_H_FRONT_PORCH,
++	SYNC_V1_H1,
++	HSTX_CMD_NOP,
++	HSTX_CMD_RAW_REPEAT | MODE_H_SYNC_WIDTH,
++	SYNC_V1_H0,
++	HSTX_CMD_NOP,
++	HSTX_CMD_RAW_REPEAT | MODE_H_BACK_PORCH,
++	SYNC_V1_H1,
++	HSTX_CMD_TMDS | MODE_H_ACTIVE_PIXELS,
++};
++
++static u8 fj_dvi_framebuf[FJ_DVI_FB_SIZE] __aligned(4);
++
++struct fj_dvi {
++	struct device *dev;
++	struct miscdevice miscdev;
++	struct mutex lock;
++	void __iomem *hstx_ctrl;
++	void __iomem *hstx_fifo;
++	void __iomem *dma;
++	void __iomem *resets;
++	void __iomem *io_bank0;
++	void __iomem *pads_bank0;
++	void __iomem *busctrl;
++	void __iomem *clocks;
++	resource_size_t hstx_fifo_phys;
++	int irq;
++	u32 scanline;
++	u32 frames;
++	u32 frames_left;
++	bool dma_pong;
++	bool active_cmd_posted;
++	bool running;
++};
++
++static void __iomem *fj_dvi_ioremap_byname(struct platform_device *pdev,
++					   const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return ERR_PTR(-EINVAL);
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++static u8 fj_dvi_rgb332(u8 r, u8 g, u8 b)
++{
++	return ((r & 0xc0) >> 6) | ((g & 0xe0) >> 3) | (b & 0xe0);
++}
++
++static void fj_dvi_fill_clear(u8 colour)
++{
++	memset(fj_dvi_framebuf, colour, sizeof(fj_dvi_framebuf));
++}
++
++static void fj_dvi_fill_pattern(void)
++{
++	static const u8 bars[] = {
++		0x00, 0x03, 0x1c, 0xe0, 0x1f, 0xe3, 0xfc, 0xff,
++	};
++	u32 x;
++	u32 y;
++
++	for (y = 0; y < FJ_DVI_HEIGHT; y++) {
++		for (x = 0; x < FJ_DVI_WIDTH; x++) {
++			u8 c;
++
++			if (y < 96) {
++				c = bars[(x * ARRAY_SIZE(bars)) / FJ_DVI_WIDTH];
++			} else if (y < 432) {
++				c = fj_dvi_rgb332(x >> 1, y >> 1, (x + y) >> 2);
++			} else {
++				c = ((x / 16) ^ (y / 16)) & 1 ? 0xff : 0x00;
++			}
++			fj_dvi_framebuf[y * FJ_DVI_WIDTH + x] = c;
++		}
++	}
++}
++
++static int fj_dvi_unreset(struct fj_dvi *fj, u32 bitno)
++{
++	u32 bit = BIT(bitno);
++	u32 val;
++	int i;
++
++	val = readl(fj->resets + RP2350_RESETS_RESET);
++	writel(val | bit, fj->resets + RP2350_RESETS_RESET);
++	udelay(1);
++	val = readl(fj->resets + RP2350_RESETS_RESET);
++	writel(val & ~bit, fj->resets + RP2350_RESETS_RESET);
++
++	for (i = 0; i < 100000; i++) {
++		if (readl(fj->resets + RP2350_RESETS_DONE) & bit)
++			return 0;
++		cpu_relax();
++	}
++
++	dev_warn(fj->dev, "reset-done timeout for bit %u\n", bitno);
++	return -ETIMEDOUT;
++}
++
++static void fj_dvi_configure_clock(struct fj_dvi *fj)
++{
++	writel(0, fj->clocks + RP2350_CLOCKS_HSTX_CTRL);
++	udelay(1);
++	writel(RP2350_CLOCKS_DIV_INT(1), fj->clocks + RP2350_CLOCKS_HSTX_DIV);
++	writel(RP2350_CLOCKS_CTRL_AUXSRC(0) | RP2350_CLOCKS_CTRL_ENABLE,
++	       fj->clocks + RP2350_CLOCKS_HSTX_CTRL);
++}
++
++static void fj_dvi_configure_gpio(struct fj_dvi *fj)
++{
++	u32 gpio;
++
++	for (gpio = 12; gpio <= 19; gpio++) {
++		writel(RP2350_PADS_DRIVE_4MA | RP2350_PADS_SLEWFAST,
++		       fj->pads_bank0 + RP2350_PADS_GPIO(gpio));
++		writel(RP2350_GPIO_FUNC_HSTX,
++		       fj->io_bank0 + RP2350_IO_GPIO_CTRL(gpio));
++	}
++}
++
++static void fj_dvi_configure_hstx(struct fj_dvi *fj)
++{
++	static const int lane_to_output_bit[3] = { 0, 6, 4 };
++	u32 lane;
++
++	writel(0, fj->hstx_ctrl + HSTX_CTRL_CSR);
++	writel(HSTX_EXPAND_TMDS_L2_NBITS(2) |
++	       HSTX_EXPAND_TMDS_L2_ROT(0) |
++	       HSTX_EXPAND_TMDS_L1_NBITS(2) |
++	       HSTX_EXPAND_TMDS_L1_ROT(29) |
++	       HSTX_EXPAND_TMDS_L0_NBITS(1) |
++	       HSTX_EXPAND_TMDS_L0_ROT(26),
++	       fj->hstx_ctrl + HSTX_CTRL_EXPAND_TMDS);
++	writel(HSTX_EXPAND_SHIFT_ENC_N(4) |
++	       HSTX_EXPAND_SHIFT_ENC(8) |
++	       HSTX_EXPAND_SHIFT_RAW_N(1) |
++	       HSTX_EXPAND_SHIFT_RAW(0),
++	       fj->hstx_ctrl + HSTX_CTRL_EXPAND_SHIFT);
++
++	for (lane = 0; lane < 8; lane++)
++		writel(0, fj->hstx_ctrl + HSTX_CTRL_BIT(lane));
++
++	writel(HSTX_CTRL_BIT_CLK, fj->hstx_ctrl + HSTX_CTRL_BIT(2));
++	writel(HSTX_CTRL_BIT_CLK | HSTX_CTRL_BIT_INV,
++	       fj->hstx_ctrl + HSTX_CTRL_BIT(3));
++
++	for (lane = 0; lane < 3; lane++) {
++		u32 bit = lane_to_output_bit[lane];
++		u32 sel = HSTX_CTRL_BIT_SEL_P(lane * 10) |
++			  HSTX_CTRL_BIT_SEL_N(lane * 10 + 1);
++
++		writel(sel, fj->hstx_ctrl + HSTX_CTRL_BIT(bit));
++		writel(sel | HSTX_CTRL_BIT_INV,
++		       fj->hstx_ctrl + HSTX_CTRL_BIT(bit + 1));
++	}
++
++	writel(HSTX_CTRL_CSR_EXPAND_EN |
++	       HSTX_CTRL_CSR_CLKDIV(5) |
++	       HSTX_CTRL_CSR_N_SHIFTS(5) |
++	       HSTX_CTRL_CSR_SHIFT(2) |
++	       HSTX_CTRL_CSR_EN,
++	       fj->hstx_ctrl + HSTX_CTRL_CSR);
++}
++
++static u32 fj_dvi_dma_ctrl(u32 chain_to)
++{
++	return DMA_CTRL_TREQ(FJ_DVI_DREQ_HSTX) |
++	       DMA_CTRL_CHAIN_TO(chain_to) |
++	       DMA_CTRL_INCR_READ |
++	       DMA_CTRL_SIZE_WORD |
++	       DMA_CTRL_EN;
++}
++
++static void fj_dvi_dma_program(struct fj_dvi *fj, u32 ch, const void *src,
++			       u32 words, u32 chain_to)
++{
++	writel((u32)virt_to_phys((void *)src), fj->dma + DMA_CH_READ_ADDR(ch));
++	writel((u32)(fj->hstx_fifo_phys + HSTX_FIFO_FIFO),
++	       fj->dma + DMA_CH_WRITE_ADDR(ch));
++	writel(words, fj->dma + DMA_CH_TRANS_COUNT(ch));
++	writel(fj_dvi_dma_ctrl(chain_to), fj->dma + DMA_CH_CTRL_TRIG(ch));
++}
++
++static void fj_dvi_dma_update(struct fj_dvi *fj, u32 ch, const void *src,
++			      u32 words)
++{
++	writel((u32)virt_to_phys((void *)src), fj->dma + DMA_CH_READ_ADDR(ch));
++	writel(words, fj->dma + DMA_CH_TRANS_COUNT(ch));
++}
++
++static void fj_dvi_hw_stop_irq(struct fj_dvi *fj)
++{
++	writel(0, fj->dma + DMA_INTE0);
++	writel(BIT(FJ_DVI_DMACH_PING) | BIT(FJ_DVI_DMACH_PONG),
++	       fj->dma + DMA_CHAN_ABORT);
++	writel(0, fj->dma + DMA_CH_CTRL_TRIG(FJ_DVI_DMACH_PING));
++	writel(0, fj->dma + DMA_CH_CTRL_TRIG(FJ_DVI_DMACH_PONG));
++	writel(0, fj->hstx_ctrl + HSTX_CTRL_CSR);
++	fj->frames_left = 0;
++	fj->running = false;
++}
++
++static irqreturn_t fj_dvi_dma_irq(int irq, void *data)
++{
++	struct fj_dvi *fj = data;
++	u32 status = readl(fj->dma + DMA_INTS0);
++	u32 ch = fj->dma_pong ? FJ_DVI_DMACH_PONG : FJ_DVI_DMACH_PING;
++	const void *src;
++	u32 words;
++
++	if (!(status & (BIT(FJ_DVI_DMACH_PING) | BIT(FJ_DVI_DMACH_PONG))))
++		return IRQ_NONE;
++
++	writel(BIT(ch), fj->dma + DMA_INTR);
++	fj->dma_pong = !fj->dma_pong;
++
++	if (fj->scanline >= MODE_V_FRONT_PORCH &&
++	    fj->scanline < MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH) {
++		src = fj_dvi_vblank_vsync_on;
++		words = ARRAY_SIZE(fj_dvi_vblank_vsync_on);
++	} else if (fj->scanline < MODE_V_ACTIVE_START) {
++		src = fj_dvi_vblank_vsync_off;
++		words = ARRAY_SIZE(fj_dvi_vblank_vsync_off);
++	} else if (!fj->active_cmd_posted) {
++		src = fj_dvi_active_line;
++		words = ARRAY_SIZE(fj_dvi_active_line);
++		fj->active_cmd_posted = true;
++	} else {
++		u32 line = fj->scanline - MODE_V_ACTIVE_START;
++
++		src = &fj_dvi_framebuf[line * FJ_DVI_WIDTH];
++		words = FJ_DVI_WIDTH / sizeof(u32);
++		fj->active_cmd_posted = false;
++	}
++
++	fj_dvi_dma_update(fj, ch, src, words);
++
++	if (!fj->active_cmd_posted) {
++		fj->scanline = (fj->scanline + 1) % MODE_V_TOTAL_LINES;
++		if (!fj->scanline) {
++			fj->frames++;
++			if (fj->frames_left && --fj->frames_left == 0)
++				fj_dvi_hw_stop_irq(fj);
++		}
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int fj_dvi_hw_start(struct fj_dvi *fj)
++{
++	int ret;
++
++	if (fj->running)
++		return 0;
++
++	ret = fj_dvi_unreset(fj, RP2350_RESET_DMA);
++	if (ret)
++		return ret;
++	ret = fj_dvi_unreset(fj, RP2350_RESET_HSTX);
++	if (ret)
++		return ret;
++
++	fj_dvi_configure_clock(fj);
++	fj_dvi_configure_gpio(fj);
++	fj_dvi_configure_hstx(fj);
++
++	fj->scanline = 2;
++	fj->frames = 0;
++	fj->dma_pong = false;
++	fj->active_cmd_posted = false;
++
++	fj_dvi_dma_program(fj, FJ_DVI_DMACH_PING, fj_dvi_vblank_vsync_off,
++			   ARRAY_SIZE(fj_dvi_vblank_vsync_off), FJ_DVI_DMACH_PONG);
++	fj_dvi_dma_program(fj, FJ_DVI_DMACH_PONG, fj_dvi_vblank_vsync_off,
++			   ARRAY_SIZE(fj_dvi_vblank_vsync_off), FJ_DVI_DMACH_PING);
++
++	writel(BIT(FJ_DVI_DMACH_PING) | BIT(FJ_DVI_DMACH_PONG),
++	       fj->dma + DMA_INTR);
++	writel(BIT(FJ_DVI_DMACH_PING) | BIT(FJ_DVI_DMACH_PONG),
++	       fj->dma + DMA_INTE0);
++	writel(BIT(FJ_DVI_DMACH_PING), fj->dma + DMA_MULTI_CHAN_TRIGGER);
++	fj->running = true;
++
++	return 0;
++}
++
++static void fj_dvi_hw_stop(struct fj_dvi *fj)
++{
++	if (!fj->running)
++		return;
++
++	writel(0, fj->dma + DMA_INTE0);
++	writel(BIT(FJ_DVI_DMACH_PING) | BIT(FJ_DVI_DMACH_PONG),
++	       fj->dma + DMA_CHAN_ABORT);
++	udelay(10);
++	writel(0, fj->dma + DMA_CH_CTRL_TRIG(FJ_DVI_DMACH_PING));
++	writel(0, fj->dma + DMA_CH_CTRL_TRIG(FJ_DVI_DMACH_PONG));
++	writel(0, fj->hstx_ctrl + HSTX_CTRL_CSR);
++	fj->frames_left = 0;
++	fj->running = false;
++}
++
++static int fj_dvi_open(struct inode *inode, struct file *file)
++{
++	struct miscdevice *miscdev = file->private_data;
++	struct fj_dvi *fj = container_of(miscdev, struct fj_dvi, miscdev);
++
++	file->private_data = fj;
++	return nonseekable_open(inode, file);
++}
++
++static ssize_t fj_dvi_read(struct file *file, char __user *buf, size_t count,
++			   loff_t *ppos)
++{
++	size_t avail;
++
++	if (*ppos < 0)
++		return -EINVAL;
++	if (*ppos >= FJ_DVI_FB_SIZE)
++		return 0;
++
++	avail = min_t(size_t, count, FJ_DVI_FB_SIZE - *ppos);
++	if (copy_to_user(buf, fj_dvi_framebuf + *ppos, avail))
++		return -EFAULT;
++	*ppos += avail;
++	return avail;
++}
++
++static ssize_t fj_dvi_write(struct file *file, const char __user *buf,
++			    size_t count, loff_t *ppos)
++{
++	struct fj_dvi *fj = file->private_data;
++	char cmd[32];
++	size_t todo;
++	int ret;
++
++	if (!count)
++		return 0;
++
++	if (*ppos == 0 && count < sizeof(cmd)) {
++		if (copy_from_user(cmd, buf, count))
++			return -EFAULT;
++		cmd[count] = '\0';
++		strim(cmd);
++
++		mutex_lock(&fj->lock);
++		if (!strcmp(cmd, "start") || !strcmp(cmd, "on") ||
++		    !strcmp(cmd, "show") || !strcmp(cmd, "frame")) {
++			fj->frames_left = FJ_DVI_SHOW_FRAMES;
++			ret = fj_dvi_hw_start(fj);
++			mutex_unlock(&fj->lock);
++			return ret ? ret : count;
++		}
++		if (!strcmp(cmd, "forever") || !strcmp(cmd, "continuous")) {
++			fj->frames_left = 0;
++			ret = fj_dvi_hw_start(fj);
++			mutex_unlock(&fj->lock);
++			return ret ? ret : count;
++		}
++		if (!strcmp(cmd, "stop") || !strcmp(cmd, "off")) {
++			fj_dvi_hw_stop(fj);
++			mutex_unlock(&fj->lock);
++			return count;
++		}
++		if (!strcmp(cmd, "test")) {
++			fj_dvi_fill_pattern();
++			fj->frames_left = FJ_DVI_TEST_FRAMES;
++			ret = fj_dvi_hw_start(fj);
++			mutex_unlock(&fj->lock);
++			return ret ? ret : count;
++		}
++		if (!strcmp(cmd, "pattern") || !strcmp(cmd, "bars")) {
++			fj_dvi_fill_pattern();
++			mutex_unlock(&fj->lock);
++			return count;
++		}
++		if (!strcmp(cmd, "clear") || !strcmp(cmd, "black")) {
++			fj_dvi_fill_clear(0);
++			mutex_unlock(&fj->lock);
++			return count;
++		}
++		if (!strcmp(cmd, "white")) {
++			fj_dvi_fill_clear(0xff);
++			mutex_unlock(&fj->lock);
++			return count;
++		}
++		mutex_unlock(&fj->lock);
++	}
++
++	if (*ppos < 0)
++		return -EINVAL;
++	if (*ppos >= FJ_DVI_FB_SIZE)
++		return -ENOSPC;
++
++	todo = min_t(size_t, count, FJ_DVI_FB_SIZE - *ppos);
++	mutex_lock(&fj->lock);
++	if (copy_from_user(fj_dvi_framebuf + *ppos, buf, todo)) {
++		mutex_unlock(&fj->lock);
++		return -EFAULT;
++	}
++	mutex_unlock(&fj->lock);
++	*ppos += todo;
++	return todo;
++}
++
++static loff_t fj_dvi_llseek(struct file *file, loff_t offset, int whence)
++{
++	return fixed_size_llseek(file, offset, whence, FJ_DVI_FB_SIZE);
++}
++
++static const struct file_operations fj_dvi_fops = {
++	.owner = THIS_MODULE,
++	.open = fj_dvi_open,
++	.read = fj_dvi_read,
++	.write = fj_dvi_write,
++	.llseek = fj_dvi_llseek,
++};
++
++static int fj_dvi_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct fj_dvi *fj;
++	int ret;
++
++	fj = devm_kzalloc(dev, sizeof(*fj), GFP_KERNEL);
++	if (!fj)
++		return -ENOMEM;
++
++	fj->dev = dev;
++	mutex_init(&fj->lock);
++	platform_set_drvdata(pdev, fj);
++
++	fj->hstx_ctrl = fj_dvi_ioremap_byname(pdev, "hstx-ctrl");
++	if (IS_ERR(fj->hstx_ctrl))
++		return PTR_ERR(fj->hstx_ctrl);
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "hstx-fifo");
++	if (!res)
++		return dev_err_probe(dev, -EINVAL, "missing hstx-fifo resource\n");
++	fj->hstx_fifo_phys = res->start;
++	fj->hstx_fifo = devm_ioremap(dev, res->start, resource_size(res));
++	if (!fj->hstx_fifo)
++		return -ENOMEM;
++
++	fj->dma = fj_dvi_ioremap_byname(pdev, "dma");
++	if (IS_ERR(fj->dma))
++		return PTR_ERR(fj->dma);
++	fj->resets = fj_dvi_ioremap_byname(pdev, "resets");
++	if (IS_ERR(fj->resets))
++		return PTR_ERR(fj->resets);
++	fj->io_bank0 = fj_dvi_ioremap_byname(pdev, "io-bank0");
++	if (IS_ERR(fj->io_bank0))
++		return PTR_ERR(fj->io_bank0);
++	fj->pads_bank0 = fj_dvi_ioremap_byname(pdev, "pads-bank0");
++	if (IS_ERR(fj->pads_bank0))
++		return PTR_ERR(fj->pads_bank0);
++	fj->busctrl = fj_dvi_ioremap_byname(pdev, "busctrl");
++	if (IS_ERR(fj->busctrl))
++		return PTR_ERR(fj->busctrl);
++	fj->clocks = fj_dvi_ioremap_byname(pdev, "clocks");
++	if (IS_ERR(fj->clocks))
++		return PTR_ERR(fj->clocks);
++
++	fj->irq = platform_get_irq(pdev, 0);
++	if (fj->irq < 0)
++		return fj->irq;
++
++	ret = devm_request_irq(dev, fj->irq, fj_dvi_dma_irq, 0,
++			       dev_name(dev), fj);
++	if (ret)
++		return ret;
++
++	fj_dvi_fill_pattern();
++
++	fj->miscdev.minor = MISC_DYNAMIC_MINOR;
++	fj->miscdev.name = "fruitjam-dvi";
++	fj->miscdev.fops = &fj_dvi_fops;
++	ret = misc_register(&fj->miscdev);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "Fruit Jam HSTX DVI registered at %ux%u RGB332, idle\n",
++		 FJ_DVI_WIDTH, FJ_DVI_HEIGHT);
++	return 0;
++}
++
++static void fj_dvi_remove(struct platform_device *pdev)
++{
++	struct fj_dvi *fj = platform_get_drvdata(pdev);
++
++	misc_deregister(&fj->miscdev);
++	fj_dvi_hw_stop(fj);
++}
++
++static const struct of_device_id fj_dvi_of_match[] = {
++	{ .compatible = "adafruit,fruit-jam-rp2350-dvi" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fj_dvi_of_match);
++
++static struct platform_driver fj_dvi_driver = {
++	.probe = fj_dvi_probe,
++	.remove = fj_dvi_remove,
++	.driver = {
++		.name = "fruitjam-dvi",
++		.of_match_table = fj_dvi_of_match,
++	},
++};
++module_platform_driver(fj_dvi_driver);
++
++MODULE_DESCRIPTION("Adafruit Fruit Jam RP2350 HSTX DVI helper");
++MODULE_AUTHOR("Codex <codex@openai.com>");
++MODULE_LICENSE("GPL");
+--
+2.39.5

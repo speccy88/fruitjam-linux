@@ -1,0 +1,110 @@
+#!/bin/sh
+set -eu
+
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+image_dir=${1:-"$repo/buildroot-output-docker-images"}
+rootfs="$image_dir/rootfs.tar"
+uf2="$image_dir/flash-image.uf2"
+
+if [ ! -s "$rootfs" ]; then
+	echo "validate-fruitjam-image: missing $rootfs" >&2
+	exit 1
+fi
+if [ ! -s "$uf2" ]; then
+	echo "validate-fruitjam-image: missing $uf2" >&2
+	exit 1
+fi
+
+python3 - "$rootfs" "$uf2" <<'PY'
+import hashlib
+import sys
+import tarfile
+from pathlib import Path
+
+rootfs = Path(sys.argv[1])
+uf2 = Path(sys.argv[2])
+
+required = [
+    "./bin/rm",
+    "./root/berry/00-hello.be",
+    "./root/berry/run-all.be",
+    "./root/berry/neopixel-rainbow-10s.be",
+    "./root/rtttl/01-scale.rtttl",
+    "./root/sh/15-wav-analyze.sh",
+    "./usr/bin/berry",
+    "./usr/bin/berry-run",
+    "./usr/bin/fruitjam-berry-json",
+    "./usr/bin/fruitjam-dvi",
+    "./usr/bin/fruitjam-rtttl",
+    "./usr/bin/fruitjam-wavplay",
+    "./usr/bin/wget",
+    "./usr/sbin/fruitjam-telnetd",
+    "./www/cgi-bin/env.cgi",
+    "./www/cgi-bin/fruitjam.cgi",
+    "./www/index.html",
+]
+
+forbidden = [
+    "./etc/fruitjam-wifi.conf",
+    "./root/neopixels.be",
+    "./root/serial-over-tcp.sh",
+    "./usr/bin/sqlite3",
+]
+
+def read_text(tf: tarfile.TarFile, name: str) -> str:
+    data = tf.extractfile(name)
+    if data is None:
+        raise SystemExit(f"{name}: not a regular file")
+    return data.read().decode("utf-8", "replace")
+
+def read_bytes(tf: tarfile.TarFile, name: str) -> bytes:
+    data = tf.extractfile(name)
+    if data is None:
+        raise SystemExit(f"{name}: not a regular file")
+    return data.read()
+
+with tarfile.open(rootfs) as tf:
+    names = set(tf.getnames())
+    missing = [name for name in required if name not in names]
+    if missing:
+        raise SystemExit(f"missing rootfs entries: {missing}")
+    present_forbidden = [name for name in forbidden if name in names]
+    if present_forbidden:
+        raise SystemExit(f"forbidden rootfs entries present: {present_forbidden}")
+
+    index = read_text(tf, "./www/index.html")
+    for needle in (
+        'const requestedHost = queryParams.get("host");',
+        '"/cgi-bin/fruitjam.cgi"',
+        'data-dvi="dashboard"',
+        'data-usbhost="status"',
+    ):
+        if needle not in index:
+            raise SystemExit(f"www/index.html missing {needle!r}")
+
+    run_all = read_text(tf, "./root/berry/run-all.be")
+    if 'var BERRY_DIR = "/root/berry"' not in run_all:
+        raise SystemExit("run-all.be does not use /root/berry BERRY_DIR")
+
+    sh_run_all = read_text(tf, "./root/sh/run-all.sh")
+    if "15-wav-analyze.sh" not in sh_run_all:
+        raise SystemExit("shell run-all does not include WAV analyzer")
+
+    wavplay = read_bytes(tf, "./usr/bin/fruitjam-wavplay")
+    for needle in (b"--analyze", b"backend=", b"segments="):
+        if needle not in wavplay:
+            raise SystemExit(f"fruitjam-wavplay missing marker {needle!r}")
+
+    web_cgi = read_bytes(tf, "./www/cgi-bin/fruitjam.cgi")
+    for needle in (b"direct-cgi", b"berry-list", b"wav-list", b"usbhost"):
+        if needle not in web_cgi:
+            raise SystemExit(f"fruitjam.cgi missing marker {needle!r}")
+
+    telnetd = read_bytes(tf, "./usr/sbin/fruitjam-telnetd")
+    if len(telnetd) < 4096 or not telnetd.startswith(b"bFLT"):
+        raise SystemExit("fruitjam-telnetd is not a valid nonempty bFLT executable")
+
+sha256 = hashlib.sha256(uf2.read_bytes()).hexdigest()
+print(f"ok rootfs {rootfs}")
+print(f"ok uf2 {uf2} sha256={sha256}")
+PY

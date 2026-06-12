@@ -44,7 +44,7 @@ static void usage(FILE *out)
 		"  init                  configure LED/buttons/reset/USB-power GPIOs\n"
 		"  status                print LED, button, reset, and USB-power state\n"
 		"  buttons               print button pressed/released state\n"
-		"  bootsel               reboot into the RP2350 BOOTSEL USB loader\n"
+		"  bootsel [delay-ms]    reboot into the RP2350 BOOTSEL USB loader\n"
 		"  led on|off|toggle     control active-low red LED on GPIO29\n"
 		"  usb-power on|off      control USB host 5V power GPIO11\n"
 		"  periph-reset assert|deassert|pulse\n"
@@ -164,8 +164,27 @@ static int fruitjam_init(void)
 	return ret ? -1 : 0;
 }
 
-static int reboot_bootsel(void)
+static int parse_delay_ms(const char *s, unsigned int *delay_ms)
 {
+	char *end;
+	unsigned long parsed;
+
+	if (!s || !*s) {
+		*delay_ms = 0;
+		return 0;
+	}
+	errno = 0;
+	parsed = strtoul(s, &end, 10);
+	if (errno || *end || parsed > 60000ul)
+		return -1;
+	*delay_ms = (unsigned int)parsed;
+	return 0;
+}
+
+static int reboot_bootsel(unsigned int delay_ms)
+{
+	if (delay_ms)
+		usleep(delay_ms * 1000u);
 	sync();
 	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
 		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
@@ -233,7 +252,13 @@ int main(int argc, char **argv)
 	}
 
 	if (!strcmp(argv[1], "bootsel")) {
-		if (reboot_bootsel() < 0) {
+		unsigned int delay_ms;
+
+		if (parse_delay_ms(argc >= 3 ? argv[2] : NULL, &delay_ms) < 0) {
+			fprintf(stderr, "fruitjamctl: bad bootsel delay: %s\n", argv[2]);
+			return 2;
+		}
+		if (reboot_bootsel(delay_ms) < 0) {
 			fprintf(stderr, "fruitjamctl: reboot bootsel: %s\n", strerror(errno));
 			return 1;
 		}

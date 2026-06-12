@@ -3,111 +3,379 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fruit Jam Hardware Playground</title>
-  <link rel="stylesheet" href="/style.css">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <meta http-equiv="Pragma" content="no-cache">
+  <title>Fruit Jam</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08090d;
+      --panel: #12151c;
+      --panel-2: #181d27;
+      --text: #f3f7fb;
+      --muted: #aab5c4;
+      --line: #2b3443;
+      --ok: #74d680;
+      --warn: #f1c65b;
+      --bad: #ff6b7a;
+      --blue: #66b7ff;
+      --pink: #f47bd8;
+      --focus: #9fd2ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.35;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #0d1017;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    h1, h2 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 750;
+    }
+
+    h2 {
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    main {
+      width: min(1180px, 100%);
+      margin: 0 auto;
+      padding: 14px;
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 12px;
+    }
+
+    section {
+      grid-column: span 6;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      min-width: 0;
+    }
+
+    .wide { grid-column: span 12; }
+
+    .head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .tile {
+      min-height: 58px;
+      padding: 9px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+
+    .tile span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+
+    .tile strong {
+      font-size: 15px;
+      word-break: break-word;
+    }
+
+    .ok strong { color: var(--ok); }
+    .bad strong { color: var(--bad); }
+    .warn strong { color: var(--warn); }
+    .run strong { color: var(--blue); }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    button, select, input {
+      color: var(--text);
+      background: #0f141d;
+      border: 1px solid #3a4656;
+      border-radius: 6px;
+      min-height: 36px;
+      padding: 7px 10px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 650;
+    }
+
+    button.primary {
+      background: #173653;
+      border-color: #3f8dd0;
+    }
+
+    button.pink {
+      background: #3c1736;
+      border-color: #be61a9;
+    }
+
+    button.good {
+      background: #14351d;
+      border-color: #5eb06c;
+    }
+
+    button.danger {
+      background: #351116;
+      border-color: #b04752;
+    }
+
+    button:disabled {
+      opacity: .55;
+      cursor: default;
+    }
+
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    input[type="color"] {
+      width: 50px;
+      padding: 2px;
+    }
+
+    input[type="text"], select {
+      flex: 1 1 220px;
+      min-width: 0;
+    }
+
+    .pixels {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .pixel {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+    }
+
+    .pixel label {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    pre {
+      width: 100%;
+      min-height: 70px;
+      max-height: 260px;
+      overflow: auto;
+      margin: 10px 0 0;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #090c11;
+      color: #dbe8f8;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .log { min-height: 160px; }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-height: 36px;
+      align-items: center;
+    }
+
+    .chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 5px 9px;
+      color: var(--muted);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    @media (max-width: 850px) {
+      main { grid-template-columns: 1fr; }
+      section, .wide { grid-column: 1; }
+      .grid, .pixels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      header { align-items: flex-start; flex-direction: column; }
+      .head { align-items: flex-start; flex-direction: column; }
+      button, select, input[type="text"] { width: 100%; }
+      input[type="color"] { width: 56px; }
+    }
+  </style>
 </head>
 <body>
-  <header class="topbar">
-    <div>
-      <p class="eyebrow">RP2350 Linux</p>
-      <h1>Fruit Jam Hardware Playground</h1>
-    </div>
-    <div class="actions">
-      <button id="refresh" type="button">Refresh</button>
-      <a class="ghost" href="/cgi-bin/env.cgi">CGI env</a>
+  <header>
+    <h1>Fruit Jam</h1>
+    <div class="row">
+      <button id="refresh" class="primary" type="button">Refresh</button>
+      <a id="envLink" href="/cgi-bin/env.cgi">CGI env</a>
     </div>
   </header>
 
-  <main class="layout">
-    <section class="status-panel">
-      <div class="status-card">
-        <span class="label">Berry CGI</span>
-        <strong id="berryStatus">checking</strong>
-      </div>
-      <div class="status-card">
-        <span class="label">NeoPixels</span>
-        <strong id="neoStatus">checking</strong>
-      </div>
-      <div class="status-card">
-        <span class="label">I2C</span>
-        <strong id="i2cStatus">checking</strong>
-      </div>
-      <div class="status-card">
-        <span class="label">Audio</span>
-        <strong id="audioStatus">checking</strong>
-      </div>
-      <div class="status-card">
-        <span class="label">SD</span>
-        <strong id="sdStatus">checking</strong>
-      </div>
+  <main>
+    <section class="wide">
+      <div class="head"><h2>Status</h2></div>
+      <div class="grid" id="statusGrid"></div>
     </section>
 
-    <section class="panel wide">
-      <div class="panel-head">
-        <div>
-          <h2>NeoPixels</h2>
-          <p>Five onboard LEDs through Berry and `/dev/neopixels`.</p>
-        </div>
-        <div class="button-row">
+    <section class="wide">
+      <div class="head">
+        <h2>NeoPixels</h2>
+        <div class="row">
           <button id="rainbow" type="button">Rainbow</button>
           <button id="warm" type="button">Warm</button>
           <button id="clearPixels" type="button">Clear</button>
           <button id="applyPixels" class="primary" type="button">Apply</button>
         </div>
       </div>
-      <div id="pixelGrid" class="pixel-grid"></div>
-      <p class="hint" id="pixelResult">Waiting for a color update.</p>
+      <div class="pixels" id="pixelGrid"></div>
+      <pre id="pixelOut">Ready.</pre>
     </section>
 
-    <section class="panel">
-      <div class="panel-head">
-        <div>
-          <h2>Buttons</h2>
-          <p>GPIO0, GPIO4, GPIO5 live state.</p>
+    <section>
+      <div class="head">
+        <h2>RTTTL</h2>
+        <div class="row">
+          <button id="toneTune" type="button">Tone</button>
+          <button id="playTune" class="primary" type="button">Play</button>
         </div>
       </div>
-      <div id="buttons" class="button-state"></div>
-      <div class="button-row">
-        <button data-test-button="button1" type="button">Test B1</button>
-        <button data-test-button="button2" type="button">Test B2</button>
-        <button data-test-button="button3" type="button">Test B3</button>
-      </div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head">
-        <div>
-          <h2>RTTTL Audio</h2>
-          <p>Play through the TLV320 beep path.</p>
-        </div>
-      </div>
-      <label class="field">
-        <span>Tune</span>
+      <div class="row">
         <input id="rtttl" type="text" value="fruit:d=8,o=5,b=120:c,e,g,c6,g,e,c">
-      </label>
-      <button id="playTune" class="primary" type="button">Play tune</button>
-      <pre id="rtttlOutput" class="output">Ready.</pre>
+      </div>
+      <pre id="rtttlOut">Ready.</pre>
     </section>
 
-    <section class="panel">
-      <div class="panel-head">
-        <div>
-          <h2>I2C</h2>
-          <p>Scan GPIO20/GPIO21 `/dev/i2c-0`.</p>
+    <section>
+      <div class="head">
+        <h2>WAVs</h2>
+        <div class="row">
+          <button id="reloadWavs" type="button">Reload</button>
+          <button id="playWav" class="primary" type="button">Play</button>
         </div>
-        <button id="scanI2c" type="button">Scan</button>
       </div>
-      <div id="i2cDevices" class="chips"></div>
+      <div class="row">
+        <select id="wavFile"></select>
+        <select id="wavBackend">
+          <option value="i2s">I2S</option>
+          <option value="beep">Beep</option>
+        </select>
+      </div>
+      <pre id="wavOut">Loading.</pre>
     </section>
 
-    <section class="panel">
-      <div class="panel-head">
-        <div>
-          <h2>ADC</h2>
-          <p>Read RP2350 ADC channels.</p>
+    <section>
+      <div class="head">
+        <h2>DVI</h2>
+        <div class="row">
+          <button data-dvi="dashboard" class="primary" type="button">Dashboard</button>
+          <button data-dvi="test" class="good" type="button">Test</button>
+          <button data-dvi="pattern" type="button">Pattern</button>
+          <button data-dvi="start" type="button">Start</button>
+          <button data-dvi="stop" class="pink" type="button">Stop</button>
         </div>
       </div>
-      <div class="split-row">
+      <div class="row">
+        <input id="dviText" type="text" value="Fruit Jam Linux">
+        <button data-dvi="text" type="button">Text</button>
+      </div>
+      <pre id="dviOut">Ready.</pre>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>USB Host</h2>
+        <div class="row">
+          <button data-usbhost="status" type="button">Status</button>
+          <button data-usbhost="on" class="good" type="button">Power On</button>
+          <button data-usbhost="off" class="pink" type="button">Power Off</button>
+        </div>
+      </div>
+      <pre id="usbhostOut">Ready.</pre>
+    </section>
+
+    <section class="wide">
+      <div class="head">
+        <h2>Berry</h2>
+        <div class="row">
+          <button id="reloadBerry" type="button">Reload</button>
+          <button id="runBerry" class="primary" type="button">Run</button>
+        </div>
+      </div>
+      <div class="row">
+        <select id="berryScript"></select>
+      </div>
+      <pre id="berryOut">Loading.</pre>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>I2C</h2>
+        <button id="scanI2c" type="button">Check</button>
+      </div>
+      <div class="chips" id="i2cDevices"></div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>ADC</h2>
+        <button id="readAdc" type="button">Read</button>
+      </div>
+      <div class="row">
         <select id="adcChannel">
           <option value="0">ADC0 GPIO40</option>
           <option value="1">ADC1 GPIO41</option>
@@ -117,23 +385,407 @@
           <option value="5">ADC5 GPIO45</option>
           <option value="temp">Temperature</option>
         </select>
-        <button id="readAdc" type="button">Read</button>
       </div>
-      <pre id="adcOutput" class="output">No ADC reading yet.</pre>
+      <pre id="adcOut">Ready.</pre>
     </section>
 
-    <section class="panel wide">
-      <div class="panel-head">
-        <div>
-          <h2>Activity</h2>
-          <p>Recent CGI calls and hardware responses.</p>
-        </div>
-        <button id="clearLog" type="button">Clear log</button>
+    <section>
+      <div class="head"><h2>Buttons</h2></div>
+      <div class="chips" id="buttons"></div>
+      <div class="row" style="margin-top:10px">
+        <button data-button="button1" type="button">Test B1</button>
+        <button data-button="button2" type="button">Test B2</button>
+        <button data-button="button3" type="button">Test B3</button>
+      </div>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Recovery</h2>
+        <button id="bootsel" class="danger" type="button">BOOTSEL</button>
+      </div>
+      <pre id="recoveryOut">Ready.</pre>
+    </section>
+
+    <section>
+      <div class="head">
+        <h2>Activity</h2>
+        <button id="clearLog" type="button">Clear</button>
       </div>
       <pre id="log" class="log"></pre>
     </section>
   </main>
 
-  <script src="/app.js"></script>
+  <script>
+    "use strict";
+
+    const queryParams = new URLSearchParams(window.location.search);
+    const requestedHost = queryParams.get("host");
+    const boardHost = requestedHost || window.location.hostname || "127.0.0.1";
+    const boardOrigin = (window.location.protocol === "file:" || requestedHost) ? "http://" + boardHost : "";
+    const api = boardOrigin + "/cgi-bin/fruitjam.cgi";
+    const $ = (s) => document.querySelector(s);
+    const $$ = (s) => Array.from(document.querySelectorAll(s));
+    const logLines = [];
+    let chain = Promise.resolve();
+    let pixels = ["#ff0033", "#ffb000", "#00d084", "#0099ff", "#aa55ff"];
+
+    function log(text) {
+      const t = new Date().toLocaleTimeString();
+      logLines.unshift("[" + t + "] " + text);
+      logLines.splice(24);
+      $("#log").textContent = logLines.join("\n");
+    }
+
+    function busy(selector, value) {
+      const node = $(selector);
+      if (node) node.disabled = value;
+    }
+
+    function esc(value) {
+      return String(value).replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      })[ch]);
+    }
+
+    async function rawGet(params, timeoutMs) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs || 12000);
+      try {
+        const res = await fetch(api + "?" + new URLSearchParams(params), {
+          cache: "no-store",
+          signal: controller.signal
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return await res.json();
+      } catch (err) {
+        if (err.name === "AbortError") throw new Error("request timed out");
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    function get(params, timeoutMs) {
+      const run = () => rawGet(params, timeoutMs);
+      chain = chain.then(run, run);
+      return chain;
+    }
+
+    function stateClass(value) {
+      if (value === true) return "ok";
+      if (value === false) return "bad";
+      if (value === "running") return "run";
+      return "warn";
+    }
+
+    function renderStatus(data) {
+      const devices = data.devices || {};
+      const items = [
+        ["CGI", data.ok === true, "direct"],
+        ["NeoPixels", devices.neopixels, devices.neopixels ? "ok" : "missing"],
+        ["Audio", devices.audio, devices.audio ? "ok" : "missing"],
+        ["I2C", devices.i2c0, devices.i2c0 ? "ok" : "missing"],
+        ["SD", devices.sd, devices.sd ? "mounted" : "missing"],
+        ["DVI", devices.dvi, devices.dvi ? "ready" : "missing"],
+        ["USB host", devices.usbhost, devices.usbhost_power === 1 ? "power on" : (devices.usbhost ? "power off" : "missing")],
+      ];
+
+      $("#statusGrid").innerHTML = items.map(([name, ok, text]) =>
+        '<div class="tile ' + stateClass(ok) + '"><span>' + name +
+        '</span><strong>' + text + '</strong></div>'
+      ).join("");
+
+      $("#buttons").innerHTML = (data.buttons || []).map((b) =>
+        '<span class="chip">' + b.name + ' GPIO' + b.gpio + ' ' +
+        (b.pressed ? "pressed" : "released") + '</span>'
+      ).join("");
+    }
+
+    async function refresh() {
+      busy("#refresh", true);
+      try {
+        const data = await get({ action: "status" }, 10000);
+        renderStatus(data);
+        log("status ok");
+        return true;
+      } catch (err) {
+        $("#statusGrid").innerHTML = '<div class="tile bad"><span>CGI</span><strong>' + err.message + '</strong></div>';
+        log("status failed: " + err.message);
+        return false;
+      } finally {
+        busy("#refresh", false);
+      }
+    }
+
+    function renderPixels() {
+      $("#pixelGrid").innerHTML = pixels.map((color, i) =>
+        '<div class="pixel"><label>P' + i + '</label><input type="color" data-pixel="' +
+        i + '" value="' + color + '"></div>'
+      ).join("");
+      $$("input[data-pixel]").forEach((input) => {
+        input.addEventListener("input", () => {
+          pixels[Number(input.dataset.pixel)] = input.value;
+        });
+      });
+    }
+
+    function setPixels(next) {
+      pixels = next.slice(0, 5);
+      renderPixels();
+    }
+
+    async function applyPixels() {
+      const params = { action: "neopixels" };
+      pixels.forEach((color, i) => params["c" + i] = color);
+      busy("#applyPixels", true);
+      try {
+        const data = await get(params, 12000);
+        $("#pixelOut").textContent = JSON.stringify(data, null, 2);
+        log("neopixels " + (data.ok ? "ok" : "failed"));
+        await refresh();
+      } catch (err) {
+        $("#pixelOut").textContent = err.message;
+        log("neopixels failed: " + err.message);
+      } finally {
+        busy("#applyPixels", false);
+      }
+    }
+
+    async function playTune() {
+      busy("#playTune", true);
+      try {
+        const data = await get({ action: "rtttl", song: $("#rtttl").value }, 12000);
+        $("#rtttlOut").textContent = data.output || data.error || JSON.stringify(data);
+        log("rtttl " + (data.ok ? "ok" : "failed"));
+        await refresh();
+      } catch (err) {
+        $("#rtttlOut").textContent = err.message;
+        log("rtttl failed: " + err.message);
+      } finally {
+        busy("#playTune", false);
+      }
+    }
+
+    async function playTone() {
+      busy("#toneTune", true);
+      try {
+        const data = await get({ action: "rtttl", tone: "880", ms: "1200" }, 9000);
+        $("#rtttlOut").textContent = data.output || data.error || JSON.stringify(data);
+        log("tone " + (data.ok ? "ok" : "failed"));
+      } catch (err) {
+        $("#rtttlOut").textContent = err.message;
+        log("tone failed: " + err.message);
+      } finally {
+        busy("#toneTune", false);
+      }
+    }
+
+    async function loadWavs() {
+      busy("#reloadWavs", true);
+      try {
+        const data = await get({ action: "wav-list" }, 12000);
+        const files = (data.files || []).slice().sort((a, b) => a.name.localeCompare(b.name));
+        $("#wavFile").innerHTML = files.map((file) =>
+          '<option value="' + esc(file.name) + '">' + esc(file.name) + ' (' + file.bytes + ')</option>'
+        ).join("");
+        $("#wavOut").textContent = files.length
+          ? (data.truncated ? "Showing first " + files.length + " WAV files." : "Ready.")
+          : (data.error || "No WAV files.");
+        log("wav list " + files.length + (data.truncated ? " truncated" : ""));
+      } catch (err) {
+        $("#wavOut").textContent = err.message;
+        log("wav list failed: " + err.message);
+      } finally {
+        busy("#reloadWavs", false);
+      }
+    }
+
+    async function playWav() {
+      const file = $("#wavFile").value;
+      if (!file) return;
+      busy("#playWav", true);
+      $("#wavOut").textContent = "Playing...";
+      try {
+        const data = await get({
+          action: "wav-play",
+          file,
+          backend: $("#wavBackend").value,
+          loud: "1"
+        }, 65000);
+        $("#wavOut").textContent = data.output || data.error || JSON.stringify(data);
+        log("wav " + file + " " + (data.ok ? "ok" : "failed"));
+      } catch (err) {
+        $("#wavOut").textContent = err.message;
+        log("wav failed: " + err.message);
+      } finally {
+        busy("#playWav", false);
+      }
+    }
+
+    async function dvi(cmd) {
+      $$("[data-dvi]").forEach((button) => button.disabled = true);
+      try {
+        const params = { action: "dvi", cmd };
+        if (cmd === "text") params.text = $("#dviText").value;
+        const data = await get(params, 10000);
+        $("#dviOut").textContent = JSON.stringify(data, null, 2);
+        log("dvi " + cmd + " " + (data.ok ? "ok" : "failed"));
+        await refresh();
+      } catch (err) {
+        $("#dviOut").textContent = err.message;
+        log("dvi failed: " + err.message);
+      } finally {
+        $$("[data-dvi]").forEach((button) => button.disabled = false);
+      }
+    }
+
+    async function usbhost(cmd) {
+      $$("[data-usbhost]").forEach((button) => button.disabled = true);
+      try {
+        const data = await get({ action: "usbhost", cmd }, 10000);
+        $("#usbhostOut").textContent = JSON.stringify(data, null, 2);
+        log("usbhost " + cmd + " " + (data.ok ? "ok" : "failed"));
+        await refresh();
+      } catch (err) {
+        $("#usbhostOut").textContent = err.message;
+        log("usbhost failed: " + err.message);
+      } finally {
+        $$("[data-usbhost]").forEach((button) => button.disabled = false);
+      }
+    }
+
+    async function loadBerry() {
+      busy("#reloadBerry", true);
+      try {
+        const data = await get({ action: "berry-list" }, 10000);
+        const scripts = (data.scripts || []).slice().sort();
+        $("#berryScript").innerHTML = scripts.map((name) =>
+          '<option value="' + esc(name) + '">' + esc(name) + '</option>'
+        ).join("");
+        $("#berryOut").textContent = scripts.length ? "Ready." : "No scripts.";
+        log("berry list " + scripts.length);
+      } catch (err) {
+        $("#berryOut").textContent = err.message;
+        log("berry list failed: " + err.message);
+      } finally {
+        busy("#reloadBerry", false);
+      }
+    }
+
+    async function runBerry() {
+      const script = $("#berryScript").value;
+      if (!script) return;
+      busy("#runBerry", true);
+      $("#berryOut").textContent = "Running...";
+      try {
+        const data = await get({ action: "berry-run", script }, 30000);
+        $("#berryOut").textContent = data.output || data.error || JSON.stringify(data);
+        log("berry " + script + " " + (data.ok ? "ok" : "failed"));
+      } catch (err) {
+        $("#berryOut").textContent = err.message;
+        log("berry failed: " + err.message);
+      } finally {
+        busy("#runBerry", false);
+      }
+    }
+
+    async function scanI2c() {
+      busy("#scanI2c", true);
+      try {
+        const data = await get({ action: "i2c" }, 10000);
+        const devices = data.devices || [];
+        $("#i2cDevices").innerHTML = devices.length
+          ? devices.map((d) => '<span class="chip">' + d + '</span>').join("")
+          : '<span class="chip">' + (data.error || "none") + '</span>';
+        log("i2c " + (data.ok ? "ok" : "failed"));
+      } catch (err) {
+        $("#i2cDevices").innerHTML = '<span class="chip">' + err.message + '</span>';
+        log("i2c failed: " + err.message);
+      } finally {
+        busy("#scanI2c", false);
+      }
+    }
+
+    async function readAdc() {
+      busy("#readAdc", true);
+      try {
+        const data = await get({ action: "adc", channel: $("#adcChannel").value }, 10000);
+        $("#adcOut").textContent = data.output || data.error || JSON.stringify(data);
+        log("adc " + (data.ok ? "ok" : "failed"));
+      } catch (err) {
+        $("#adcOut").textContent = err.message;
+        log("adc failed: " + err.message);
+      } finally {
+        busy("#readAdc", false);
+      }
+    }
+
+    async function testButton(button) {
+      const selector = '[data-button="' + button + '"]';
+      $$(selector).forEach((node) => node.disabled = true);
+      try {
+        const data = await get({ action: "button-test", button }, 10000);
+        log("button " + button + " " + (data.ok ? "ok" : "failed"));
+        await refresh();
+      } catch (err) {
+        log("button failed: " + err.message);
+      } finally {
+        $$(selector).forEach((node) => node.disabled = false);
+      }
+    }
+
+    async function bootsel() {
+      if (!confirm("Reboot Fruit Jam into BOOTSEL?")) return;
+      busy("#bootsel", true);
+      try {
+        const data = await get({ action: "bootsel" }, 6000);
+        $("#recoveryOut").textContent = JSON.stringify(data, null, 2);
+        log("bootsel requested");
+      } catch (err) {
+        $("#recoveryOut").textContent = "BOOTSEL request sent; the board may have reset before the reply finished.";
+        log("bootsel request interrupted: " + err.message);
+      } finally {
+        busy("#bootsel", false);
+      }
+    }
+
+    async function initialLoad() {
+      if (await refresh()) {
+        await loadBerry();
+        await loadWavs();
+      }
+    }
+
+    function bind() {
+      $("#envLink").href = boardOrigin + "/cgi-bin/env.cgi";
+      renderPixels();
+      $("#refresh").addEventListener("click", refresh);
+      $("#rainbow").addEventListener("click", () => setPixels(["#ff0033", "#ffb000", "#00d084", "#0099ff", "#aa55ff"]));
+      $("#warm").addEventListener("click", () => setPixels(["#ff2200", "#ff6600", "#ffb000", "#ffd166", "#fff1a8"]));
+      $("#clearPixels").addEventListener("click", () => setPixels(["#000000", "#000000", "#000000", "#000000", "#000000"]));
+      $("#applyPixels").addEventListener("click", applyPixels);
+      $("#toneTune").addEventListener("click", playTone);
+      $("#playTune").addEventListener("click", playTune);
+      $("#reloadWavs").addEventListener("click", loadWavs);
+      $("#playWav").addEventListener("click", playWav);
+      $("#reloadBerry").addEventListener("click", loadBerry);
+      $("#runBerry").addEventListener("click", runBerry);
+      $("#scanI2c").addEventListener("click", scanI2c);
+      $("#readAdc").addEventListener("click", readAdc);
+      $("#bootsel").addEventListener("click", bootsel);
+      $("#clearLog").addEventListener("click", () => { logLines.length = 0; $("#log").textContent = ""; });
+      $$("[data-dvi]").forEach((button) => button.addEventListener("click", () => dvi(button.dataset.dvi)));
+      $$("[data-usbhost]").forEach((button) => button.addEventListener("click", () => usbhost(button.dataset.usbhost)));
+      $$("[data-button]").forEach((button) => button.addEventListener("click", () => testButton(button.dataset.button)));
+      initialLoad();
+    }
+
+    document.addEventListener("DOMContentLoaded", bind);
+  </script>
 </body>
 </html>

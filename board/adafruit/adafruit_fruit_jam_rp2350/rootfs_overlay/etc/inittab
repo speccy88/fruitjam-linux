@@ -19,7 +19,7 @@
 ::sysinit:/bin/mkdir -p /dev/pts /dev/shm
 ::sysinit:/bin/mount -a
 ::sysinit:/bin/mkdir -p /run/lock/subsys
-::sysinit:/usr/bin/fruitjam-services all
+::once:/usr/bin/fruitjam-services all
 
 ttyAMA0::respawn:/usr/bin/hush
 ttyGS0::respawn:/usr/bin/hush

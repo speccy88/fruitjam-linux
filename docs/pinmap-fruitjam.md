@@ -23,10 +23,10 @@ onboard NeoPixels; the remaining entries are planning notes for later milestones
 | microSD card detect | GPIO33 | Pull-up input configured | Note: Adafruit Learn text has listed GPIO34 in one place, but the current CircuitPython board definition maps card detect to GPIO33. |
 | SDIO DAT1 | GPIO37 | Not implemented | Later optional SDIO path. |
 | SDIO DAT2 | GPIO38 | Not implemented | Later optional SDIO path. |
-| HSTX DVI CKN/CKP | GPIO12/GPIO13 | Not implemented | UART must remain fallback when DVI work starts. |
-| HSTX DVI D0N/D0P | GPIO14/GPIO15 | Not implemented | Text console only in later milestone. |
-| HSTX DVI D1N/D1P | GPIO16/GPIO17 | Not implemented | Text console only in later milestone. |
-| HSTX DVI D2N/D2P | GPIO18/GPIO19 | Not implemented | Text console only in later milestone. |
+| HSTX DVI CKN/CKP | GPIO12/GPIO13 | `/dev/fruitjam-dvi` partial path | Tiny RGB332 HSTX frame helper; UART remains fallback while full console/fbdev work continues. |
+| HSTX DVI D0N/D0P | GPIO14/GPIO15 | `/dev/fruitjam-dvi` partial path | Used by the bounded dashboard/text/test frame helper. |
+| HSTX DVI D1N/D1P | GPIO16/GPIO17 | `/dev/fruitjam-dvi` partial path | Used by the bounded dashboard/text/test frame helper. |
+| HSTX DVI D2N/D2P | GPIO18/GPIO19 | `/dev/fruitjam-dvi` partial path | Used by the bounded dashboard/text/test frame helper. |
 | USB host D+ | GPIO1 | Not implemented | Connected through the Fruit Jam USB host/hub path. |
 | USB host D- | GPIO2 | Not implemented | Connected through the Fruit Jam USB host/hub path. |
 | USB host 5V power | GPIO11 | `fruitjamctl` power switch only | Power-enable/control for USB host 5 V path; Linux USB host protocol driver is not implemented. |
@@ -39,7 +39,7 @@ onboard NeoPixels; the remaining entries are planning notes for later milestones
 | Peripheral reset | GPIO22 | `fruitjamctl` / AirLift reset line | Shared ESP32-C6/TLV320 reset. |
 | I2C SDA | GPIO20 | `/dev/i2c-0` | GPIO-backed `i2c-gpio0`; `fruitjam-i2c scan` found TLV320DAC3100 at `0x18`. |
 | I2C SCL | GPIO21 | `/dev/i2c-0` | GPIO-backed `i2c-gpio0`; internal pull-up enabled by the RP2350 SIO GPIO driver. |
-| I2S DIN | GPIO24 | Not implemented | TLV320DAC3100 data input; full PCM/I2S data path is still future work. |
-| I2S MCLK | GPIO25 | Not implemented | TLV320DAC3100 master clock; first audio milestone uses BCLK as the codec PLL input. |
-| I2S BCLK | GPIO26 | `/dev/fruitjam-audio` | PIO1-generated 512 kHz BCLK for the TLV320DAC3100 first audio milestone. |
-| I2S WS | GPIO27 | `/dev/fruitjam-audio` | PIO1-generated 16 kHz word-select clock for TLV320DAC3100 beep-generator RTTTL playback. |
+| I2S DIN | GPIO24 | `/dev/fruitjam-audio` tone path | PIO1-generated 16-bit stereo sample stream for the first TLV320 tone milestone. |
+| I2S MCLK | GPIO25 | `/dev/fruitjam-audio` tone path | PIO1-generated 15 MHz MCLK used as the TLV320 PLL input. |
+| I2S BCLK | GPIO26 | `/dev/fruitjam-audio` tone path | PIO1-generated BCLK for the 8 kHz TLV320 I2S tone stream. |
+| I2S WS | GPIO27 | `/dev/fruitjam-audio` tone path | PIO1-generated word-select clock for the 8 kHz TLV320 I2S tone stream. |

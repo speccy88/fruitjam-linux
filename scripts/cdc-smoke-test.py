@@ -7,6 +7,7 @@ import argparse
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -21,6 +22,8 @@ except ImportError as exc:  # pragma: no cover - host dependency guard
 
 PROMPT_RE = re.compile(rb"(?:^|\r|\n)/ # ")
 CONTROL_NOISE = b"\x10\x01\x01"
+INBOUND_UPLOAD_NAME = "airlift_upload_smoke.txt"
+INBOUND_UPLOAD_TEXT = "hello from Fruit Jam AirLift upload smoke\n"
 
 
 @dataclass
@@ -214,9 +217,16 @@ def core_tests(shell: CdcShell, args: argparse.Namespace) -> Iterable[TestResult
     yield pass_if(shell, "kernel", "cat /proc/version", rc_zero)
     yield pass_if(shell, "tool inventory", tool_inventory_command(), inventory_ok)
     yield pass_if(shell, "berry expression", "berry -e 'print(\"berry-cdc-ok\")'", contains("berry-cdc-ok"))
+    yield pass_if(
+        shell,
+        "berry-run script",
+        "berry-run /root/berry/00-hello.be",
+        contains("00-hello.be: ok"),
+        timeout=20,
+    )
     yield pass_if(shell, "board status", "fruitjamctl status", contains("red-led", "button1"))
     yield pass_if(shell, "buttons", "fruitjam-buttons status", contains("button1", "button2", "button3"))
-    yield pass_if(shell, "i2c scan", "fruitjam-i2c scan", rc_zero, timeout=20)
+    yield pass_if(shell, "i2c codec ping", "fruitjam-i2c ping 0x18", rc_zero, timeout=8)
     yield pass_if(
         shell,
         "neopixel device",
@@ -232,8 +242,27 @@ def core_tests(shell: CdcShell, args: argparse.Namespace) -> Iterable[TestResult
             contains("played"),
             timeout=20,
         )
+        yield pass_if(
+            shell,
+            "wavplay sample",
+            "if [ -r /mnt/sd/wavs/fruitjam-scale.wav ]; then fruitjam-wavplay --loud /mnt/sd/wavs/fruitjam-scale.wav; else echo wavplay-skip; fi",
+            lambda r: r.rc == 0 and clean_output(r) and ("played /mnt/sd/wavs/fruitjam-scale.wav" in r.output or "wavplay-skip" in r.output),
+            timeout=45,
+        )
     else:
         yield skip("rtttl audio", "use --audio to play a short tune")
+        yield skip("wavplay sample", "use --audio to play /mnt/sd/wavs/fruitjam-scale.wav when present")
+
+    if args.skip_display:
+        yield skip("dvi bounded show", "disabled by --skip-display")
+    else:
+        yield pass_if(
+            shell,
+            "dvi bounded show",
+            "fruitjam-dvi dashboard",
+            rc_zero,
+            timeout=12,
+        )
 
 
 def service_tests(shell: CdcShell) -> Iterable[TestResult]:
@@ -243,6 +272,24 @@ def service_tests(shell: CdcShell) -> Iterable[TestResult]:
         "http loopback",
         "wget -O - http://127.0.0.1/cgi-bin/fruitjam.cgi?action=status",
         contains('"ok":true'),
+        timeout=20,
+    )
+    yield pass_if(
+        shell,
+        "http berry list",
+        "wget -O - http://127.0.0.1/cgi-bin/fruitjam.cgi?action=berry-list",
+        contains('"run-all.be"'),
+        timeout=20,
+    )
+    yield skip(
+        "http berry run",
+        "browser Berry execution is verified through the AirLift HTTP bridge; local wget+httpd+Berry is too memory-heavy for no-MMU",
+    )
+    yield pass_if(
+        shell,
+        "http wav list",
+        "wget -O - http://127.0.0.1/cgi-bin/fruitjam.cgi?action=wav-list",
+        lambda r: r.rc == 0 and clean_output(r) and '"dir":"/mnt/sd/wavs"' in r.output and '"files":[' in r.output,
         timeout=20,
     )
     yield pass_if(
@@ -269,6 +316,7 @@ def service_tests(shell: CdcShell) -> Iterable[TestResult]:
 
 
 def airlift_tests(shell: CdcShell, args: argparse.Namespace) -> Iterable[TestResult]:
+    shell.run("fruitjam-services stop; killall airliftctl 2>/dev/null || true", timeout=10)
     yield pass_if(shell, "airlift probe", "airliftctl probe", contains("firmware", "mac"), timeout=35)
     yield pass_if(
         shell,
@@ -283,10 +331,26 @@ def airlift_tests(shell: CdcShell, args: argparse.Namespace) -> Iterable[TestRes
     if not ssid or not password:
         yield skip("airlift join", "set FJ_WIFI_SSID/FJ_WIFI_PASSWORD or pass --ssid/--password")
         yield skip("airlift tcp-get", "requires WiFi join")
+        yield skip("airlift inbound http", "requires WiFi join")
+        yield skip("airlift inbound shell", "requires WiFi join")
+        yield skip("airlift inbound ftp", "requires WiFi join")
         return
 
     join_cmd = f"airliftctl join {shell_quote(ssid)} {shell_quote(password)}"
-    yield pass_if(shell, "airlift join", join_cmd, contains("ip "), timeout=45)
+    join_result = shell.run(join_cmd, timeout=45)
+    join_ok = not join_result.timed_out and contains("ip ")(join_result)
+    if join_ok:
+        yield TestResult("airlift join", "PASS", first_line(join_result.output), join_result.output)
+    else:
+        detail = f"timeout after 45s" if join_result.timed_out else f"rc={join_result.rc} {first_line(join_result.output)}"
+        yield TestResult("airlift join", "FAIL", detail, join_result.output)
+        yield skip("airlift tcp-get", "requires WiFi join")
+        yield skip("airlift inbound shell", "requires WiFi join")
+        yield skip("airlift inbound ftp", "requires WiFi join")
+        return
+
+    ip_match = re.search(r"\bip\s+(\d+\.\d+\.\d+\.\d+)\b", join_result.output)
+    airlift_ip = ip_match.group(1) if ip_match else ""
     yield pass_if(
         shell,
         "airlift tcp-get",
@@ -294,6 +358,410 @@ def airlift_tests(shell: CdcShell, args: argparse.Namespace) -> Iterable[TestRes
         lambda r: r.rc == 0 and clean_output(r) and ("HTTP/" in r.output or "Example Domain" in r.output),
         timeout=45,
     )
+    if airlift_ip:
+        yield from airlift_inbound_tests(shell, airlift_ip)
+    else:
+        yield skip("airlift inbound http", "could not parse AirLift IP")
+        yield skip("airlift inbound shell", "could not parse AirLift IP")
+        yield skip("airlift inbound ftp", "could not parse AirLift IP")
+
+
+def airlift_inbound_tests(shell: CdcShell, ip_addr: str) -> Iterable[TestResult]:
+    start_cmd = (
+        "fruitjam-services stop; "
+        "airliftctl serve-inbound >/tmp/airlift-inbound.log 2>&1 & "
+        "echo airlift-inbound:$!; sleep 2; cat /tmp/airlift-inbound.log"
+    )
+    start = shell.run(start_cmd, timeout=20)
+    listening = (
+        "shell listening on port 23" in start.output
+        and "http listening on port 80" in start.output
+        and "ftp listening on port 21" in start.output
+    )
+    if start.timed_out or start.rc != 0 or not listening:
+        detail = "timeout starting bridge" if start.timed_out else f"rc={start.rc} {first_line(start.output)}"
+        yield TestResult("airlift inbound http", "FAIL", detail, start.output)
+        yield TestResult("airlift inbound shell", "FAIL", detail, start.output)
+        yield skip("airlift inbound ftp", "requires inbound daemon")
+        return
+
+    try:
+        http_root = run_inbound_http_probe(ip_addr, "/")
+        http_status = run_inbound_http_probe(
+            ip_addr, "/cgi-bin/fruitjam.cgi?action=status"
+        )
+        http_berry_list = run_inbound_http_probe(
+            ip_addr, "/cgi-bin/fruitjam.cgi?action=berry-list"
+        )
+        http_berry_run = run_inbound_http_probe(
+            ip_addr, "/cgi-bin/fruitjam.cgi?action=berry-run&script=00-hello.be"
+        )
+        http_output = (
+            http_root
+            + "\n--- status ---\n" + http_status
+            + "\n--- berry-list ---\n" + http_berry_list
+            + "\n--- berry-run ---\n" + http_berry_run
+        )
+    except OSError as exc:
+        yield TestResult("airlift inbound http", "FAIL", str(exc), start.output)
+    else:
+        if (
+            "HTTP/1.0 200 OK" in http_root
+            and ("<h1>Fruit Jam</h1>" in http_root or "<title>Fruit Jam</title>" in http_root)
+            and "HTTP/1.0 200 OK" in http_status
+            and '"ok":true' in http_status
+            and "HTTP/1.0 200 OK" in http_berry_list
+            and '"run-all.be"' in http_berry_list
+            and "HTTP/1.0 200 OK" in http_berry_run
+            and '"ok":true' in http_berry_run
+            and "00-hello.be: ok" in http_berry_run
+        ):
+            yield TestResult("airlift inbound http", "PASS", f"{ip_addr}:80 root + status + Berry run", http_output)
+        else:
+            yield TestResult("airlift inbound http", "FAIL", "HTTP root/status/Berry proof missing", http_output)
+
+    try:
+        shell_output = run_inbound_shell_probe(ip_addr)
+    except OSError as exc:
+        yield TestResult("airlift inbound shell", "FAIL", str(exc), start.output)
+    else:
+        if "Fruit Jam telnet shell" in shell_output and "inbound-smoke" in shell_output:
+            yield TestResult("airlift inbound shell", "PASS", f"{ip_addr}:23 shell echo", shell_output)
+        else:
+            yield TestResult("airlift inbound shell", "FAIL", "shell proof text missing", shell_output)
+
+    try:
+        ftp_output = run_inbound_ftp_probe(ip_addr)
+    except OSError as exc:
+        yield TestResult("airlift inbound ftp", "FAIL", str(exc), "")
+    else:
+        if (
+            "220 Fruit Jam FTP ready" in ftp_output
+            and "230 Logged in" in ftp_output
+            and "EPSV STOR 150 226" in ftp_output
+            and "PASV STOR 150 226" in ftp_output
+            and "EPSV RETR match: True" in ftp_output
+            and "PASV RETR match: True" in ftp_output
+            and "SECOND banner 220" in ftp_output
+            and "SIZE " in ftp_output
+            and INBOUND_UPLOAD_NAME in ftp_output
+        ):
+            yield TestResult("airlift inbound ftp", "PASS", f"{ip_addr}:21 passive EPSV/PASV STOR/RETR/NLST", ftp_output)
+        else:
+            yield TestResult("airlift inbound ftp", "FAIL", "FTP transfer proof missing", ftp_output)
+
+
+def run_inbound_http_probe(ip_addr: str, target: str) -> str:
+    request = (
+        f"GET {target} HTTP/1.0\r\n"
+        f"Host: {ip_addr}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+    data = bytearray()
+    header_end = -1
+    content_length: int | None = None
+    deadline = time.monotonic() + 15.0
+
+    with socket.create_connection((ip_addr, 80), timeout=10) as sock:
+        sock.settimeout(1)
+        sock.sendall(request)
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            data.extend(chunk)
+            if header_end < 0:
+                pos = data.find(b"\r\n\r\n")
+                if pos >= 0:
+                    header_end = pos + 4
+                    for line in data[:pos].splitlines():
+                        if line.lower().startswith(b"content-length:"):
+                            try:
+                                content_length = int(line.split(b":", 1)[1].strip())
+                            except ValueError:
+                                content_length = None
+            if content_length is not None and header_end >= 0:
+                if len(data) - header_end >= content_length:
+                    break
+    return bytes(data).decode("utf-8", "replace")
+
+
+def run_inbound_shell_probe(ip_addr: str) -> str:
+    return run_inbound_shell_script(ip_addr, b"echo inbound-smoke\nexit\n")
+
+
+def run_inbound_shell_script(ip_addr: str, script: bytes) -> str:
+    chunks: list[bytes] = []
+
+    with socket.create_connection((ip_addr, 23), timeout=10) as sock:
+        sock.settimeout(2)
+        read_socket_chunks(sock, chunks, 3.0)
+        sock.sendall(script)
+        read_socket_chunks(sock, chunks, 5.0)
+
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+def run_inbound_ftp_probe(ip_addr: str) -> str:
+    payload = INBOUND_UPLOAD_TEXT.encode("utf-8")
+    transcript = bytearray()
+
+    with socket.create_connection((ip_addr, 21), timeout=10) as sock:
+        sock.settimeout(2)
+        transcript += ftp_read_response(sock)
+        for command in (b"USER anonymous\r\n", b"PASS fruitjam@\r\n", b"SYST\r\n", b"PWD\r\n", b"TYPE I\r\n"):
+            sock.sendall(command)
+            transcript += ftp_read_response(sock)
+
+        for mode in ("EPSV", "PASV"):
+            stor_status = ftp_passive_upload(sock, ip_addr, mode, INBOUND_UPLOAD_NAME, payload)
+            transcript += f"{mode} STOR {stor_status}\r\n".encode("ascii")
+            names = ftp_passive_download(
+                sock, ip_addr, mode, f"NLST {INBOUND_UPLOAD_NAME}", text=True
+            )
+            transcript += f"{mode} NLST {names.strip()}\r\n".encode("utf-8")
+            readback = ftp_passive_download(
+                sock, ip_addr, mode, f"RETR {INBOUND_UPLOAD_NAME}"
+            )
+            transcript += f"{mode} RETR match: {readback == payload}\r\n".encode("ascii")
+            sock.sendall(f"SIZE {INBOUND_UPLOAD_NAME}\r\n".encode("ascii"))
+            transcript += f"{mode} SIZE ".encode("ascii") + ftp_read_response(sock)
+            sock.sendall(f"DELE {INBOUND_UPLOAD_NAME}\r\n".encode("ascii"))
+            transcript += f"{mode} ".encode("ascii") + ftp_read_response(sock)
+        transcript += ftp_second_control_handoff(sock, ip_addr)
+    return bytes(transcript).decode("utf-8", "replace")
+
+
+def ftp_passive_open(control: socket.socket, ip_addr: str, mode: str) -> socket.socket:
+    if mode == "EPSV":
+        control.sendall(b"EPSV\r\n")
+        reply = ftp_read_response(control)
+        match = re.search(rb"\(\|\|\|(\d+)\|\)", reply)
+        if not match:
+            raise OSError(f"EPSV failed: {reply!r}")
+        host = ip_addr
+        port = int(match.group(1))
+    elif mode == "PASV":
+        control.sendall(b"PASV\r\n")
+        reply = ftp_read_response(control)
+        match = re.search(rb"\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)", reply)
+        if not match:
+            raise OSError(f"PASV failed: {reply!r}")
+        nums = [int(group) for group in match.groups()]
+        host = ".".join(str(part) for part in nums[:4])
+        port = nums[4] * 256 + nums[5]
+    else:
+        raise ValueError(f"unknown passive FTP mode: {mode}")
+
+    data = socket.create_connection((host, port), timeout=10)
+    data.settimeout(6)
+    return data
+
+
+def ftp_passive_upload(
+    control: socket.socket, ip_addr: str, mode: str, name: str, payload: bytes
+) -> str:
+    data = ftp_passive_open(control, ip_addr, mode)
+
+    control.sendall(f"STOR {name}\r\n".encode("ascii"))
+    start = ftp_read_response(control)
+    if first_ftp_code(start) != "150":
+        data.close()
+        return f"{first_ftp_code(start)} 000"
+    data.sendall(payload)
+    try:
+        data.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    data.close()
+    done = ftp_read_response(control, timeout=8.0)
+    return f"{first_ftp_code(start)} {first_ftp_code(done)}"
+
+
+def ftp_passive_download(
+    control: socket.socket, ip_addr: str, mode: str, command: str, text: bool = False
+) -> bytes | str:
+    data = ftp_passive_open(control, ip_addr, mode)
+    chunks: list[bytes] = []
+
+    control.sendall(f"{command}\r\n".encode("ascii"))
+    start = ftp_read_response(control)
+    if first_ftp_code(start) != "150":
+        data.close()
+        raise OSError(f"{mode} {command} failed to start: {start!r}")
+    read_socket_chunks(data, chunks, 6.0)
+    data.close()
+    done = ftp_read_response(control, timeout=8.0)
+    if first_ftp_code(done) != "226":
+        raise OSError(f"{mode} {command} failed to finish: {done!r}")
+    payload = b"".join(chunks)
+    return payload.decode("utf-8", "replace") if text else payload
+
+
+def ftp_second_control_handoff(control: socket.socket, ip_addr: str) -> bytes:
+    transcript = bytearray()
+
+    with socket.create_connection((ip_addr, 21), timeout=10) as second:
+        second.settimeout(6)
+        banner = ftp_read_response(second)
+        transcript += f"SECOND banner {first_ftp_code(banner)}\r\n".encode("ascii")
+        if first_ftp_code(banner) != "220":
+            raise OSError(f"second FTP control did not receive banner: {banner!r}")
+        second.sendall(b"USER anonymous\r\n")
+        transcript += b"SECOND " + ftp_read_response(second)
+        second.sendall(b"PASS fruitjam-second@\r\n")
+        transcript += b"SECOND " + ftp_read_response(second)
+        second.sendall(b"QUIT\r\n")
+        transcript += b"SECOND " + ftp_read_response(second)
+
+    transcript += b"FIRST " + ftp_read_response(control, timeout=2.0)
+    return bytes(transcript)
+
+
+def ftp_active_listener(control: socket.socket) -> socket.socket:
+    local_ip = control.getsockname()[0]
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((local_ip, 0))
+    listener.listen(1)
+    listener.settimeout(10)
+    host, port = listener.getsockname()
+    octets = host.split(".")
+    if len(octets) != 4:
+        listener.close()
+        raise OSError(f"active FTP needs IPv4, got {host}")
+    control.sendall(
+        f"PORT {','.join(octets)},{port // 256},{port % 256}\r\n".encode("ascii")
+    )
+    reply = ftp_read_response(control)
+    if first_ftp_code(reply) != "200":
+        listener.close()
+        raise OSError(f"PORT failed: {reply!r}")
+    return listener
+
+
+def ftp_active_accept(listener: socket.socket) -> socket.socket:
+    data, _ = listener.accept()
+    listener.close()
+    data.settimeout(6)
+    return data
+
+
+def ftp_active_upload(control: socket.socket, name: str, payload: bytes) -> str:
+    listener = ftp_active_listener(control)
+    control.sendall(f"STOR {name}\r\n".encode("ascii"))
+    start = ftp_read_response(control)
+    if first_ftp_code(start) != "150":
+        listener.close()
+        return f"{first_ftp_code(start)} 000"
+    data = ftp_active_accept(listener)
+    data.sendall(payload)
+    data.close()
+    done = ftp_read_response(control, timeout=8.0)
+    return f"{first_ftp_code(start)} {first_ftp_code(done)}"
+
+
+def ftp_active_download(control: socket.socket, command: str, text: bool = False) -> bytes | str:
+    listener = ftp_active_listener(control)
+    chunks: list[bytes] = []
+
+    control.sendall(f"{command}\r\n".encode("ascii"))
+    start = ftp_read_response(control)
+    if first_ftp_code(start) != "150":
+        listener.close()
+        raise OSError(f"{command} failed to start: {start!r}")
+    data = ftp_active_accept(listener)
+    read_socket_chunks(data, chunks, 6.0)
+    data.close()
+    done = ftp_read_response(control, timeout=8.0)
+    if first_ftp_code(done) != "226":
+        raise OSError(f"{command} failed to finish: {done!r}")
+    payload = b"".join(chunks)
+    return payload.decode("utf-8", "replace") if text else payload
+
+
+def first_ftp_code(reply: bytes) -> str:
+    text = reply.decode("utf-8", "replace").lstrip()
+    return text[:3] if len(text) >= 3 and text[:3].isdigit() else "000"
+
+
+def ftp_read_response(sock: socket.socket, timeout: float = 8.0) -> bytes:
+    end = time.monotonic() + timeout
+    chunks: list[bytes] = []
+
+    while time.monotonic() < end:
+        try:
+            data = sock.recv(4096)
+        except socket.timeout:
+            continue
+        if not data:
+            break
+        chunks.append(data)
+        text = b"".join(chunks)
+        for line in text.splitlines():
+            if re.match(rb"^\d{3} ", line):
+                return text
+    return b"".join(chunks)
+
+
+def ftp_read_available(sock: socket.socket, timeout: float = 2.0) -> bytes:
+    end = time.monotonic() + timeout
+    chunks: list[bytes] = []
+
+    while time.monotonic() < end:
+        try:
+            data = sock.recv(4096)
+        except socket.timeout:
+            break
+        if not data:
+            break
+        chunks.append(data)
+        if data.endswith(b"\r\n"):
+            break
+    return b"".join(chunks)
+
+
+def run_inbound_tftp_probe(ip_addr: str) -> str:
+    upload = INBOUND_UPLOAD_TEXT.encode("utf-8")
+    wrq = b"\x00\x02" + INBOUND_UPLOAD_NAME.encode("ascii") + b"\x00octet\x00"
+    data_pkt = b"\x00\x03\x00\x01" + upload
+    rrq = b"\x00\x01" + INBOUND_UPLOAD_NAME.encode("ascii") + b"\x00octet\x00"
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(6)
+        sock.sendto(wrq, (ip_addr, 69))
+        ack0, ack0_addr = sock.recvfrom(1024)
+        if ack0[:4] != b"\x00\x04\x00\x00":
+            return ack0.decode("utf-8", "replace")
+        sock.sendto(data_pkt, ack0_addr)
+        ack1, _ = sock.recvfrom(1024)
+        if ack1[:4] != b"\x00\x04\x00\x01":
+            return ack1.decode("utf-8", "replace")
+        sock.sendto(rrq, (ip_addr, 69))
+        data, _ = sock.recvfrom(1024)
+
+    if len(data) >= 4 and data[1] == 3:
+        return data[4:].decode("utf-8", "replace")
+    return data.decode("utf-8", "replace")
+
+
+def read_socket_chunks(sock: socket.socket, chunks: list[bytes], seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+
+    while time.monotonic() < deadline:
+        try:
+            data = sock.recv(4096)
+        except socket.timeout:
+            continue
+        if not data:
+            return
+        chunks.append(data)
+        if b"fj$ " in b"".join(chunks):
+            return
 
 
 def tool_inventory_command() -> str:
@@ -303,8 +771,12 @@ def tool_inventory_command() -> str:
         "fruitjamctl",
         "fruitjam-i2c",
         "fruitjam-rtttl",
+        "fruitjam-wavplay",
+        "fruitjam-dvi",
+        "fruitjam-usbhost",
         "fruitjam-services",
         "fruitjam-buttons",
+        "berry-run",
         "wget",
         "telnet",
         "nc",
@@ -397,12 +869,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssid", help="WiFi SSID for AirLift join test")
     parser.add_argument("--password", help="WiFi passphrase for AirLift join test")
     parser.add_argument("--audio", action="store_true", help="play a short RTTTL tune")
+    parser.add_argument("--skip-display", action="store_true", help="skip the bounded DVI dashboard render")
     parser.add_argument("--skip-airlift", action="store_true", help="skip AirLift and WiFi tests")
     parser.add_argument("--skip-services", action="store_true", help="skip loopback network service tests")
     parser.add_argument(
         "--no-phase-reboot",
         action="store_true",
-        help="do not reboot between AirLift and loopback service test phases",
+        help="kept for compatibility; the suite now leaves AirLift inbound running by default",
     )
     parser.add_argument(
         "--picotool",
@@ -441,27 +914,16 @@ def main() -> int:
         shell.sync()
         results: list[TestResult] = []
         results.extend(core_tests(shell, args))
-        if args.skip_airlift:
-            results.append(skip("airlift", "disabled by --skip-airlift"))
-        else:
-            results.extend(airlift_tests(shell, args))
-
-        if not args.skip_services and not args.skip_airlift and not args.no_phase_reboot:
-            try:
-                shell.request_reboot()
-                shell.close()
-                reboot_from_bootsel(args.port, args.picotool)
-                shell = CdcShell(args.port, args.baud, verbose=args.verbose)
-                shell.sync(timeout=20.0)
-                results.append(TestResult("phase reboot", "PASS", "BOOTSEL -> RISC-V reboot before service tests"))
-            except Exception as exc:
-                results.append(TestResult("phase reboot", "FAIL", str(exc)))
-                return print_report(results, args.verbose)
 
         if args.skip_services:
             results.append(skip("network services", "disabled by --skip-services"))
         else:
             results.extend(service_tests(shell))
+
+        if args.skip_airlift:
+            results.append(skip("airlift", "disabled by --skip-airlift"))
+        else:
+            results.extend(airlift_tests(shell, args))
         return print_report(results, args.verbose)
     finally:
         shell.close()

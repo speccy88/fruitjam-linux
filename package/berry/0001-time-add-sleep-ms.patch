@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam@example.local>
+Date: Fri, 12 Jun 2026 01:24:00 -0400
+Subject: [PATCH] time: add sleep_ms helper
+
+Add a tiny millisecond sleep primitive for no-MMU board examples. This avoids
+busy-wait animation loops that consume CPU and can run much longer than intended
+when using process CPU time as a delay source.
+---
+ src/be_timelib.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/be_timelib.c b/src/be_timelib.c
+index e3c169b..87ed7bd 100644
+--- a/src/be_timelib.c
++++ b/src/be_timelib.c
+@@ -7,6 +7,7 @@
+ ********************************************************************/
+ #include "berry.h"
+ #include <time.h>
++#include <sys/select.h>
+
+ #if BE_USE_TIME_MODULE
+
+@@ -47,22 +48,38 @@ static int m_clock(bvm *vm)
+     be_pushreal(vm, clock() / (breal)CLOCKS_PER_SEC);
+     be_return(vm);
+ }
+
++static int m_sleep_ms(bvm *vm)
++{
++    if (be_top(vm) >= 1 && be_isint(vm, 1)) {
++        bint ms = be_toint(vm, 1);
++        if (ms > 0) {
++            struct timeval tv;
++            tv.tv_sec = ms / 1000;
++            tv.tv_usec = (ms % 1000) * 1000;
++            (void)select(0, NULL, NULL, NULL, &tv);
++        }
++    }
++    be_return_nil(vm);
++}
++
+ #if !BE_USE_PRECOMPILED_OBJECT
+ be_native_module_attr_table(time) {
+     be_native_module_function("time", m_time),
+     be_native_module_function("dump", m_dump),
++    be_native_module_function("sleep_ms", m_sleep_ms),
+     be_native_module_function("clock", m_clock)
+ };
+
+ be_define_native_module(time, NULL);
+ #else
+ /* @const_object_info_begin
+ module time (scope: global, depend: BE_USE_TIME_MODULE) {
+     time, func(m_time)
+     dump, func(m_dump)
++    sleep_ms, func(m_sleep_ms)
+     clock, func(m_clock)
+ }
+ @const_object_info_end */
+ #include "../generate/be_fixed_time.h"
+ #endif
+--
+2.39.5

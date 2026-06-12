@@ -16,7 +16,7 @@ Validated on Adafruit Fruit Jam hardware:
 * Berry `-e`, script execution, and REPL work.
 * BusyBox `vi` is enabled.
 * `/dev/neopixels` works through the RP2350 PIO NeoPixel driver.
-* `/root/neopixels.be` lights the five onboard NeoPixels.
+* `/root/berry/neopixels.be` lights the five onboard NeoPixels.
 * BusyBox httpd/CGI and tftpd work on loopback; telnet, FTP, `nc`, `wget`, and
   status use tiny Fruit Jam helpers to stay below fragile no-MMU allocation
   classes.
@@ -37,11 +37,11 @@ Validated on Adafruit Fruit Jam hardware:
 * GPIO20/GPIO21 are exposed as `/dev/i2c-0` via `i2c-gpio0`; `fruitjam-i2c scan`
   found the TLV320DAC3100 at `0x18`.
 * `/dev/fruitjam-audio` is a misc char device from the `fruitjam-audio-clock`
-  driver. It starts/stops a PIO1 BCLK/WS clock for the TLV320DAC3100 on
-  GPIO26/GPIO27.
+  driver. It starts/stops PIO1-generated TLV320DAC3100 MCLK/BCLK/WS/DIN signals
+  on GPIO24/GPIO25/GPIO26/GPIO27.
 * `fruitjam-rtttl` configures the TLV320 over `/dev/i2c-0` and plays RTTTL
-  through the codec beep generator. This is a verified first audio path, not
-  full ALSA or PCM/I2S data support.
+  through the PIO I2S tone path. Audible output was verified with the Mac
+  microphone helper; exit-status-only tests are not sufficient for regressions.
 * `fruitjamctl bootsel` reboots into the RP2350 ROM BOOTSEL loader, verified
   with `picotool info -a`.
 * `airliftctl` talks to the onboard ESP32-C6 AirLift over RP2350 PL022/spidev
@@ -160,8 +160,8 @@ port = "/dev/cu.usbmodem1101"
 cmds = [
     "echo CDC_OK",
     "berry -e 'print(\"berry ok\")'",
-    "ls -l /usr/bin/berry /bin/vi /dev/neopixels /root/neopixels.be",
-    "berry /root/neopixels.be",
+    "ls -l /usr/bin/berry /bin/vi /dev/neopixels /root/berry/neopixels.be",
+    "berry-run /root/berry/neopixels.be",
     "echo SMOKE_DONE",
 ]
 with serial.Serial(port, 115200, timeout=0.25, write_timeout=1) as s:

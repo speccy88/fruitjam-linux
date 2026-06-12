@@ -21,11 +21,14 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
-#define FTP_ROOT "/tmp/ftp"
+#define FTP_ROOT "/mnt/sd"
 #define FTP_PORT 21
+#define FTP_CONTROL_IDLE_SECONDS 10
 
 static int reply(FILE *ctrl, int code, const char *fmt, ...)
 {
@@ -80,19 +83,96 @@ static int mkdir_p(const char *path)
 	return 0;
 }
 
-static int safe_path(const char *arg, char *out, size_t out_len)
+static int ftp_virtual_path(const char *cwd, const char *arg, char *out,
+			    size_t out_len)
 {
-	const char *p = arg;
+	char combined[160];
+	char tmp[160];
+	char *saveptr = NULL;
+	char *part;
+	size_t used = 1;
 	int ret;
 
-	if (!p || !*p || !strcmp(p, "/"))
-		p = ".";
-	while (*p == '/')
-		p++;
-	if (strstr(p, ".."))
+	if (!arg || !*arg)
+		arg = ".";
+	if (strchr(arg, '\\'))
 		return -1;
-	ret = snprintf(out, out_len, "%s/%s", FTP_ROOT, p);
+	if (arg[0] == '/')
+		ret = snprintf(combined, sizeof(combined), "%s", arg);
+	else if (!strcmp(cwd, "/"))
+		ret = snprintf(combined, sizeof(combined), "/%s", arg);
+	else
+		ret = snprintf(combined, sizeof(combined), "%s/%s", cwd, arg);
+	if (ret < 0 || (size_t)ret >= sizeof(combined))
+		return -1;
+
+	out[0] = '/';
+	out[1] = '\0';
+	strcpy(tmp, combined);
+	for (part = strtok_r(tmp, "/", &saveptr); part;
+	     part = strtok_r(NULL, "/", &saveptr)) {
+		size_t len;
+
+		if (!strcmp(part, ".") || !*part)
+			continue;
+		if (!strcmp(part, "..")) {
+			char *slash;
+
+			if (!strcmp(out, "/"))
+				continue;
+			slash = strrchr(out, '/');
+			if (!slash || slash == out)
+				out[1] = '\0';
+			else
+				*slash = '\0';
+			used = strlen(out);
+			continue;
+		}
+		len = strlen(part);
+		if (used + (used > 1 ? 1 : 0) + len >= out_len)
+			return -1;
+		if (used > 1) {
+			strcat(out, "/");
+			used++;
+		}
+		strcat(out, part);
+		used += len;
+	}
+	return 0;
+}
+
+static int ftp_fs_path(const char *virt, char *out, size_t out_len)
+{
+	int ret;
+
+	if (!virt || virt[0] != '/' || strstr(virt, "..") || strchr(virt, '\\'))
+		return -1;
+	ret = snprintf(out, out_len, "%s%s", FTP_ROOT, virt);
 	return ret > 0 && (size_t)ret < out_len ? 0 : -1;
+}
+
+static int path_from_cwd(const char *cwd, const char *arg, char *virt,
+			 size_t virt_len, char *path, size_t path_len)
+{
+	if (ftp_virtual_path(cwd, arg, virt, virt_len) < 0)
+		return -1;
+	return ftp_fs_path(virt, path, path_len);
+}
+
+static void ftp_format_mdtm(time_t mtime, char *out, size_t out_len)
+{
+	struct tm *tm = gmtime(&mtime);
+
+	if (!tm || !strftime(out, out_len, "%Y%m%d%H%M%S", tm))
+		snprintf(out, out_len, "19700101000000");
+}
+
+static void ftp_format_list_date(time_t mtime, char *out, size_t out_len)
+{
+	struct tm *tm = gmtime(&mtime);
+
+	if (!tm || !strftime(out, out_len, "%b %d %Y", tm))
+		snprintf(out, out_len, "Jan 01 1970");
 }
 
 static int open_listener(uint16_t port)
@@ -171,14 +251,16 @@ static int accept_data(FILE *ctrl, int *pasv_fd)
 	return fd;
 }
 
-static void do_list(FILE *ctrl, int *pasv_fd, const char *arg)
+static void do_list(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 {
 	char path[160];
+	char virt[128];
 	DIR *dir;
 	struct dirent *de;
 	int data;
 
-	if (safe_path(arg, path, sizeof(path)) < 0) {
+	if (path_from_cwd(cwd, *arg ? arg : ".", virt, sizeof(virt),
+			  path, sizeof(path)) < 0) {
 		reply(ctrl, 550, "Bad path");
 		return;
 	}
@@ -193,7 +275,9 @@ static void do_list(FILE *ctrl, int *pasv_fd, const char *arg)
 		while ((de = readdir(dir)) != NULL) {
 			char child[192];
 			struct stat st;
-			const char *type = "-";
+			const char *perms = "-rw-r--r--";
+			char date[16];
+			int have_st;
 			int n;
 
 			if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
@@ -201,10 +285,13 @@ static void do_list(FILE *ctrl, int *pasv_fd, const char *arg)
 			n = snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
 			if (n <= 0 || (size_t)n >= sizeof(child))
 				continue;
-			if (stat(child, &st) == 0 && S_ISDIR(st.st_mode))
-				type = "d";
-			dprintf(data, "%srw-r--r-- 1 root root %ld Jan 01 00:00 %s\r\n",
-				type, stat(child, &st) == 0 ? (long)st.st_size : 0,
+			have_st = stat(child, &st) == 0;
+			if (have_st && S_ISDIR(st.st_mode))
+				perms = "drwxr-xr-x";
+			ftp_format_list_date(have_st ? st.st_mtime : 0, date, sizeof(date));
+			dprintf(data, "%s 1 root root %lu %s %s\r\n",
+				perms, have_st ? (unsigned long)st.st_size : 0,
+				date,
 				de->d_name);
 		}
 		close(data);
@@ -213,15 +300,17 @@ static void do_list(FILE *ctrl, int *pasv_fd, const char *arg)
 	closedir(dir);
 }
 
-static void do_retr(FILE *ctrl, int *pasv_fd, const char *arg)
+static void do_retr(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 {
 	char path[160];
+	char virt[128];
 	char buf[256];
 	int file;
 	int data;
 	ssize_t len;
 
-	if (safe_path(arg, path, sizeof(path)) < 0) {
+	if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+				   path, sizeof(path)) < 0) {
 		reply(ctrl, 550, "Bad path");
 		return;
 	}
@@ -241,15 +330,17 @@ static void do_retr(FILE *ctrl, int *pasv_fd, const char *arg)
 	close(file);
 }
 
-static void do_stor(FILE *ctrl, int *pasv_fd, const char *arg)
+static void do_stor(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 {
 	char path[160];
+	char virt[128];
 	char buf[256];
 	int file;
 	int data;
 	ssize_t len;
 
-	if (safe_path(arg, path, sizeof(path)) < 0) {
+	if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+				   path, sizeof(path)) < 0) {
 		reply(ctrl, 550, "Bad path");
 		return;
 	}
@@ -269,12 +360,85 @@ static void do_stor(FILE *ctrl, int *pasv_fd, const char *arg)
 	close(file);
 }
 
+static void do_size(FILE *ctrl, const char *cwd, const char *arg)
+{
+	char path[160];
+	char virt[128];
+	struct stat st;
+
+	if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+				   path, sizeof(path)) < 0) {
+		reply(ctrl, 501, "Bad filename");
+		return;
+	}
+	if (stat(path, &st) < 0 || !S_ISREG(st.st_mode)) {
+		reply(ctrl, 550, "Not found");
+		return;
+	}
+	reply(ctrl, 213, "%lu", (unsigned long)st.st_size);
+}
+
+static void do_mdtm(FILE *ctrl, const char *cwd, const char *arg)
+{
+	char path[160];
+	char virt[128];
+	char stamp[24];
+	struct stat st;
+
+	if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+				   path, sizeof(path)) < 0) {
+		reply(ctrl, 501, "Bad filename");
+		return;
+	}
+	if (stat(path, &st) < 0) {
+		reply(ctrl, 550, "Not found");
+		return;
+	}
+	ftp_format_mdtm(st.st_mtime, stamp, sizeof(stamp));
+	reply(ctrl, 213, "%s", stamp);
+}
+
+static void do_dele(FILE *ctrl, const char *cwd, const char *arg)
+{
+	char path[160];
+	char virt[128];
+
+	if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+				   path, sizeof(path)) < 0) {
+		reply(ctrl, 501, "Bad filename");
+		return;
+	}
+	if (unlink(path) < 0)
+		reply(ctrl, 550, "Delete failed");
+	else
+		reply(ctrl, 250, "Deleted");
+}
+
+static void do_mkd(FILE *ctrl, const char *cwd, const char *arg)
+{
+	char path[160];
+	char virt[128];
+
+	if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+				   path, sizeof(path)) < 0) {
+		reply(ctrl, 501, "Bad directory");
+		return;
+	}
+	if (mkdir(path, 0755) < 0 && errno != EEXIST)
+		reply(ctrl, 550, "Create directory failed");
+	else
+		reply(ctrl, 257, "\"%s\" created", virt);
+}
+
 static void serve_client(int fd)
 {
+	struct timeval timeout = { FTP_CONTROL_IDLE_SECONDS, 0 };
 	FILE *ctrl = fdopen(fd, "r+");
 	char line[160];
+	char cwd[128] = "/";
 	int pasv_fd = -1;
 
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 	if (!ctrl) {
 		close(fd);
 		return;
@@ -294,23 +458,57 @@ static void serve_client(int fd)
 		} else if (!strcasecmp(line, "SYST")) {
 			reply(ctrl, 215, "UNIX Type: L8");
 		} else if (!strcasecmp(line, "FEAT")) {
-			fprintf(ctrl, "211-Features\r\n PASV\r\n211 End\r\n");
+			fprintf(ctrl,
+				"211-Features\r\n"
+				" PASV\r\n"
+				" SIZE\r\n"
+				" MDTM\r\n"
+				" UTF8\r\n"
+				"211 End\r\n");
 		} else if (!strcasecmp(line, "PWD") || !strcasecmp(line, "XPWD")) {
-			reply(ctrl, 257, "\"/\"");
-		} else if (!strcasecmp(line, "CWD") || !strcasecmp(line, "CDUP")) {
-			reply(ctrl, 250, "Directory changed");
+			reply(ctrl, 257, "\"%s\"", cwd);
+		} else if (!strcasecmp(line, "CWD") || !strcasecmp(line, "XCWD") ||
+			   !strcasecmp(line, "CDUP")) {
+			const char *dest = !strcasecmp(line, "CDUP") ? ".." :
+					   (*arg ? arg : "/");
+			char path[160];
+			char virt[128];
+			struct stat st;
+
+			if (path_from_cwd(cwd, dest, virt, sizeof(virt),
+					  path, sizeof(path)) < 0) {
+				reply(ctrl, 550, "Bad directory");
+			} else if (stat(path, &st) < 0 || !S_ISDIR(st.st_mode)) {
+				reply(ctrl, 550, "Not a directory");
+			} else {
+				strcpy(cwd, virt);
+				reply(ctrl, 250, "Directory changed");
+			}
 		} else if (!strcasecmp(line, "TYPE")) {
 			reply(ctrl, 200, "Type set");
 		} else if (!strcasecmp(line, "NOOP")) {
 			reply(ctrl, 200, "OK");
+		} else if (!strcasecmp(line, "OPTS")) {
+			if (!strncasecmp(arg, "UTF8", 4))
+				reply(ctrl, 200, "UTF8 mode enabled");
+			else
+				reply(ctrl, 502, "Option not implemented");
 		} else if (!strcasecmp(line, "PASV")) {
 			start_passive(ctrl, fd, &pasv_fd);
 		} else if (!strcasecmp(line, "LIST") || !strcasecmp(line, "NLST")) {
-			do_list(ctrl, &pasv_fd, arg);
+			do_list(ctrl, &pasv_fd, cwd, arg);
 		} else if (!strcasecmp(line, "RETR")) {
-			do_retr(ctrl, &pasv_fd, arg);
+			do_retr(ctrl, &pasv_fd, cwd, arg);
 		} else if (!strcasecmp(line, "STOR")) {
-			do_stor(ctrl, &pasv_fd, arg);
+			do_stor(ctrl, &pasv_fd, cwd, arg);
+		} else if (!strcasecmp(line, "SIZE")) {
+			do_size(ctrl, cwd, arg);
+		} else if (!strcasecmp(line, "MDTM")) {
+			do_mdtm(ctrl, cwd, arg);
+		} else if (!strcasecmp(line, "DELE")) {
+			do_dele(ctrl, cwd, arg);
+		} else if (!strcasecmp(line, "MKD") || !strcasecmp(line, "XMKD")) {
+			do_mkd(ctrl, cwd, arg);
 		} else if (!strcasecmp(line, "QUIT")) {
 			reply(ctrl, 221, "Bye");
 			break;
@@ -321,6 +519,8 @@ static void serve_client(int fd)
 
 	if (pasv_fd >= 0)
 		close(pasv_fd);
+	if (ferror(ctrl))
+		reply(ctrl, 421, "Control connection idle timeout");
 	fclose(ctrl);
 }
 

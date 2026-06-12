@@ -12,6 +12,7 @@ FRUITJAM_AIRLIFT_LICENSE = MIT
 define FRUITJAM_AIRLIFT_BUILD_CMDS
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
 		-std=c99 -Wall -Wextra -Os -o $(@D)/airliftctl $(@D)/airliftctl.c
+	$(TARGET_CROSS)flthdr -s 4096 $(@D)/airliftctl
 endef
 
 define FRUITJAM_AIRLIFT_INSTALL_TARGET_CMDS

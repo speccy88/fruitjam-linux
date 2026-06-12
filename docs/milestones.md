@@ -34,7 +34,7 @@ Included:
 * Berry `-e`, script execution, and REPL.
 * BusyBox `vi`.
 * PIO-backed `/dev/neopixels` driver for the five onboard GPIO32 NeoPixels.
-* `/root/neopixels.be` Berry smoke-test script.
+* `/root/berry/neopixels.be` Berry smoke-test script.
 
 Acceptance test:
 
@@ -43,7 +43,7 @@ Acceptance test:
 3. Run `berry -e 'print("berry ok")'`.
 4. Enter the Berry REPL and evaluate `1+2`.
 5. Confirm `/bin/vi` exists and points to BusyBox.
-6. Run `berry /root/neopixels.be` and visually confirm the five-pixel pattern.
+6. Run `berry-run /root/berry/neopixels.be` and visually confirm the five-pixel pattern.
 7. Run `fruitjamctl bootsel` and confirm `picotool info -a` reports
    `boot type: bootsel`.
 
@@ -194,9 +194,10 @@ without a full ALSA/PCM driver.
 Included:
 
 * `fruitjam-audio-clock` misc driver exposed as `/dev/fruitjam-audio`.
-* PIO1 state machine 1 generates BCLK on GPIO26 and WS on GPIO27.
+* PIO1 generates MCLK on GPIO25 and an 8 kHz stereo I2S stream on
+  GPIO24/GPIO26/GPIO27, using 16-bit samples in 32-bit slots.
 * `fruitjam-rtttl` starts the audio clock, configures the TLV320DAC3100 over
-  `/dev/i2c-0`, and plays RTTTL notes through the codec beep generator.
+  `/dev/i2c-0`, and asks the kernel helper to play RTTTL notes as sine tones.
 * The driver maps shared RP2350 register windows with `devm_ioremap()` instead
   of exclusive `devm_platform_ioremap_resource_byname()`, because IO_BANK0 and
   pad registers are shared with the GPIO, NeoPixel, and AirLift helpers.
@@ -209,12 +210,21 @@ Acceptance test:
 4. Run `fruitjam-i2c ping 0x18` and confirm the TLV320DAC3100 responds.
 5. Run `echo start > /dev/fruitjam-audio` and `echo stop > /dev/fruitjam-audio`;
    both should return exit status 0.
-6. Run `/usr/bin/fruitjam-rtttl` and confirm it reports the default tune played.
-7. Re-run `wget -O - http://127.0.0.1/cgi-bin/env.cgi` and
+6. Run `/usr/bin/fruitjam-rtttl --tone 880 1200` as a single-tone calibration,
+   then run `/usr/bin/fruitjam-rtttl scale` while recording with the Mac microphone:
+   `scripts/fruitjam-audio-mic-test.py --serial-port <port> --rtttl scale`.
+   Confirm the verifier reports matched note frequencies and `PASS`.
+7. Generate and copy a sample WAV, then run `fruitjam-wavplay` while recording
+   with the same microphone verifier. Keep SD-card filesystem failures separate
+   from audio failures; a bad FAT read should not be counted as a codec
+   regression.
+8. Re-run `wget -O - http://127.0.0.1/cgi-bin/env.cgi` and
    `fruitjam-services status`.
 
-Status: achieved on Fruit Jam hardware. The verified first path is PIO clock plus
-TLV320 beep-generator RTTTL playback, not full ALSA or PCM/I2S audio.
+Status: achieved for the first RTTTL audio path on Fruit Jam hardware. The
+current verified path is TLV320 control plus PIO I2S generated tones, confirmed
+with the Mac microphone helper. Full streamed PCM/I2S playback is still future
+work.
 
 ## Milestone E: HSTX DVI text console
 
@@ -236,7 +246,9 @@ The onboard ESP32-C6 AirLift runs NINA firmware and communicates with the RP2350
 over RP2350 PL022/spidev hardware SPI. The first Linux milestone is a small
 userspace probe that can reset the C6, read the NINA firmware version, scan APs,
 join a network, report DHCP addressing, open a basic TCP connection, and publish
-a QoS 0 MQTT message through the coprocessor.
+a QoS 0 MQTT message through the coprocessor. The current helper also serves a
+small inbound HTTP/telnet/FTP surface directly through AirLift sockets when WiFi
+is configured on the SD card.
 
 Acceptance test:
 
@@ -248,16 +260,20 @@ Acceptance test:
 6. Run `airliftctl tcp-get example.com /` and confirm an HTTP 200 response.
 7. Run `airliftctl mqtt-pub <broker-host> 1883 fruitjam/test hello` and confirm
    an MQTT broker receives the message.
+8. With `/mnt/sd/fruitjam/wifi.conf` present, boot the image and confirm
+   `airliftctl serve-inbound` exposes `http://<board-ip>/`, telnet on TCP/23,
+   and passive FTP on TCP/21 plus a passive data port.
 
 Status: userspace NINA socket milestone achieved on Fruit Jam hardware with the
-installed NINA firmware reporting `3.1.0`. `airliftctl mqtt-pub` was verified
-against a local MQTT broker after joining WiFi.
+installed NINA firmware reporting `3.3.0`. `airliftctl mqtt-pub` was verified
+against a local MQTT broker after joining WiFi, and inbound HTTP/telnet/passive
+FTP were verified from another host.
 
 The NINA protocol uses big-endian 16-bit SPI framing for buffer lengths and port
 parameters. Do not change this to little-endian; doing so makes TCP connect/send
 fail even though firmware/status/IP commands still work.
 
 A normal Linux `wlan0`/socket integration would require either a kernel netdev
-driver or a userspace bridge and is a larger follow-on task. Updating the
-ESP32-C6 to the Adafruit NINA `3.3.0` Fruit Jam firmware remains separate from
-the Linux image work.
+driver or a fuller userspace bridge and is a larger follow-on task. Updating the
+ESP32-C6 firmware remains separate from the Linux image work; the tested board
+already had the Adafruit Fruit Jam NINA `3.3.0` firmware.

@@ -4,20 +4,21 @@ Date: Wed, 10 Jun 2026 18:55:00 -0400
 Subject: [PATCH] misc: add Fruit Jam RP2350 audio clock driver
 
 Add a tiny board bring-up misc driver that programs RP2350 PIO1 to generate
-BCLK and WS for the Fruit Jam TLV320DAC3100.  Userspace controls it through
+MCLK and a tiny I2S tone stream for the Fruit Jam TLV320DAC3100.  Userspace controls it through
 /dev/fruitjam-audio with simple text commands:
 
   start
+  tone HZ MS
   stop
 
-This is not a full ALSA/I2S driver.  It is a small hardware-clock bridge for
+This is not a full ALSA/I2S driver.  It is a small hardware bridge for
 early TLV320 speaker tests while keeping userspace away from /dev/mem PIO,
 reset, and pad registers that fault on this no-MMU target.
 ---
  drivers/misc/Kconfig                |  10 ++
  drivers/misc/Makefile               |   1 +
- drivers/misc/fruitjam_audio_clock.c | 267 ++++++++++++++++++++++++++++
- 3 files changed, 278 insertions(+)
+ drivers/misc/fruitjam_audio_clock.c | 693 ++++++++++++++++++++++++++++
+ 3 files changed, 704 insertions(+)
  create mode 100644 drivers/misc/fruitjam_audio_clock.c
 
 diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
@@ -33,7 +34,7 @@ index 0f58d5b5b8a1..bc7f3e7468ef 100644
 +	depends on OF && HAS_IOMEM
 +	help
 +	  Say Y here to expose /dev/fruitjam-audio, a tiny bring-up
-+	  interface that starts and stops an RP2350 PIO-generated BCLK/WS
++	  interface that starts and stops RP2350 PIO-driven DIN/MCLK/BCLK/WS
 +	  clock for the Fruit Jam TLV320DAC3100.
 +
 +	  If unsure, say N.
@@ -58,18 +59,18 @@ new file mode 100644
 index 000000000000..71e9b3d9f014
 --- /dev/null
 +++ b/drivers/misc/fruitjam_audio_clock.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,693 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Minimal Adafruit Fruit Jam RP2350 PIO audio clock helper.
 + *
-+ * This exposes /dev/fruitjam-audio with "start" and "stop" text commands.
-+ * PIO1 state machine 1 generates BCLK on GPIO26 and WS on GPIO27.  The first
-+ * userspace audio milestone uses this clock as the TLV320DAC3100 PLL input and
-+ * plays RTTTL through the codec beep generator.
++ * This exposes /dev/fruitjam-audio with "start", "tone HZ MS", and "stop"
++ * text commands. PIO1 state machines drive MCLK on GPIO25 and a minimal
++ * 16-bit stereo I2S stream on GPIO24/26/27.
 + */
 +
 +#include <linux/bitops.h>
++#include <linux/delay.h>
 +#include <linux/device.h>
 +#include <linux/err.h>
 +#include <linux/fs.h>
@@ -84,13 +85,19 @@ index 000000000000..71e9b3d9f014
 +#include <linux/string.h>
 +#include <linux/uaccess.h>
 +
-+#define FJ_AUDIO_SAMPLE_RATE		16000u
-+#define FJ_AUDIO_BITS_PER_FRAME		32u
-+#define FJ_AUDIO_PIO_CYCLES_PER_BIT	3u
-+#define FJ_AUDIO_PROGRAM_OFFSET		8u
++#define FJ_AUDIO_SAMPLE_RATE		8000u
++#define FJ_AUDIO_I2S_CYCLES_PER_FRAME	130u
++#define FJ_AUDIO_MCLK_HZ		15000000u
++#define FJ_AUDIO_TONE_MAX_MS		15000u
++#define FJ_AUDIO_TONE_AMPLITUDE		16000
++#define FJ_AUDIO_TAIL_FRAMES		64u
++#define FJ_AUDIO_MCLK_PROGRAM_OFFSET	0u
++#define FJ_AUDIO_STREAM_PROGRAM_OFFSET	8u
 +
 +#define RP2350_PIO_CTRL			0x000
++#define RP2350_PIO_FSTAT		0x004
 +#define RP2350_PIO_FDEBUG		0x008
++#define RP2350_PIO_TXF(sm)		(0x010 + ((sm) * 4))
 +#define RP2350_PIO_INSTR_MEM		0x048
 +#define RP2350_PIO_SM_BASE(sm)		(0x0c8 + ((sm) * 0x18))
 +#define RP2350_PIO_SM_CLKDIV		0x00
@@ -112,6 +119,8 @@ index 000000000000..71e9b3d9f014
 +#define PIO_CTRL_SM_ENABLE(sm)		BIT(sm)
 +#define PIO_CTRL_SM_RESTART(sm)		BIT(4 + (sm))
 +#define PIO_CTRL_CLKDIV_RESTART(sm)	BIT(8 + (sm))
++#define PIO_FSTAT_TXFULL(sm)		BIT(16 + (sm))
++#define PIO_FSTAT_TXEMPTY(sm)		BIT(24 + (sm))
 +#define PIO_FDEBUG_TXSTALL(sm)		BIT(24 + (sm))
 +#define PIO_FDEBUG_TXOVER(sm)		BIT(16 + (sm))
 +#define PIO_FDEBUG_RXUNDER(sm)		BIT(8 + (sm))
@@ -119,18 +128,51 @@ index 000000000000..71e9b3d9f014
 +
 +#define PIO_EXECCTRL_WRAP_TOP(v)	(((v) & 0x1f) << 12)
 +#define PIO_EXECCTRL_WRAP_BOTTOM(v)	(((v) & 0x1f) << 7)
++#define PIO_SHIFTCTRL_FJOIN_TX		BIT(30)
++#define PIO_SHIFTCTRL_FJOIN_RX		BIT(31)
++#define PIO_SHIFTCTRL_PULL_THRESH(v)	(((v) & 0x1f) << 25)
 +#define PIO_PINCTRL_SET_COUNT(v)	(((v) & 0x7) << 26)
++#define PIO_PINCTRL_OUT_COUNT(v)	(((v) & 0x3f) << 20)
 +#define PIO_PINCTRL_SET_BASE(v)		(((v) & 0x1f) << 5)
++#define PIO_PINCTRL_OUT_BASE(v)		((v) & 0x1f)
++#define PIO_JMP_X_DEC(addr)		(0x0040 | ((addr) & 0x1f))
 +
-+static const u16 fj_audio_clock_program[] = {
-+	0xe02f, /* set x, 15 */
++static const u16 fj_audio_mclk_program[] = {
 +	0xe000, /* set pins, 0 */
 +	0xe001, /* set pins, 1 */
-+	0x0041, /* jmp x--, 1 */
-+	0xe02f, /* set x, 15 */
-+	0xe002, /* set pins, 2 */
-+	0xe003, /* set pins, 3 */
-+	0x0045, /* jmp x--, 5 */
++};
++
++static const u16 fj_audio_i2s_program[] = {
++	0x80a0, /* pull block */
++	0xe02e, /* set x, 14: left channel first 15 bits */
++	0x6001, /* out pins, 1 */
++	0xe000, /* set pins, 0: BCLK low, WS left */
++	0xe001, /* set pins, 1: BCLK high, WS left */
++	PIO_JMP_X_DEC(FJ_AUDIO_STREAM_PROGRAM_OFFSET + 2),
++	0x6001, /* out pins, 1: left LSB, WS moves early for right */
++	0xe002, /* set pins, 2: BCLK low, WS right */
++	0xe003, /* set pins, 3: BCLK high, WS right */
++	0x80a0, /* pull block */
++	0xe02e, /* set x, 14: right channel first 15 bits */
++	0x6001, /* out pins, 1 */
++	0xe002, /* set pins, 2: BCLK low, WS right */
++	0xe003, /* set pins, 3: BCLK high, WS right */
++	PIO_JMP_X_DEC(FJ_AUDIO_STREAM_PROGRAM_OFFSET + 11),
++	0x6001, /* out pins, 1: right LSB, WS moves early for left */
++	0xe000, /* set pins, 0: BCLK low, WS left */
++	0xe001, /* set pins, 1: BCLK high, WS left */
++};
++
++static const s16 fj_audio_sine_q15[] = {
++	    0,   804,  1608,  2410,  3212,  4011,  4808,  5602,
++	 6393,  7179,  7962,  8739,  9512, 10278, 11039, 11793,
++	12539, 13279, 14010, 14732, 15446, 16151, 16846, 17530,
++	18204, 18868, 19519, 20159, 20787, 21403, 22005, 22594,
++	23170, 23731, 24279, 24811, 25329, 25832, 26319, 26790,
++	27245, 27683, 28105, 28510, 28898, 29268, 29621, 29956,
++	30273, 30571, 30852, 31113, 31356, 31580, 31785, 31971,
++	32137, 32285, 32412, 32521, 32609, 32678, 32728, 32757,
++	32767,
 +};
 +
 +struct fj_audio {
@@ -143,10 +185,20 @@ index 000000000000..71e9b3d9f014
 +	void __iomem *pads_bank0;
 +	u32 pio_index;
 +	u32 sm;
++	u32 mclk_sm;
++	u32 din_gpio;
++	u32 mclk_gpio;
 +	u32 bclk_gpio;
 +	u32 ws_gpio;
 +	u32 gpio_base;
 +	u32 clk_sys_hz;
++	u32 mclk_hz;
++	u32 tone_count;
++	u32 last_hz;
++	u32 last_ms;
++	u32 last_fstat;
++	u32 last_fdebug;
++	int last_ret;
 +	bool running;
 +};
 +
@@ -162,10 +214,9 @@ index 000000000000..71e9b3d9f014
 +	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
 +}
 +
-+static u32 fj_audio_clkdiv(struct fj_audio *fj)
++static u32 fj_audio_frame_clkdiv(struct fj_audio *fj, u32 cycles_per_frame)
 +{
-+	u64 bit_hz = FJ_AUDIO_SAMPLE_RATE * FJ_AUDIO_BITS_PER_FRAME;
-+	u64 denom = bit_hz * FJ_AUDIO_PIO_CYCLES_PER_BIT;
++	u64 denom = (u64)FJ_AUDIO_SAMPLE_RATE * cycles_per_frame;
 +	u64 scaled = div64_u64((u64)fj->clk_sys_hz * 256 + denom / 2, denom);
 +	u32 div_int = scaled >> 8;
 +	u32 div_frac = scaled & 0xff;
@@ -178,12 +229,54 @@ index 000000000000..71e9b3d9f014
 +	return (div_int << 16) | (div_frac << 8);
 +}
 +
-+static void fj_audio_sm_disable(struct fj_audio *fj)
++static u32 fj_audio_i2s_clkdiv(struct fj_audio *fj)
++{
++	return fj_audio_frame_clkdiv(fj, FJ_AUDIO_I2S_CYCLES_PER_FRAME);
++}
++
++static u32 fj_audio_mclk_clkdiv(struct fj_audio *fj)
++{
++	u64 denom = (u64)fj->mclk_hz * 2u;
++	u64 scaled = div64_u64((u64)fj->clk_sys_hz * 256 + denom / 2, denom);
++	u32 div_int = scaled >> 8;
++	u32 div_frac = scaled & 0xff;
++
++	if (!div_int)
++		div_int = 1;
++	if (div_int > 0xffff)
++		div_int = 0xffff;
++
++	return (div_int << 16) | (div_frac << 8);
++}
++
++static void fj_audio_sm_disable_one(struct fj_audio *fj, u32 sm)
 +{
 +	u32 ctrl = readl(fj->pio + RP2350_PIO_CTRL);
 +
-+	ctrl &= ~PIO_CTRL_SM_ENABLE(fj->sm);
++	ctrl &= ~PIO_CTRL_SM_ENABLE(sm);
 +	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
++}
++
++static void fj_audio_sm_enable_one(struct fj_audio *fj, u32 sm)
++{
++	u32 ctrl = readl(fj->pio + RP2350_PIO_CTRL);
++
++	ctrl |= PIO_CTRL_SM_ENABLE(sm);
++	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
++}
++
++static void fj_audio_sm_restart_one(struct fj_audio *fj, u32 sm)
++{
++	u32 ctrl = readl(fj->pio + RP2350_PIO_CTRL);
++
++	ctrl |= PIO_CTRL_SM_RESTART(sm) | PIO_CTRL_CLKDIV_RESTART(sm);
++	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
++}
++
++static void fj_audio_stop(struct fj_audio *fj)
++{
++	fj_audio_sm_disable_one(fj, fj->sm);
++	fj_audio_sm_disable_one(fj, fj->mclk_sm);
 +	fj->running = false;
 +}
 +
@@ -209,54 +302,285 @@ index 000000000000..71e9b3d9f014
 +{
 +	u32 func = RP2350_GPIO_FUNC_PIO0 + fj->pio_index;
 +
++	writel(RP2350_PADS_DRIVE_4MA, fj->pads_bank0 + RP2350_PADS_GPIO(fj->din_gpio));
++	writel(RP2350_PADS_DRIVE_4MA, fj->pads_bank0 + RP2350_PADS_GPIO(fj->mclk_gpio));
 +	writel(RP2350_PADS_DRIVE_4MA, fj->pads_bank0 + RP2350_PADS_GPIO(fj->bclk_gpio));
 +	writel(RP2350_PADS_DRIVE_4MA, fj->pads_bank0 + RP2350_PADS_GPIO(fj->ws_gpio));
++	writel(func, fj->io_bank0 + RP2350_IO_GPIO_CTRL(fj->din_gpio));
++	writel(func, fj->io_bank0 + RP2350_IO_GPIO_CTRL(fj->mclk_gpio));
 +	writel(func, fj->io_bank0 + RP2350_IO_GPIO_CTRL(fj->bclk_gpio));
 +	writel(func, fj->io_bank0 + RP2350_IO_GPIO_CTRL(fj->ws_gpio));
 +}
 +
-+static int fj_audio_start(struct fj_audio *fj)
++static void fj_audio_load_stream_program(struct fj_audio *fj, const u16 *program,
++					 size_t words)
++{
++	int i;
++
++	for (i = 0; i < words; i++)
++		writel(program[i],
++		       fj->pio + RP2350_PIO_INSTR_MEM +
++		       (FJ_AUDIO_STREAM_PROGRAM_OFFSET + i) * 4);
++}
++
++static void fj_audio_clear_stream_fifos(struct fj_audio *fj)
 +{
 +	void __iomem *sm = fj->pio + RP2350_PIO_SM_BASE(fj->sm);
++
++	writel(PIO_SHIFTCTRL_FJOIN_RX, sm + RP2350_PIO_SM_SHIFTCTRL);
++	writel(0, sm + RP2350_PIO_SM_SHIFTCTRL);
++}
++
++static void fj_audio_force_set(struct fj_audio *fj, u32 sm_id, u32 local_base,
++			       u32 count, u32 value, bool pindirs)
++{
++	void __iomem *sm = fj->pio + RP2350_PIO_SM_BASE(sm_id);
++	u16 instr = (pindirs ? 0xe080 : 0xe000) | (value & 0x1f);
++
++	writel(PIO_PINCTRL_SET_COUNT(count) | PIO_PINCTRL_SET_BASE(local_base),
++	       sm + RP2350_PIO_SM_PINCTRL);
++	writel(instr, sm + RP2350_PIO_SM_INSTR);
++}
++
++static void fj_audio_prepare_output_pins(struct fj_audio *fj)
++{
++	u32 local_din = fj->din_gpio - fj->gpio_base;
++	u32 local_mclk = fj->mclk_gpio - fj->gpio_base;
 +	u32 local_bclk = fj->bclk_gpio - fj->gpio_base;
++
++	fj_audio_force_set(fj, fj->mclk_sm, local_mclk, 1, 1, true);
++	fj_audio_force_set(fj, fj->mclk_sm, local_mclk, 1, 0, false);
++	fj_audio_force_set(fj, fj->sm, local_din, 1, 1, true);
++	fj_audio_force_set(fj, fj->sm, local_din, 1, 0, false);
++	fj_audio_force_set(fj, fj->sm, local_bclk, 2, 3, true);
++	fj_audio_force_set(fj, fj->sm, local_bclk, 2, 0, false);
++}
++
++static int fj_audio_validate(struct fj_audio *fj)
++{
++	if (fj->din_gpio < fj->gpio_base || fj->mclk_gpio < fj->gpio_base ||
++	    fj->bclk_gpio < fj->gpio_base ||
++	    fj->mclk_gpio != fj->din_gpio + 1 ||
++	    fj->ws_gpio != fj->bclk_gpio + 1 || fj->sm == fj->mclk_sm ||
++	    fj->sm > 3 || fj->mclk_sm > 3)
++		return -EINVAL;
++	return 0;
++}
++
++static int fj_audio_start(struct fj_audio *fj)
++{
++	void __iomem *mclk_sm = fj->pio + RP2350_PIO_SM_BASE(fj->mclk_sm);
++	u32 local_mclk = fj->mclk_gpio - fj->gpio_base;
 +	u32 ctrl;
 +	int i;
 +
-+	if (fj->bclk_gpio < fj->gpio_base || fj->ws_gpio != fj->bclk_gpio + 1)
++	if (fj_audio_validate(fj))
 +		return -EINVAL;
 +
 +	fj_audio_reset_pio(fj);
 +	fj_audio_configure_gpio(fj);
-+	fj_audio_sm_disable(fj);
++	fj_audio_stop(fj);
 +
-+	for (i = 0; i < ARRAY_SIZE(fj_audio_clock_program); i++)
-+		writel(fj_audio_clock_program[i],
++	for (i = 0; i < ARRAY_SIZE(fj_audio_mclk_program); i++)
++		writel(fj_audio_mclk_program[i],
 +		       fj->pio + RP2350_PIO_INSTR_MEM +
-+		       (FJ_AUDIO_PROGRAM_OFFSET + i) * 4);
-+
++		       (FJ_AUDIO_MCLK_PROGRAM_OFFSET + i) * 4);
 +	writel(fj->gpio_base, fj->pio + RP2350_PIO_GPIOBASE);
-+	writel(fj_audio_clkdiv(fj), sm + RP2350_PIO_SM_CLKDIV);
-+	writel(PIO_EXECCTRL_WRAP_TOP(FJ_AUDIO_PROGRAM_OFFSET + 7) |
-+	       PIO_EXECCTRL_WRAP_BOTTOM(FJ_AUDIO_PROGRAM_OFFSET),
-+	       sm + RP2350_PIO_SM_EXECCTRL);
-+	writel(0, sm + RP2350_PIO_SM_SHIFTCTRL);
-+	writel(PIO_PINCTRL_SET_COUNT(2) | PIO_PINCTRL_SET_BASE(local_bclk),
-+	       sm + RP2350_PIO_SM_PINCTRL);
++	writel(fj_audio_mclk_clkdiv(fj), mclk_sm + RP2350_PIO_SM_CLKDIV);
++	writel(PIO_EXECCTRL_WRAP_TOP(FJ_AUDIO_MCLK_PROGRAM_OFFSET + 1) |
++	       PIO_EXECCTRL_WRAP_BOTTOM(FJ_AUDIO_MCLK_PROGRAM_OFFSET),
++	       mclk_sm + RP2350_PIO_SM_EXECCTRL);
++	writel(0, mclk_sm + RP2350_PIO_SM_SHIFTCTRL);
++	writel(PIO_PINCTRL_SET_COUNT(1) | PIO_PINCTRL_SET_BASE(local_mclk),
++	       mclk_sm + RP2350_PIO_SM_PINCTRL);
 +
-+	writel(0xe083, sm + RP2350_PIO_SM_INSTR); /* set pindirs, 3 */
-+	writel(0xe000, sm + RP2350_PIO_SM_INSTR); /* set pins, 0 */
-+	writel(FJ_AUDIO_PROGRAM_OFFSET, sm + RP2350_PIO_SM_INSTR); /* jmp offset */
-+	writel(PIO_FDEBUG_TXSTALL(fj->sm) | PIO_FDEBUG_TXOVER(fj->sm) |
-+	       PIO_FDEBUG_RXUNDER(fj->sm) | PIO_FDEBUG_RXSTALL(fj->sm),
++	fj_audio_prepare_output_pins(fj);
++	writel(PIO_PINCTRL_SET_COUNT(1) | PIO_PINCTRL_SET_BASE(local_mclk),
++	       mclk_sm + RP2350_PIO_SM_PINCTRL);
++	writel(FJ_AUDIO_MCLK_PROGRAM_OFFSET, mclk_sm + RP2350_PIO_SM_INSTR);
++	writel(PIO_FDEBUG_TXSTALL(fj->mclk_sm) | PIO_FDEBUG_TXOVER(fj->mclk_sm) |
++	       PIO_FDEBUG_RXUNDER(fj->mclk_sm) | PIO_FDEBUG_RXSTALL(fj->mclk_sm),
 +	       fj->pio + RP2350_PIO_FDEBUG);
 +
 +	ctrl = readl(fj->pio + RP2350_PIO_CTRL);
-+	ctrl |= PIO_CTRL_SM_RESTART(fj->sm) | PIO_CTRL_CLKDIV_RESTART(fj->sm);
++	ctrl |= PIO_CTRL_SM_RESTART(fj->mclk_sm) |
++		PIO_CTRL_CLKDIV_RESTART(fj->mclk_sm);
 +	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
-+	ctrl |= PIO_CTRL_SM_ENABLE(fj->sm);
++	ctrl |= PIO_CTRL_SM_ENABLE(fj->mclk_sm);
 +	writel(ctrl, fj->pio + RP2350_PIO_CTRL);
 +	fj->running = true;
 +	return 0;
++}
++
++static u32 fj_audio_i2s_word(s16 sample)
++{
++	u32 bits = (u16)sample;
++	return bits << 16;
++}
++
++static s16 fj_audio_sine_sample(u32 phase, s32 amp)
++{
++	u32 p = phase >> 16;
++	u32 quadrant = p >> 14;
++	u32 idx = (p & 0x3fff) >> 8;
++	s32 v;
++
++	if (quadrant & 1)
++		idx = 64 - idx;
++	v = fj_audio_sine_q15[idx];
++	if (quadrant >= 2)
++		v = -v;
++	return (s16)((v * amp) / 32767);
++}
++
++static int fj_audio_wait_tx_space(struct fj_audio *fj)
++{
++	int i;
++
++	for (i = 0; i < 200000; i++) {
++		if (!(readl(fj->pio + RP2350_PIO_FSTAT) &
++		      PIO_FSTAT_TXFULL(fj->sm)))
++			return 0;
++		cpu_relax();
++	}
++	return -ETIMEDOUT;
++}
++
++static int fj_audio_wait_tx_empty(struct fj_audio *fj)
++{
++	int i;
++
++	for (i = 0; i < 200000; i++) {
++		if (readl(fj->pio + RP2350_PIO_FSTAT) &
++		    PIO_FSTAT_TXEMPTY(fj->sm))
++			return 0;
++		cpu_relax();
++	}
++	return -ETIMEDOUT;
++}
++
++static int fj_audio_write_frame(struct fj_audio *fj, u32 frame)
++{
++	int ret = fj_audio_wait_tx_space(fj);
++
++	if (ret)
++		return ret;
++	writel(frame, fj->pio + RP2350_PIO_TXF(fj->sm));
++	return 0;
++}
++
++static void fj_audio_record_tone_result(struct fj_audio *fj,
++					unsigned int hz,
++					unsigned int ms,
++					int ret)
++{
++	fj->tone_count++;
++	fj->last_hz = hz;
++	fj->last_ms = ms;
++	fj->last_ret = ret;
++	fj->last_fstat = readl(fj->pio + RP2350_PIO_FSTAT);
++	fj->last_fdebug = readl(fj->pio + RP2350_PIO_FDEBUG);
++}
++
++static int fj_audio_configure_i2s_stream(struct fj_audio *fj)
++{
++	void __iomem *sm = fj->pio + RP2350_PIO_SM_BASE(fj->sm);
++	u32 local_din = fj->din_gpio - fj->gpio_base;
++	u32 local_bclk = fj->bclk_gpio - fj->gpio_base;
++
++	if (!fj->running) {
++		int ret = fj_audio_start(fj);
++
++		if (ret)
++			return ret;
++	}
++
++	fj_audio_sm_disable_one(fj, fj->sm);
++	fj_audio_load_stream_program(fj, fj_audio_i2s_program,
++				     ARRAY_SIZE(fj_audio_i2s_program));
++	fj_audio_clear_stream_fifos(fj);
++	fj_audio_prepare_output_pins(fj);
++
++	writel(fj_audio_i2s_clkdiv(fj), sm + RP2350_PIO_SM_CLKDIV);
++	writel(PIO_EXECCTRL_WRAP_TOP(FJ_AUDIO_STREAM_PROGRAM_OFFSET + 17) |
++	       PIO_EXECCTRL_WRAP_BOTTOM(FJ_AUDIO_STREAM_PROGRAM_OFFSET),
++	       sm + RP2350_PIO_SM_EXECCTRL);
++	writel(PIO_SHIFTCTRL_FJOIN_TX | PIO_SHIFTCTRL_PULL_THRESH(32),
++	       sm + RP2350_PIO_SM_SHIFTCTRL);
++	writel(PIO_PINCTRL_SET_COUNT(2) | PIO_PINCTRL_OUT_COUNT(1) |
++	       PIO_PINCTRL_SET_BASE(local_bclk) | PIO_PINCTRL_OUT_BASE(local_din),
++	       sm + RP2350_PIO_SM_PINCTRL);
++	writel(FJ_AUDIO_STREAM_PROGRAM_OFFSET, sm + RP2350_PIO_SM_INSTR);
++	writel(PIO_FDEBUG_TXSTALL(fj->sm) | PIO_FDEBUG_TXOVER(fj->sm) |
++	       PIO_FDEBUG_RXUNDER(fj->sm) | PIO_FDEBUG_RXSTALL(fj->sm),
++	       fj->pio + RP2350_PIO_FDEBUG);
++	fj_audio_sm_restart_one(fj, fj->sm);
++	fj_audio_sm_enable_one(fj, fj->sm);
++	return 0;
++}
++
++static int fj_audio_tone(struct fj_audio *fj, unsigned int hz, unsigned int ms)
++{
++	unsigned int req_hz = hz;
++	unsigned int req_ms = ms;
++	u32 phase = 0;
++	u32 phase_step;
++	u32 frames;
++	u32 i;
++	int ret;
++
++	if (!ms) {
++		fj_audio_record_tone_result(fj, req_hz, req_ms, 0);
++		return 0;
++	}
++	if (ms > FJ_AUDIO_TONE_MAX_MS)
++		ms = FJ_AUDIO_TONE_MAX_MS;
++	if (hz >= FJ_AUDIO_SAMPLE_RATE / 2)
++		hz = FJ_AUDIO_SAMPLE_RATE / 2 - 1;
++	if (!hz) {
++		msleep(ms);
++		fj_audio_record_tone_result(fj, req_hz, req_ms, 0);
++		return 0;
++	}
++
++	ret = fj_audio_configure_i2s_stream(fj);
++	if (ret) {
++		fj_audio_record_tone_result(fj, req_hz, req_ms, ret);
++		return ret;
++	}
++
++	frames = div_u64((u64)ms * FJ_AUDIO_SAMPLE_RATE, 1000);
++	if (!frames)
++		frames = 1;
++	phase_step = (u32)div_u64((u64)hz << 32, FJ_AUDIO_SAMPLE_RATE);
++
++	for (i = 0; i < frames + FJ_AUDIO_TAIL_FRAMES; i++) {
++		s32 amp = FJ_AUDIO_TONE_AMPLITUDE;
++		s16 sample = 0;
++
++		if (i < frames) {
++			if (i < FJ_AUDIO_SAMPLE_RATE / 200)
++				amp = div_u64((u64)amp * i,
++					      FJ_AUDIO_SAMPLE_RATE / 200);
++			if (frames - i < FJ_AUDIO_SAMPLE_RATE / 200)
++				amp = div_u64((u64)amp * (frames - i),
++					      FJ_AUDIO_SAMPLE_RATE / 200);
++			sample = fj_audio_sine_sample(phase, amp);
++			phase += phase_step;
++		}
++		ret = fj_audio_write_frame(fj, fj_audio_i2s_word(sample));
++		if (ret)
++			break;
++		ret = fj_audio_write_frame(fj, fj_audio_i2s_word(sample));
++		if (ret)
++			break;
++	}
++	if (!ret)
++		ret = fj_audio_wait_tx_empty(fj);
++	udelay(500);
++	fj_audio_sm_disable_one(fj, fj->sm);
++	fj_audio_record_tone_result(fj, req_hz, req_ms, ret);
++	return ret;
 +}
 +
 +static ssize_t fj_audio_write(struct file *file, const char __user *ubuf,
@@ -264,6 +588,8 @@ index 000000000000..71e9b3d9f014
 +{
 +	struct fj_audio *fj = file->private_data;
 +	char buf[32];
++	unsigned int hz;
++	unsigned int ms;
 +	int ret = 0;
 +
 +	if (!count)
@@ -278,13 +604,50 @@ index 000000000000..71e9b3d9f014
 +	mutex_lock(&fj->lock);
 +	if (!strcmp(buf, "start"))
 +		ret = fj_audio_start(fj);
++	else if (sscanf(buf, "tone %u %u", &hz, &ms) == 2)
++		ret = fj_audio_tone(fj, hz, ms);
 +	else if (!strcmp(buf, "stop"))
-+		fj_audio_sm_disable(fj);
++		fj_audio_stop(fj);
 +	else
 +		ret = -EINVAL;
 +	mutex_unlock(&fj->lock);
 +
 +	return ret ? ret : count;
++}
++
++static ssize_t fj_audio_read(struct file *file, char __user *ubuf,
++			     size_t count, loff_t *ppos)
++{
++	struct fj_audio *fj = file->private_data;
++	char buf[256];
++	u32 fstat;
++	u32 fdebug;
++	u32 ctrl;
++	int len;
++
++	mutex_lock(&fj->lock);
++	fstat = readl(fj->pio + RP2350_PIO_FSTAT);
++	fdebug = readl(fj->pio + RP2350_PIO_FDEBUG);
++	ctrl = readl(fj->pio + RP2350_PIO_CTRL);
++	len = scnprintf(buf, sizeof(buf),
++			"running %u\n"
++			"mclk_hz %u\n"
++			"sample_rate %u\n"
++			"tone_count %u\n"
++			"last_hz %u\n"
++			"last_ms %u\n"
++			"last_ret %d\n"
++			"last_fstat 0x%08x\n"
++			"last_fdebug 0x%08x\n"
++			"fstat 0x%08x\n"
++			"fdebug 0x%08x\n"
++			"ctrl 0x%08x\n",
++			fj->running ? 1 : 0, fj->mclk_hz, FJ_AUDIO_SAMPLE_RATE,
++			fj->tone_count, fj->last_hz, fj->last_ms, fj->last_ret,
++			fj->last_fstat, fj->last_fdebug, fstat, fdebug, ctrl);
++	mutex_unlock(&fj->lock);
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
 +}
 +
 +static int fj_audio_open(struct inode *inode, struct file *file)
@@ -299,6 +662,7 @@ index 000000000000..71e9b3d9f014
 +static const struct file_operations fj_audio_fops = {
 +	.owner = THIS_MODULE,
 +	.open = fj_audio_open,
++	.read = fj_audio_read,
 +	.write = fj_audio_write,
 +	.llseek = noop_llseek,
 +};
@@ -329,16 +693,24 @@ index 000000000000..71e9b3d9f014
 +
 +	fj->pio_index = 1;
 +	fj->sm = 1;
++	fj->mclk_sm = 0;
++	fj->din_gpio = 24;
++	fj->mclk_gpio = 25;
 +	fj->bclk_gpio = 26;
 +	fj->ws_gpio = 27;
 +	fj->gpio_base = 16;
 +	fj->clk_sys_hz = 150000000;
++	fj->mclk_hz = FJ_AUDIO_MCLK_HZ;
 +	of_property_read_u32(pdev->dev.of_node, "raspberrypi,pio", &fj->pio_index);
 +	of_property_read_u32(pdev->dev.of_node, "raspberrypi,sm", &fj->sm);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,mclk-sm", &fj->mclk_sm);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,din-gpio", &fj->din_gpio);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,mclk-gpio", &fj->mclk_gpio);
 +	of_property_read_u32(pdev->dev.of_node, "raspberrypi,bclk-gpio", &fj->bclk_gpio);
 +	of_property_read_u32(pdev->dev.of_node, "raspberrypi,ws-gpio", &fj->ws_gpio);
 +	of_property_read_u32(pdev->dev.of_node, "raspberrypi,gpio-base", &fj->gpio_base);
 +	of_property_read_u32(pdev->dev.of_node, "raspberrypi,clk-sys-hz", &fj->clk_sys_hz);
++	of_property_read_u32(pdev->dev.of_node, "raspberrypi,mclk-hz", &fj->mclk_hz);
 +
 +	fj->miscdev.minor = MISC_DYNAMIC_MINOR;
 +	fj->miscdev.name = "fruitjam-audio";
@@ -358,7 +730,7 @@ index 000000000000..71e9b3d9f014
 +{
 +	struct fj_audio *fj = platform_get_drvdata(pdev);
 +
-+	fj_audio_sm_disable(fj);
++	fj_audio_stop(fj);
 +	misc_deregister(&fj->miscdev);
 +}
 +

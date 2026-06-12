@@ -28,8 +28,10 @@ BusyBox, CramFS in flash, and an 8 MiB PSRAM kernel load address.
   GPIO47 is intentionally not exposed because it is the PSRAM chip-select line.
 * microSD: SPI-mode card access uses PL022 SPI0 on GPIO34/GPIO35/GPIO36 with
   GPIO39 as a gpiolib chip select, mounted at `/mnt/sd`.
-* Audio first step: `/dev/fruitjam-audio` drives PIO1 BCLK/WS on GPIO26/GPIO27,
-  and `fruitjam-rtttl` plays RTTTL through the TLV320DAC3100 beep generator.
+* Audio first step: `/dev/fruitjam-audio` drives PIO1 I2S on GPIO24/GPIO26/GPIO27
+  plus MCLK on GPIO25, and `fruitjam-rtttl` plays RTTTL through that tone path.
+* DVI first step: `/dev/fruitjam-dvi` exposes a tiny RGB332 HSTX frame path and
+  `fruitjam-dvi` renders bounded text/dashboard/test frames.
 
 Validated on the Fruit Jam board:
 
@@ -38,41 +40,47 @@ Validated on the Fruit Jam board:
 * Berry installed at `/usr/bin/berry`.
 * `berry -e 'print("berry ok")'`.
 * Berry REPL expression evaluation.
-* `/root/neopixels.be` runs with `berry /root/neopixels.be` and lights the five
-  onboard NeoPixels.
+* `/root/berry/neopixels.be` runs with `berry-run /root/berry/neopixels.be` and lights the
+  five onboard NeoPixels.
 * BusyBox `vi` is enabled as `/bin/vi`.
 * `fruitjamctl bootsel` reboots into the RP2350 ROM BOOTSEL loader.
 * `/proc/mtd` reports the CramFS partition as
   `mtd0: 00a00000 00001000 "cramfs"`.
 * Sysfs GPIO exports work for GPIO29 output and GPIO0/GPIO4/GPIO5 button inputs:
   GPIO29 reads back output writes, while the released buttons read high.
-* Loopback services start automatically: BusyBox httpd on TCP/80, tiny
-  `fruitjam-telnetd` on TCP/23, tiny `fruitjam-ftpd` on TCP/21, and BusyBox
-  tftpd on UDP/69.
+* Default services start automatically: AirLift inbound HTTP/telnet/FTP through
+  the ESP32-C6 when WiFi is configured, plus the `fruitjam-buttons` daemon.
+  The loopback `fruitjam-services core` set starts `fruitjam-httpd`,
+  `fruitjam-telnetd`, `fruitjam-ftpd`, and TFTP on demand for target-side smoke
+  tests.
 * Serial login shells use standalone `/usr/bin/hush`; telnet sessions use the
   smaller `/usr/bin/fruitjam-shell` command loop to preserve no-MMU allocation
   headroom.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps` or `netstat`, and CGI still runs after status/telnet
   checks.
-* `wget -O - http://127.0.0.1/index.html` serves the bundled status page, and
-  `wget -O - http://127.0.0.1/cgi-bin/env.cgi` returns `Fruit Jam CGI OK`.
-* `telnet 127.0.0.1 23` spawns `fruitjam-shell` and successfully echoed
-  `TELNET_OK`.
+* `wget -O - http://127.0.0.1/index.html` serves the bundled status page after
+  `fruitjam-services core`, and `wget -O - http://127.0.0.1/cgi-bin/env.cgi`
+  returns `Fruit Jam CGI OK`.
+* AirLift telnet on TCP/23 spawns `fruitjam-shell` and successfully echoed
+  `TELNET_OK`; loopback telnet works after `fruitjam-services core`.
 * microSD enumerates as `/dev/mmcblk0` and `/dev/mmcblk0p1`; `/mnt/sd` mounts
   as VFAT, accepts writes, unmounts, remounts, and preserves the test file.
 * `airliftctl` talks to the onboard ESP32-C6 AirLift over RP2350 PL022/spidev
-  hardware SPI. The installed NINA firmware reported `3.1.0`; WiFi join,
-  DHCP address reporting, and outbound HTTP via
-  `airliftctl tcp-get example.com /` were verified on hardware.
+  hardware SPI. The installed NINA firmware reported `3.3.0`; WiFi join,
+  DHCP address reporting, outbound HTTP via `airliftctl tcp-get example.com /`,
+  inbound HTTP, inbound telnet, and passive FTP were verified on hardware.
 * `airliftctl mqtt-pub` and `mosquitto_pub --airlift` provide a userspace AirLift
   MQTT QoS 0 publish path for button actions when `MQTT_TRANSPORT=airlift` is
   set in the button config. A local broker received both a direct
   `fruitjam/test` AirLift publish and a synthetic `fruitjam/buttons/button2`
   publish from the button FIFO path.
 * `/sys/class/misc/fruitjam-audio` registers, `/dev/fruitjam-audio` accepts
-  `start` and `stop`, `fruitjam-i2c ping 0x18` acks, and
-  `/usr/bin/fruitjam-rtttl` reports the default tune played with exit status 0.
+  `start` and `stop`, and `fruitjam-i2c ping 0x18` acks. Audible RTTTL output
+  and a generated WAV scale were verified with the Mac microphone helper.
+* `/dev/fruitjam-dvi` exists and `fruitjam-dvi dashboard` plus
+  `fruitjam-dvi exec fruitjam-services status` returned successfully on the
+  flashed image.
 
 ## Build
 
@@ -241,15 +249,36 @@ cat /sys/class/misc/fruitjam-audio/dev
 ls -l /dev/fruitjam-audio
 echo start > /dev/fruitjam-audio
 echo stop > /dev/fruitjam-audio
+fruitjam-rtttl --tone 880 1200
+FRUITJAM_AUDIO_RESET=pulse fruitjam-rtttl --tone 880 1200
 fruitjam-rtttl
 fruitjam-rtttl 'ok:d=8,o=5,b=120:c,e,g,c6'
 ```
 
-`/dev/fruitjam-audio` starts a PIO1 state machine that generates BCLK on GPIO26
-and WS on GPIO27. `fruitjam-rtttl` uses that clock as the TLV320DAC3100 PLL
-input, configures the codec over `/dev/i2c-0`, and plays notes through the
-TLV320 beep generator. GPIO24 DIN and GPIO25 MCLK are still reserved for a later
-full PCM/I2S data path.
+`/dev/fruitjam-audio` starts PIO1 state machines that generate MCLK on GPIO25
+and a simple 8 kHz, 16-bit stereo I2S stream on GPIO24/GPIO26/GPIO27.
+`fruitjam-rtttl` configures the codec over `/dev/i2c-0`, then asks the kernel
+helper to play each note as a sine tone. Full streamed PCM/I2S playback is still
+future work. The `FRUITJAM_AUDIO_RESET=pulse` form is for serial/lab tests only;
+the TLV320 reset line is shared with the AirLift ESP32-C6.
+
+Host-side microphone verifier:
+
+```sh
+scripts/fruitjam-audio-mic-test.py --serial-port /dev/cu.usbserial-P97cvdxp --rtttl scale
+scripts/fruitjam-audio-mic-test.py --serial-port /dev/cu.usbserial-P97cvdxp --install-sd-wav --run-wavplay --rtttl scale
+```
+
+Host-side example and CGI preflight:
+
+```sh
+scripts/validate-fruitjam-examples.sh
+```
+
+This compiles the web CGI for the host and checks JSON responses, verifies the
+HTTP-callable Berry whitelist matches the installed `/root/berry` examples,
+parses all RTTTL tunes by generating throwaway WAVs, and runs the finite Berry
+examples with graceful hardware skips.
 
 ## AirLift networking
 
@@ -264,11 +293,27 @@ airliftctl tcp-get example.com /
 airliftctl mqtt-pub <broker-host> 1883 fruitjam/test hello
 ```
 
+For automatic service startup, store WiFi credentials on the SD card at
+`/mnt/sd/fruitjam/wifi.conf`:
+
+```sh
+mkdir -p /mnt/sd/fruitjam
+chmod 700 /mnt/sd/fruitjam
+cat > /mnt/sd/fruitjam/wifi.conf <<'EOF'
+SSID=your-ssid
+PASSWORD=your-passphrase
+EOF
+chmod 600 /mnt/sd/fruitjam/wifi.conf
+```
+
+Do not put real WiFi credentials in the rootfs overlay or release artifacts.
+
 This is a userspace coprocessor socket helper. It proves that the AirLift can join
-WiFi and open outbound TCP connections, but it does not create a Linux `wlan0`
-interface, so BusyBox `wget` and normal Linux sockets still only use loopback
-until a kernel netdev driver or userspace bridge exists. The Adafruit NINA
-`3.3.0` Fruit Jam firmware update has not been integrated into this image yet.
+WiFi, open outbound TCP connections, and host a small inbound HTTP/telnet/FTP
+surface, but it does not create a Linux `wlan0` interface. BusyBox `wget` and
+normal Linux sockets still use loopback until a kernel netdev driver or a fuller
+userspace bridge exists. The Linux image does not flash the ESP32-C6 firmware;
+the tested board already had the Adafruit Fruit Jam NINA `3.3.0` firmware.
 
 ## microSD
 
@@ -298,7 +343,7 @@ and REPL support:
 ```sh
 berry -e 'print("hello fruit jam")'
 berry
-berry /root/neopixels.be
+berry-run /root/berry/neopixels.be
 ```
 
 The NeoPixel driver exposes `/dev/neopixels` with a simple text command interface:
@@ -313,12 +358,13 @@ test
 
 ## Known limitations
 
-* HSTX DVI output is not implemented.
+* HSTX DVI has a tiny `/dev/fruitjam-dvi` RGB332 frame helper for bounded
+  dashboard/text/test frames. Full fbdev/console support is not implemented.
 * USB host 5 V power can be enabled by `fruitjamctl`, but USB host and USB
   keyboard input protocol support are not implemented.
 * Buttons, GPIO29, microSD block access, button SQLite logging, GPIO20/GPIO21
   I2C, AirLift userspace socket access, and first-step TLV320 RTTTL audio work,
-  but WiFi/AirLift Linux netdev support, full PCM/I2S audio, DVI, and USB host
-  input still need real Linux support.
+  but WiFi/AirLift Linux netdev support, full PCM/I2S audio, full DVI console,
+  and USB host input still need real Linux support.
 * RP2350 atomics are only safe in internal SRAM; see `docs/risks.md` before moving
   lock-heavy structures or userspace runtimes into PSRAM.

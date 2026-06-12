@@ -10,6 +10,9 @@ static void print_env(const char *name)
 int main(void)
 {
 	puts("Content-Type: text/plain");
+	puts("Access-Control-Allow-Origin: *");
+	puts("Cache-Control: no-store");
+	puts("Pragma: no-cache");
 	putchar('\n');
 	puts("Fruit Jam CGI OK");
 	print_env("REQUEST_METHOD");

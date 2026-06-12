@@ -10,6 +10,11 @@ BERRY_SITE_METHOD = git
 BERRY_LICENSE = MIT
 BERRY_LICENSE_FILES = LICENSE
 BERRY_DEPENDENCIES = host-python3
+BERRY_CFLAGS = \
+	$(TARGET_CFLAGS) -ffunction-sections -fdata-sections \
+	-fno-unwind-tables -fno-asynchronous-unwind-tables
+BERRY_LDFLAGS = \
+	$(TARGET_LDFLAGS) -Wl,--gc-sections
 
 define BERRY_CONFIGURE_CMDS
 	$(SED) 's/#define BE_USE_SHARED_LIB[[:space:]].*/#define BE_USE_SHARED_LIB               0/' \
@@ -23,12 +28,13 @@ endef
 define BERRY_BUILD_CMDS
 	mkdir -p $(@D)/generate
 	cd $(@D) && $(HOST_DIR)/bin/python3 ./tools/coc/coc -o generate src default -c default/berry_conf.h
-	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
-		-std=c99 -Wall -Wextra \
+	$(TARGET_CC) $(BERRY_CFLAGS) $(BERRY_LDFLAGS) \
+		-std=c99 -Wall -Wextra -Os \
 		-I$(@D)/src -I$(@D)/default -I$(@D)/generate \
 		$(@D)/src/*.c $(@D)/default/be_port.c $(@D)/default/be_modtab.c \
 		$(BERRY_PKGDIR)/berry_main.c \
 		-lm -o $(@D)/berry
+	$(TARGET_CROSS)flthdr -s 4096 $(@D)/berry
 endef
 
 define BERRY_INSTALL_TARGET_CMDS

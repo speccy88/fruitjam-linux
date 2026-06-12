@@ -3,24 +3,27 @@
  * Tiny raw telnet-style shell server for Fruit Jam.
  *
  * It intentionally does not allocate a pty or implement telnet option
- * negotiation. It accepts one TCP client at a time and execs fruitjam-shell
- * with the socket connected to stdin/stdout/stderr.
+ * negotiation. Each TCP client gets a tiny fruitjam-shell child with the
+ * socket connected to stdin/stdout/stderr, while the listener immediately
+ * goes back to accepting the next connection.
  */
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #define DEFAULT_PORT 23
 #define DEFAULT_SHELL "/usr/bin/fruitjam-shell"
+#define CLIENT_IDLE_SEC 120
 
 static int parse_port(const char *s)
 {
@@ -35,13 +38,17 @@ static int parse_port(const char *s)
 static int serve_client(int client, const char *shell)
 {
 	pid_t pid = vfork();
-	int status;
+	int one = 1;
+	struct timeval idle = { CLIENT_IDLE_SEC, 0 };
 
 	if (pid < 0) {
 		perror("fruitjam-telnetd: vfork");
 		close(client);
 		return 1;
 	}
+	setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+	setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 	if (pid == 0) {
 		dup2(client, STDIN_FILENO);
 		dup2(client, STDOUT_FILENO);
@@ -53,10 +60,6 @@ static int serve_client(int client, const char *shell)
 	}
 
 	close(client);
-	while (waitpid(pid, &status, 0) < 0) {
-		if (errno != EINTR)
-			return 1;
-	}
 	return 0;
 }
 
@@ -78,7 +81,7 @@ int main(int argc, char **argv)
 	if (argc > 2)
 		shell = argv[2];
 
-	signal(SIGCHLD, SIG_DFL);
+	signal(SIGCHLD, SIG_IGN);
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -94,7 +97,7 @@ int main(int argc, char **argv)
 		perror("fruitjam-telnetd: bind");
 		return 1;
 	}
-	if (listen(srv, 1) < 0) {
+	if (listen(srv, 2) < 0) {
 		perror("fruitjam-telnetd: listen");
 		return 1;
 	}

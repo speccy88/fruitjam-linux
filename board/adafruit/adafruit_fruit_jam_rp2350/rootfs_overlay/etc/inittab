@@ -22,7 +22,7 @@
 ::once:/usr/bin/fruitjam-services all
 
 ttyAMA0::respawn:/usr/bin/hush
-ttyGS0::respawn:/usr/bin/hush
+ttyGS0::respawn:-/usr/bin/hush
 
 #::sysinit:/sbin/swapon -a
 #null::sysinit:/bin/ln -sf /proc/self/fd /dev/fd

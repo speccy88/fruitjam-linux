@@ -1,0 +1,9 @@
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+export EDITOR=/bin/vi
+
+# Keep the hush default prompt ("/ # "): the stock PS1 block would break the
+# cdc-smoke-test prompt regex and calls the disabled id applet.
+for i in /etc/profile.d/*.sh ; do
+	[ -r "$i" ] && . $i
+done
+unset i

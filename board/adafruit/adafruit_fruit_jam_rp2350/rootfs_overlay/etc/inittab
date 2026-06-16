@@ -21,7 +21,9 @@
 ::sysinit:/bin/mkdir -p /run/lock/subsys
 ::once:/usr/bin/fruitjam-services all
 
-ttyAMA0::respawn:/usr/bin/hush
+# UART login disabled: SBSA-uart read returns EOF instantly with no adapter attached,
+# causing an infinite hush respawn loop. Kernel log output on ttyAMA0 is unaffected.
+#ttyAMA0::askfirst:/usr/bin/hush
 ttyGS0::respawn:/usr/bin/hush
 
 #::sysinit:/sbin/swapon -a

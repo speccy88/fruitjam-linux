@@ -17,11 +17,14 @@ BERRY_LDFLAGS = \
 	$(TARGET_LDFLAGS) -Wl,--gc-sections
 
 define BERRY_CONFIGURE_CMDS
+	cp $(BERRY_PKGDIR)/be_i2clib.c $(@D)/src/be_i2clib.c
+	$(HOST_DIR)/bin/python3 $(BERRY_PKGDIR)/inject-i2c.py $(@D)/default/be_modtab.c
 	$(SED) 's/#define BE_USE_SHARED_LIB[[:space:]].*/#define BE_USE_SHARED_LIB               0/' \
-		-e 's/#define BE_USE_OS_MODULE[[:space:]].*/#define BE_USE_OS_MODULE                0/' \
+		-e 's/#define BE_USE_OS_MODULE[[:space:]].*/#define BE_USE_OS_MODULE                1/' \
 		-e 's/#define BE_USE_BYTECODE_SAVER[[:space:]].*/#define BE_USE_BYTECODE_SAVER        0/' \
 		-e 's/#define BE_USE_BYTECODE_LOADER[[:space:]].*/#define BE_USE_BYTECODE_LOADER       0/' \
 		-e 's/#define BE_USE_SOLIDIFY_MODULE[[:space:]].*/#define BE_USE_SOLIDIFY_MODULE       0/' \
+		-e '/#define BE_USE_OS_MODULE/a\#define BE_USE_I2C_MODULE               1' \
 		$(@D)/default/berry_conf.h
 endef
 

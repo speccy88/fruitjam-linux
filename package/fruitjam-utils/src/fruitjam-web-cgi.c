@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -453,18 +454,51 @@ static void action_status(void)
 	printf("]}");
 }
 
+#ifndef I2C_RDWR
+#define I2C_RDWR 0x0707
+#endif
+
+struct cgi_i2c_msg {
+	unsigned short addr;
+	unsigned short flags;
+	unsigned short len;
+	unsigned char *buf;
+};
+
+struct cgi_i2c_rdwr {
+	struct cgi_i2c_msg *msgs;
+	unsigned int nmsgs;
+};
+
+static int cgi_i2c_ping(int fd, int addr)
+{
+	unsigned char dummy = 0;
+	struct cgi_i2c_msg msg = { (unsigned short)addr, 0, 0, &dummy };
+	struct cgi_i2c_rdwr data = { &msg, 1 };
+
+	return ioctl(fd, I2C_RDWR, &data) == 1 ? 0 : -1;
+}
+
 static void action_i2c(void)
 {
-	int ok = access("/dev/i2c-0", R_OK | W_OK) == 0;
+	int fd = open("/dev/i2c-0", O_RDWR);
+	int first = 1;
+	int addr;
 
 	printf("{\"ok\":%s,\"bus\":\"/dev/i2c-0\",\"source\":\"direct-cgi\",\"devices\":[",
-	       ok ? "true" : "false");
-	if (ok)
-		printf("\"0x18 TLV320DAC3100\"");
-	printf("],\"exit\":%d", ok ? 0 : 1);
-	if (ok) {
+	       fd >= 0 ? "true" : "false");
+	for (addr = 0x03; fd >= 0 && addr <= 0x77; addr++) {
+		if (cgi_i2c_ping(fd, addr) != 0)
+			continue;
+		printf("%s\"0x%02x%s\"", first ? "" : ",", addr,
+		       addr == 0x18 ? " TLV320DAC3100" : "");
+		first = 0;
+	}
+	printf("],\"exit\":%d", fd >= 0 ? 0 : 1);
+	if (fd >= 0) {
+		close(fd);
 		printf(",\"message\":");
-		json_string("I2C bus present; Fruit Jam audio codec is expected at 0x18");
+		json_string("live scan of /dev/i2c-0 (0x18 = onboard audio codec)");
 	} else {
 		printf(",\"error\":");
 		json_string("cannot access /dev/i2c-0");

@@ -2918,21 +2918,55 @@ static void http_api_status_body(char *body, size_t body_len)
 		http_json_error_body(body, body_len, "status response too large");
 }
 
+#ifndef I2C_RDWR
+#define I2C_RDWR 0x0707
+#endif
+
+struct fj_http_i2c_msg {
+	unsigned short addr;
+	unsigned short flags;
+	unsigned short len;
+	unsigned char *buf;
+};
+
+struct fj_http_i2c_rdwr {
+	struct fj_http_i2c_msg *msgs;
+	unsigned int nmsgs;
+};
+
+static int http_i2c_ping(int fd, int addr)
+{
+	unsigned char dummy = 0;
+	struct fj_http_i2c_msg msg = { (unsigned short)addr, 0, 0, &dummy };
+	struct fj_http_i2c_rdwr data = { &msg, 1 };
+
+	return ioctl(fd, I2C_RDWR, &data) == 1 ? 0 : -1;
+}
+
 static void http_api_i2c_body(char *body, size_t body_len)
 {
-	int ok = access("/dev/i2c-0", R_OK | W_OK) == 0;
 	struct http_buf b;
+	int fd = open("/dev/i2c-0", O_RDWR);
+	int first = 1;
+	int addr;
 
 	http_buf_init(&b, body, body_len);
 	http_buf_printf(&b, "{\"ok\":%s,\"bus\":\"/dev/i2c-0\",\"source\":\"airlift-direct\",\"devices\":[",
-			ok ? "true" : "false");
-	if (ok)
-		http_buf_puts(&b, "\"0x18 TLV320DAC3100\"");
-	http_buf_printf(&b, "],\"exit\":%d", ok ? 0 : 1);
-	if (ok)
-		http_buf_puts(&b, ",\"message\":\"I2C bus present; Fruit Jam audio codec is expected at 0x18\"");
-	else
+			fd >= 0 ? "true" : "false");
+	for (addr = 0x03; fd >= 0 && addr <= 0x77; addr++) {
+		if (http_i2c_ping(fd, addr) != 0)
+			continue;
+		http_buf_printf(&b, "%s\"0x%02x%s\"", first ? "" : ",", addr,
+				addr == 0x18 ? " TLV320DAC3100" : "");
+		first = 0;
+	}
+	http_buf_printf(&b, "],\"exit\":%d", fd >= 0 ? 0 : 1);
+	if (fd >= 0) {
+		close(fd);
+		http_buf_puts(&b, ",\"message\":\"live scan of /dev/i2c-0 (0x18 = onboard audio codec)\"");
+	} else {
 		http_buf_puts(&b, ",\"error\":\"cannot access /dev/i2c-0\"");
+	}
 	http_buf_puts(&b, "}");
 	if (b.overflow)
 		http_json_error_body(body, body_len, "i2c response too large");

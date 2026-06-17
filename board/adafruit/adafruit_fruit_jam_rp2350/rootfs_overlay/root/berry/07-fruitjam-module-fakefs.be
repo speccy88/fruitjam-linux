@@ -94,6 +94,14 @@ assert(string.find(i2c_ping, "fruitjam-i2c ping '0x18'") == 0)
 assert(string.find(i2c_ping, "'/dev/i2c-0'") >= 0)
 print("fake i2c helpers: ok")
 
+assert(fruitjam.usbhost_kbd_find_command() == "fruitjam-usbhost kbd-find")
+assert(fruitjam.usbhost_kbd_auto_text_command(1) == "fruitjam-usbhost kbd-auto-text '1'")
+assert(fruitjam.usbhost_kbd_events_command(1, 1, 1, 0, 2) ==
+       "fruitjam-usbhost kbd-events '1' '1' '1' '0' '2'")
+assert(fruitjam.usbhost_kbd_shell_command(nil, 1, 1, 0, 2) ==
+       "fruitjam-usbhost kbd-shell '0' '1' '1' '0' '2'")
+print("fake usb keyboard helpers: ok")
+
 assert(fruitjam.audio_clock("start")["ok"])
 assert(fruitjam.read_text(fruitjam.paths["audio"]) == "start")
 assert(fruitjam.audio_clock("stop")["ok"])

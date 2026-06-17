@@ -345,6 +345,105 @@ fruitjam.usbhost_status = def()
     return fruitjam.usbhost_status_from_gpio()
 end
 
+fruitjam.usbhost_kbd_target_args = def(addr, config, iface, ep)
+    if addr == nil && config == nil && iface == nil && ep == nil
+        return ""
+    end
+    var a = addr
+    var c = config
+    var i = iface
+    var e = ep
+    if a == nil
+        a = 1
+    end
+    if c == nil
+        c = 1
+    end
+    if i == nil
+        i = 0
+    end
+    if e == nil
+        e = 1
+    end
+    return " " + fruitjam.shell_quote(a) +
+           " " + fruitjam.shell_quote(c) +
+           " " + fruitjam.shell_quote(i) +
+           " " + fruitjam.shell_quote(e)
+end
+
+fruitjam.usbhost_kbd_find_command = def()
+    return "fruitjam-usbhost kbd-find"
+end
+
+fruitjam.usbhost_kbd_live_command = def(mode, seconds, addr, config, iface, ep)
+    var cmd = "fruitjam-usbhost " + mode
+    var target = fruitjam.usbhost_kbd_target_args(addr, config, iface, ep)
+    if seconds != nil || target != ""
+        var s = seconds
+        if s == nil
+            s = mode == "kbd-shell" ? 0 : 30
+        end
+        cmd += " " + fruitjam.shell_quote(s)
+    end
+    return cmd + target
+end
+
+fruitjam.usbhost_kbd_text_command = def(seconds, addr, config, iface, ep)
+    return fruitjam.usbhost_kbd_live_command("kbd-text", seconds, addr, config, iface, ep)
+end
+
+fruitjam.usbhost_kbd_events_command = def(seconds, addr, config, iface, ep)
+    return fruitjam.usbhost_kbd_live_command("kbd-events", seconds, addr, config, iface, ep)
+end
+
+fruitjam.usbhost_kbd_shell_command = def(seconds, addr, config, iface, ep)
+    return fruitjam.usbhost_kbd_live_command("kbd-shell", seconds, addr, config, iface, ep)
+end
+
+fruitjam.usbhost_kbd_auto_command = def(mode, seconds)
+    var cmd = "fruitjam-usbhost " + mode
+    if seconds != nil
+        cmd += " " + fruitjam.shell_quote(seconds)
+    end
+    return cmd
+end
+
+fruitjam.usbhost_kbd_auto_text_command = def(seconds)
+    return fruitjam.usbhost_kbd_auto_command("kbd-auto-text", seconds)
+end
+
+fruitjam.usbhost_kbd_auto_events_command = def(seconds)
+    return fruitjam.usbhost_kbd_auto_command("kbd-auto-events", seconds)
+end
+
+fruitjam.usbhost_kbd_auto_shell_command = def(seconds)
+    return fruitjam.usbhost_kbd_auto_command("kbd-auto-shell", seconds)
+end
+
+fruitjam.usbhost_run_command = def(cmd)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.usbhost_kbd_find = def()
+    return fruitjam.usbhost_run_command(fruitjam.usbhost_kbd_find_command())
+end
+
+fruitjam.usbhost_kbd_text = def(seconds, addr, config, iface, ep)
+    return fruitjam.usbhost_run_command(
+        fruitjam.usbhost_kbd_text_command(seconds, addr, config, iface, ep))
+end
+
+fruitjam.usbhost_kbd_events = def(seconds, addr, config, iface, ep)
+    return fruitjam.usbhost_run_command(
+        fruitjam.usbhost_kbd_events_command(seconds, addr, config, iface, ep))
+end
+
+fruitjam.usbhost_kbd_shell = def(seconds, addr, config, iface, ep)
+    return fruitjam.usbhost_run_command(
+        fruitjam.usbhost_kbd_shell_command(seconds, addr, config, iface, ep))
+end
+
 fruitjam.hex2 = def(value)
     var digits = "0123456789abcdef"
     return digits[(value >> 4) & 15] + digits[value & 15]

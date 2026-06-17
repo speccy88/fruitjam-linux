@@ -25,6 +25,7 @@ mosquitto_pub_src="$repo/package/fruitjam-utils/src/mosquitto_pub.c"
 mosquitto_sub_src="$repo/package/fruitjam-utils/src/mosquitto_sub.c"
 uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
+cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
 bootloader_clocks_src="$repo/package/pico2-bootloader/bootloader/src/clocks.h"
 kernel_usbhost_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0020-misc-add-fruitjam-usbhost-bridge-driver.patch"
 kernel_usbhost_pio_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0021-misc-stage-fruitjam-usbhost-pio2-engine.patch"
@@ -1498,6 +1499,10 @@ print("ok usbhost kernel bridge source")
 PY
 
 echo "== console source guards =="
+python3 -m py_compile "$cdc_smoke_src"
+grep -q -- '--usb-keyboard' "$cdc_smoke_src"
+grep -q -- 'usbhost_keyboard_tests' "$cdc_smoke_src"
+echo "ok cdc smoke usb keyboard guard"
 grep -q 'ttyAMA0::respawn:/usr/bin/fruitjam-uart-login' "$inittab_src"
 if grep -q 'ttyAMA0::respawn:/usr/bin/hush' "$inittab_src"; then
 	echo "ttyAMA0 hush respawn loop was reintroduced" >&2

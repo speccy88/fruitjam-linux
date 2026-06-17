@@ -276,8 +276,12 @@ chmod 600 .fruitjam.env
 ./scripts/cdc-smoke-test.py
 ```
 
-Use `--audio` to include the short RTTTL speaker test. Use `--skip-airlift` or
-`--skip-services` to narrow the suite during bring-up.
+Use `--audio` to include the short RTTTL speaker test. Use `--usb-keyboard`
+with a boot-protocol HID keyboard plugged into the Fruit Jam host port to run
+`kbd-find`, the Berry USB keyboard helper, and live `kbd-auto-text`/`kbd-auto-events`
+loops. Add `--usb-keyboard-require-input` when someone can press keys during
+the test and you want captured text/events to be required. Use `--skip-airlift`
+or `--skip-services` to narrow the suite during bring-up.
 
 Recent release-prep verification on June 12, 2026:
 

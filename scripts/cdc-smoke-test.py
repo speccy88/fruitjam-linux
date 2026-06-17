@@ -315,6 +315,83 @@ def service_tests(shell: CdcShell) -> Iterable[TestResult]:
     )
 
 
+def usbhost_keyboard_tests(shell: CdcShell, args: argparse.Namespace) -> Iterable[TestResult]:
+    seconds = args.usb_keyboard_seconds
+    require_input = args.usb_keyboard_require_input
+
+    yield pass_if(
+        shell,
+        "usbhost bridge status",
+        "fruitjam-usbhost status",
+        lambda r: r.rc == 0 and clean_output(r) and "usbhost device" in r.output,
+        timeout=12,
+    )
+    yield pass_if(
+        shell,
+        "usb keyboard berry helper",
+        "berry-run /root/berry/12-usbhost-keyboard.be",
+        lambda r: r.rc == 0 and clean_output(r) and "12-usbhost-keyboard.be: ok" in r.output,
+        timeout=45,
+    )
+    yield pass_if(
+        shell,
+        "usb keyboard target",
+        "fruitjam-usbhost kbd-find",
+        lambda r: r.rc == 0 and clean_output(r) and "usbhost keyboard target" in r.output,
+        timeout=45,
+    )
+    yield pass_if(
+        shell,
+        "usb keyboard text",
+        f"fruitjam-usbhost kbd-auto-text {seconds}",
+        lambda r: (
+            r.rc == 0
+            and clean_output(r)
+            and (not require_input or bool(strip_usb_keyboard_noise(r.output)))
+        ),
+        timeout=seconds + 20,
+        detail=(
+            "live text loop completed"
+            if not require_input
+            else "live text loop saw typed characters"
+        ),
+    )
+    yield pass_if(
+        shell,
+        "usb keyboard events",
+        f"fruitjam-usbhost kbd-auto-events {seconds}",
+        lambda r: (
+            r.rc == 0
+            and clean_output(r)
+            and (
+                not require_input
+                or "press key=" in r.output
+                or "release key=" in r.output
+            )
+        ),
+        timeout=seconds + 20,
+        detail=(
+            "live event loop completed"
+            if not require_input
+            else "live event loop saw key events"
+        ),
+    )
+
+
+def strip_usb_keyboard_noise(output: str) -> str:
+    lines = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("usbhost keyboard "):
+            continue
+        if stripped.startswith("usbhost keyboard target "):
+            continue
+        lines.append(stripped)
+    return "\n".join(lines).strip()
+
+
 def airlift_tests(shell: CdcShell, args: argparse.Namespace) -> Iterable[TestResult]:
     shell.run("fruitjam-services stop; killall airliftctl 2>/dev/null || true", timeout=10)
     yield pass_if(shell, "airlift probe", "airliftctl probe", contains("firmware", "mac"), timeout=35)
@@ -872,6 +949,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssid", help="WiFi SSID for AirLift join test")
     parser.add_argument("--password", help="WiFi passphrase for AirLift join test")
     parser.add_argument("--audio", action="store_true", help="play a short RTTTL tune")
+    parser.add_argument(
+        "--usb-keyboard",
+        action="store_true",
+        help="run USB host boot-keyboard smoke tests against the plugged-in HID device",
+    )
+    parser.add_argument(
+        "--usb-keyboard-seconds",
+        type=int,
+        default=int(os.environ.get("FJ_USB_KEYBOARD_SECONDS", "8")),
+        help="seconds for live USB keyboard text/events loops",
+    )
+    parser.add_argument(
+        "--usb-keyboard-require-input",
+        action="store_true",
+        help="fail live USB keyboard loops unless typed text or key events are captured",
+    )
     parser.add_argument("--skip-display", action="store_true", help="skip the bounded DVI dashboard render")
     parser.add_argument("--skip-airlift", action="store_true", help="skip AirLift and WiFi tests")
     parser.add_argument("--skip-services", action="store_true", help="skip loopback network service tests")
@@ -922,6 +1015,11 @@ def main() -> int:
             results.append(skip("network services", "disabled by --skip-services"))
         else:
             results.extend(service_tests(shell))
+
+        if args.usb_keyboard:
+            results.extend(usbhost_keyboard_tests(shell, args))
+        else:
+            results.append(skip("usb keyboard", "use --usb-keyboard with a boot HID keyboard attached"))
 
         if args.skip_airlift:
             results.append(skip("airlift", "disabled by --skip-airlift"))

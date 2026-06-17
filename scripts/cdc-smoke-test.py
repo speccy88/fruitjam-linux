@@ -884,6 +884,8 @@ def tool_inventory_command() -> str:
         "mosquitto_sub",
         "fruitjam-mem",
         "free",
+        "fruitjam-uptime",
+        "uptime",
         "fruitjam-ps",
         "ps",
         "fruitjam-pgrep",

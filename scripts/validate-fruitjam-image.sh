@@ -45,6 +45,8 @@ required = [
     "./usr/bin/fruitjam-dvi",
     "./usr/bin/fruitjam-rtttl",
     "./usr/bin/fruitjam-wavplay",
+    "./usr/bin/fruitjam-uptime",
+    "./usr/bin/uptime",
     "./usr/bin/fruitjam-ps",
     "./usr/bin/ps",
     "./usr/bin/fruitjam-pgrep",
@@ -212,6 +214,11 @@ with tarfile.open(rootfs) as tf:
     for needle in (b"fruitjam-ps", b"PID", b"PPID", b"vsize_kb", b"rss_kb"):
         if needle not in fruitjam_ps:
             raise SystemExit(f"fruitjam-ps missing marker {needle!r}")
+
+    fruitjam_uptime = read_bytes(tf, "./usr/bin/fruitjam-uptime")
+    for needle in (b"fruitjam-uptime", b"uptime_seconds", b"load_1m", b"load average"):
+        if needle not in fruitjam_uptime:
+            raise SystemExit(f"fruitjam-uptime missing marker {needle!r}")
 
     fruitjam_pgrep = read_bytes(tf, "./usr/bin/fruitjam-pgrep")
     for needle in (b"fruitjam-pgrep", b"pgrep", b"pkill", b"PATTERN"):

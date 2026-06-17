@@ -26,6 +26,7 @@ mosquitto_pub_src="$repo/package/fruitjam-utils/src/mosquitto_pub.c"
 mosquitto_sub_src="$repo/package/fruitjam-utils/src/mosquitto_sub.c"
 uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
+uptime_src="$repo/package/fruitjam-utils/src/fruitjam-uptime.c"
 ps_src="$repo/package/fruitjam-utils/src/fruitjam-ps.c"
 pgrep_src="$repo/package/fruitjam-utils/src/fruitjam-pgrep.c"
 cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
@@ -701,15 +702,22 @@ printf '0.01 0.02 0.03 1/23 456\n' > "$proc_root/loadavg"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os \
 	-DPROC_ROOT="\"$proc_root\"" \
 	-o "$tmp/fruitjam-mem" "$mem_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-DPROC_ROOT="\"$proc_root\"" \
+	-o "$tmp/fruitjam-uptime" "$uptime_src"
 "$tmp/fruitjam-mem" > "$tmp/fruitjam-mem.txt"
 "$tmp/fruitjam-mem" json > "$tmp/fruitjam-mem.json"
-python3 - "$tmp/fruitjam-mem.txt" "$tmp/fruitjam-mem.json" <<'PY'
+"$tmp/fruitjam-uptime" > "$tmp/fruitjam-uptime.txt"
+"$tmp/fruitjam-uptime" json > "$tmp/fruitjam-uptime.json"
+python3 - "$tmp/fruitjam-mem.txt" "$tmp/fruitjam-mem.json" "$tmp/fruitjam-uptime.txt" "$tmp/fruitjam-uptime.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text()
 data = json.loads(Path(sys.argv[2]).read_text())
+uptime_text = Path(sys.argv[3]).read_text()
+uptime_data = json.loads(Path(sys.argv[4]).read_text())
 if "Fruit Jam memory" not in text or "Note: no-MMU" not in text:
     raise SystemExit("fruitjam-mem text output missing expected labels")
 if data.get("unit") != "kB" or data.get("mem", {}).get("total") != 8192:
@@ -718,9 +726,17 @@ if data.get("mem", {}).get("cache") != 1088:
     raise SystemExit("fruitjam-mem json cache calculation regressed")
 if data.get("uptime_seconds") != 12.34 or data.get("load_15m") != 0.03:
     raise SystemExit("fruitjam-mem json uptime/load parse regressed")
+if "up 00:00, load average: 0.01, 0.02, 0.03" not in uptime_text:
+    raise SystemExit(f"fruitjam-uptime text regressed: {uptime_text!r}")
+if uptime_data.get("uptime_seconds") != 12 or uptime_data.get("idle_seconds") != 56:
+    raise SystemExit("fruitjam-uptime json seconds regressed")
+if uptime_data.get("load_5m") != 0.02 or uptime_data.get("load_15m") != 0.03:
+    raise SystemExit("fruitjam-uptime json load regressed")
 PY
 echo "ok fruitjam-mem text"
 echo "ok fruitjam-mem json"
+echo "ok fruitjam-uptime text"
+echo "ok fruitjam-uptime json"
 
 echo "== process helper host behavior =="
 proc_root="$tmp/proc"
@@ -1925,6 +1941,8 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$uart_login_src
 echo "ok c syntax $uart_login_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$mem_src"
 echo "ok c syntax $mem_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$uptime_src"
+echo "ok c syntax $uptime_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$ps_src"
 echo "ok c syntax $ps_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$pgrep_src"

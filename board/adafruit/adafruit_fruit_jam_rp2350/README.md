@@ -74,6 +74,8 @@ Validated on the Fruit Jam board:
 * `fruitjam-mem` and `free` provide a tiny no-fork memory, uptime, load, and
   commit-pressure summary from `/proc` without enabling heavier BusyBox procps
   applets.
+* `fruitjam-uptime` and `uptime` provide a tiny no-fork uptime/load-average
+  view from `/proc`.
 * `fruitjam-ps` and `ps` provide a tiny no-fork process list from `/proc` for
   interactive inspection without re-enabling the larger BusyBox `ps` applet.
 * `fruitjam-pgrep`, `pgrep`, and `pkill` provide tiny no-fork process lookup

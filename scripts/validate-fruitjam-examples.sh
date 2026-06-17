@@ -510,7 +510,7 @@ echo "ok fruitjam-hidkeys text"
 echo "ok fruitjam-hidkeys events"
 
 echo "== usbhost kernel bridge source guards =="
-	python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" <<'PY'
+	python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" "$web_page_src" <<'PY'
 import sys
 from pathlib import Path
 
@@ -557,6 +557,7 @@ helper = Path(sys.argv[42]).read_text()
 cgi = Path(sys.argv[43]).read_text()
 airlift = Path(sys.argv[44]).read_text()
 clocks = Path(sys.argv[45]).read_text()
+web = Path(sys.argv[46]).read_text()
 if "CONFIG_FRUITJAM_USBHOST_BRIDGE" not in patch or "fruitjam_usbhost.c" not in patch:
     raise SystemExit("kernel patch missing Fruit Jam USB host bridge driver")
 if "/dev/fruitjam-usbhost" not in patch or "pio-packet-io-pending" not in patch:
@@ -915,6 +916,15 @@ for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirL
     ):
         if needle not in source:
             raise SystemExit(f"{name} does not surface USB host RX probe field {needle}")
+for needle in (
+    "decodeUsbRx",
+    "usbPidName",
+    "rx descriptor",
+    "boot keyboard interface yes",
+    "formatUsbhost(data)",
+):
+    if needle not in web:
+        raise SystemExit(f"web page missing USB-host RX decode helper: {needle}")
 print("ok usbhost kernel bridge source")
 PY
 

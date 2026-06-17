@@ -649,11 +649,133 @@
       }
     }
 
+    function hex2(value) {
+      return "0x" + value.toString(16).padStart(2, "0");
+    }
+
+    function hex4(value) {
+      return "0x" + value.toString(16).padStart(4, "0");
+    }
+
+    function parseHexBytes(text) {
+      const bytes = [];
+      let hi = -1;
+      for (const ch of text || "") {
+        if (/\s|:|,|-|_/.test(ch) || ch === "x" || ch === "X") continue;
+        const v = parseInt(ch, 16);
+        if (Number.isNaN(v)) return [];
+        if (hi < 0) {
+          hi = v;
+        } else {
+          bytes.push((hi << 4) | v);
+          hi = -1;
+        }
+      }
+      return hi < 0 ? bytes : [];
+    }
+
+    function usbPidValid(pid) {
+      return (((pid >> 4) ^ (pid & 0x0f)) === 0x0f);
+    }
+
+    function usbPidName(pid) {
+      return ({
+        0xe1: "OUT", 0x69: "IN", 0xa5: "SOF", 0x2d: "SETUP",
+        0xc3: "DATA0", 0x4b: "DATA1", 0x87: "DATA2", 0x0f: "MDATA",
+        0xd2: "ACK", 0x5a: "NAK", 0x1e: "STALL", 0x96: "NYET",
+        0x3c: "PRE/ERR", 0x78: "SPLIT", 0xb4: "PING"
+      })[pid] || "unknown";
+    }
+
+    function usbPidIsData(pid) {
+      return pid === 0xc3 || pid === 0x4b || pid === 0x87 || pid === 0x0f;
+    }
+
+    function le16(bytes, offset) {
+      return bytes[offset] | (bytes[offset + 1] << 8);
+    }
+
+    function addDescriptorHints(lines, data) {
+      if (data.length < 2) return;
+      if (data[1] === 1) {
+        if (data.length >= 8) {
+          lines.push("rx descriptor: device bLength=" + data[0] +
+            " bcdUSB=" + hex4(le16(data, 2)) +
+            " class=" + hex2(data[4]) +
+            " subclass=" + hex2(data[5]) +
+            " protocol=" + hex2(data[6]) +
+            " maxPacket0=" + data[7]);
+        } else {
+          lines.push("rx descriptor: device truncated=" + data.length);
+        }
+        if (data.length >= 18) {
+          lines.push("rx id: vid=" + hex4(le16(data, 8)) +
+            " pid=" + hex4(le16(data, 10)) +
+            " bcdDevice=" + hex4(le16(data, 12)) +
+            " configs=" + data[17]);
+        }
+        return;
+      }
+      if (data[1] === 2 && data.length >= 9) {
+        lines.push("rx descriptor: config total=" + le16(data, 2) +
+          " interfaces=" + data[4] +
+          " attributes=" + hex2(data[7]) +
+          " maxPower=" + (data[8] * 2) + "mA");
+        return;
+      }
+      if (data[1] === 4 && data.length >= 9) {
+        lines.push("rx descriptor: interface number=" + data[2] +
+          " class=" + hex2(data[5]) +
+          " subclass=" + hex2(data[6]) +
+          " protocol=" + hex2(data[7]) +
+          " endpoints=" + data[4]);
+        if (data[5] === 3 && data[6] === 1 && data[7] === 1) {
+          lines.push("rx descriptor: boot keyboard interface yes");
+        }
+      }
+    }
+
+    function decodeUsbRx(hex) {
+      const bytes = parseHexBytes(hex);
+      const lines = [];
+      if (!hex) return lines;
+      if (!bytes.length) return ["rx decode: bad hex"];
+      const pidIndex = bytes.length >= 2 && usbPidValid(bytes[1]) ? 1 : 0;
+      const pid = bytes[pidIndex];
+      if (!usbPidValid(pid)) {
+        let line = "rx decode: invalid pid len=" + bytes.length +
+          " byte0=" + hex2(bytes[0]);
+        if (bytes.length >= 2) line += " byte1=" + hex2(bytes[1]);
+        return [line];
+      }
+      lines.push("rx decode: prefix=" + pidIndex +
+        " pid=" + usbPidName(pid) +
+        " raw=" + hex2(pid) +
+        " packetBytes=" + (bytes.length - pidIndex));
+      if (usbPidIsData(pid)) {
+        const payloadWithCrc = bytes.length - pidIndex - 1;
+        const dataLen = payloadWithCrc >= 2 ? payloadWithCrc - 2 : payloadWithCrc;
+        lines.push("rx data: payloadBytes=" + dataLen +
+          " crc16=" + (payloadWithCrc >= 2 ? "present" : "missing"));
+        if (dataLen > 0) {
+          addDescriptorHints(lines, bytes.slice(pidIndex + 1, pidIndex + 1 + dataLen));
+        }
+      }
+      return lines;
+    }
+
+    function formatUsbhost(data) {
+      const lines = [JSON.stringify(data, null, 2)];
+      const decoded = decodeUsbRx(data.last_rx_hex || "");
+      if (decoded.length) lines.push("", decoded.join("\n"));
+      return lines.join("\n");
+    }
+
     async function usbhost(cmd) {
       $$("[data-usbhost]").forEach((button) => button.disabled = true);
       try {
         const data = await get({ action: "usbhost", cmd }, 10000);
-        $("#usbhostOut").textContent = JSON.stringify(data, null, 2);
+        $("#usbhostOut").textContent = formatUsbhost(data);
         log("usbhost " + cmd + " " + (data.ok ? "ok" : "failed"));
         await refresh();
       } catch (err) {

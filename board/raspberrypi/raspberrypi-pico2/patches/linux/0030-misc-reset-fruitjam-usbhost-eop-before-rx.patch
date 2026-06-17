@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 17:45:00 +0000
+Subject: [PATCH] misc: reset Fruit Jam usbhost EOP before RX probes
+
+After an RX timeout, the EOP detector can remain active.  The next host
+transaction may then be decoded as receive data before the bridge reaches
+its explicit start-receive clear, which showed up as SETUP token bytes in
+the RX diagnostic state.
+
+Reset the EOP state machine alongside the RX decoder before each receive
+attempt so normal transactions keep EOP parked at its initial IRQ wait
+until the bridge intentionally releases it.
+---
+ drivers/misc/fruitjam_usbhost.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 444444444444..555555555555 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -459,14 +459,19 @@
+ static void fj_usbhost_pio_prepare_receive(struct fruitjam_usbhost *uh)
+ {
+ 	void __iomem *rx_sm = fj_usbhost_pio_sm(uh, uh->sm_rx);
++	void __iomem *eop_sm = fj_usbhost_pio_sm(uh, uh->sm_eop);
+ 
+ 	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_eop);
+ 	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
+ 	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	fj_usbhost_pio_sm_restart(uh, uh->sm_eop);
++	writel(FJ_PIO_EOP_INIT_INSTR, eop_sm + FJ_PIO_SM_INSTR);
+ 	fj_usbhost_pio_sm_enable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_eop);
+ }
+ 
+ static void fj_usbhost_pio_clear_rx_irq(struct fruitjam_usbhost *uh)
+-- 
+2.39.5

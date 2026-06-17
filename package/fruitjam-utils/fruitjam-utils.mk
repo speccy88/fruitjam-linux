@@ -30,6 +30,9 @@ define FRUITJAM_UTILS_BUILD_CMDS
 			-Wall -Wextra -Os -o $(@D)/fruitjam-usbhost \
 			$(@D)/fruitjam-usbhost.c
 		$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
+			-Wall -Wextra -Os -o $(@D)/fruitjam-hidkeys \
+			$(@D)/fruitjam-hidkeys.c
+		$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
 			-Wall -Wextra -Os -o $(@D)/fruitjam-dvi \
 			$(@D)/fruitjam-dvi.c
 		$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
@@ -70,6 +73,12 @@ define FRUITJAM_UTILS_BUILD_CMDS
 		-Wall -Wextra -Os -o $(@D)/fruitjam-shell \
 		$(@D)/fruitjam-shell.c
 	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
+		-Wall -Wextra -Os -o $(@D)/fruitjam-uart-login \
+		$(@D)/fruitjam-uart-login.c
+	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
+		-Wall -Wextra -Os -o $(@D)/fruitjam-mem \
+		$(@D)/fruitjam-mem.c
+	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
 		-Wall -Wextra -Os -o $(@D)/fruitjam-wget \
 		$(@D)/fruitjam-wget.c
 	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
@@ -95,6 +104,9 @@ define FRUITJAM_UTILS_BUILD_CMDS
 			$(@D)/fruitjam-nc \
 			$(@D)/fruitjam-telnet \
 			$(@D)/fruitjam-shell \
+			$(@D)/fruitjam-uart-login \
+			$(@D)/fruitjam-mem \
+			$(@D)/fruitjam-hidkeys \
 			$(@D)/fruitjam-web.cgi \
 			$(@D)/fruitjam-rm \
 			$(@D)/fruitjam-berry-run \
@@ -112,6 +124,7 @@ define FRUITJAM_UTILS_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-i2c $(TARGET_DIR)/usr/bin/fruitjam-i2c
 		$(INSTALL) -D -m 0755 $(@D)/fruitjam-adc $(TARGET_DIR)/usr/bin/fruitjam-adc
 		$(INSTALL) -D -m 0755 $(@D)/fruitjam-usbhost $(TARGET_DIR)/usr/bin/fruitjam-usbhost
+		$(INSTALL) -D -m 0755 $(@D)/fruitjam-hidkeys $(TARGET_DIR)/usr/bin/fruitjam-hidkeys
 		$(INSTALL) -D -m 0755 $(@D)/fruitjam-dvi $(TARGET_DIR)/usr/bin/fruitjam-dvi
 		$(INSTALL) -D -m 0755 $(@D)/fruitjam-rm $(TARGET_DIR)/bin/rm
 		$(INSTALL) -D -m 0755 $(@D)/fruitjam-berry-run $(TARGET_DIR)/usr/bin/berry-run
@@ -126,6 +139,9 @@ define FRUITJAM_UTILS_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-nc $(TARGET_DIR)/usr/bin/nc
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-telnet $(TARGET_DIR)/usr/bin/telnet
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-shell $(TARGET_DIR)/usr/bin/fruitjam-shell
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-uart-login $(TARGET_DIR)/usr/bin/fruitjam-uart-login
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-mem $(TARGET_DIR)/usr/bin/fruitjam-mem
+	ln -sf fruitjam-mem $(TARGET_DIR)/usr/bin/free
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-wget $(TARGET_DIR)/usr/bin/wget
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-httpd $(TARGET_DIR)/usr/sbin/fruitjam-httpd
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-telnetd $(TARGET_DIR)/usr/sbin/fruitjam-telnetd

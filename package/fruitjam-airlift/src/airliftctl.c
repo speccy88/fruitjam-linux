@@ -41,9 +41,12 @@
 #define AIRLIFT_GPIO_DEV_DEFAULT "/dev/airlift-gpio"
 #define AIRLIFT_SPI_DEV_DEFAULT "/dev/spidev0.0"
 #define FRUITJAMCTL_BIN "/usr/bin/fruitjamctl"
+#define USBHOST_DEV "/dev/fruitjam-usbhost"
 #define AIRLIFT_SPI_HZ 8000000u
 #define AIRLIFT_RESET_GPIO 22u
 #define AIRLIFT_READY_GPIO 3u
+#define USBHOST_RESET_MS 50u
+#define USBHOST_POST_RESET_US 100000u
 #define AIRLIFT_IRQ_GPIO 23u
 #define AIRLIFT_MISO_GPIO 28u
 #define AIRLIFT_SCK_GPIO 30u
@@ -109,7 +112,9 @@
 #define DEFAULT_FTP_DATA_PORT 2121u
 #define DEFAULT_TFTP_PORT 69u
 #define DEFAULT_SHELL_PATH "/usr/bin/fruitjam-shell"
-#define WWW_ROOT "/www"
+#define PLAYGROUND_ROOT "/www"
+#define SD_WEB_ROOT "/mnt/sd/www"
+#define PLAYGROUND_PREFIX "/playground"
 #define FTP_ROOT "/mnt/sd"
 #define TFTP_ROOT "/tmp/tftp"
 #define TFTP_README_TEXT "Fruit Jam TFTP area\n"
@@ -135,6 +140,8 @@
 #define AIRLIFT_SERVICE_POLL_US 5000
 #define AIRLIFT_TELNET_DRAIN_LIMIT 4
 #define AIRLIFT_WIFI_JOIN_POLLS 1500
+#define AIRLIFT_LOCK_PATH "/run/airliftctl.lock"
+#define AIRLIFT_START_LOG "/tmp/airlift-start.log"
 #define FTP_READ_NEW_CONTROL (-2)
 #define FTP_READ_SERVICE_WAITING (-3)
 
@@ -145,6 +152,7 @@ static const char *const berry_scripts[] = {
 	"03-buttons.be",
 	"04-adc-summary.be",
 	"05-usbhost-status.be",
+	"06-fruitjam-module.be",
 	"neopixels.be",
 	"neopixel-colors.be",
 	"neopixel-rainbow-10s.be",
@@ -233,6 +241,18 @@ struct telnet_session {
 static struct response response_buf;
 static uint8_t command_buf[768];
 static volatile sig_atomic_t stop_requested;
+static int airlift_lock_fd = -1;
+
+static void airlift_lock_release(void)
+{
+	int fd = airlift_lock_fd;
+
+	if (fd < 0)
+		return;
+	airlift_lock_fd = -1;
+	unlink(AIRLIFT_LOCK_PATH);
+	close(fd);
+}
 
 static void request_stop(int sig)
 {
@@ -259,7 +279,9 @@ static void usage(FILE *out)
 		"  serve-inbound         listen through AirLift on telnet/HTTP/FTP ports\n"
 		"  tcp-get HOST [PATH]   fetch an HTTP path through the NINA TCP socket API\n"
 		"  mqtt-pub HOST PORT TOPIC MESSAGE [CLIENTID]\n"
-		"                        publish one MQTT 3.1.1 QoS 0 message over AirLift\n");
+		"                        publish one MQTT 3.1.1 QoS 0 message over AirLift\n"
+		"\n"
+		"AirLift SPI access is serialized with " AIRLIFT_LOCK_PATH ".\n");
 }
 
 static long now_ms(void)
@@ -304,6 +326,203 @@ static int mkdir_p(const char *path)
 	if (mkdir(tmp, 0755) < 0 && errno != EEXIST)
 		return -1;
 	return 0;
+}
+
+static int copy_log_line(char *dst, size_t dst_len, const char *src)
+{
+	int ret;
+
+	if (dst_len == 0)
+		return -1;
+	ret = snprintf(dst, dst_len, "%s", src);
+	return ret > 0 && (size_t)ret < dst_len ? 0 : -1;
+}
+
+static int print_cached_airlift_info(const char *command)
+{
+	char firmware[96] = "";
+	char mac[96] = "";
+	char status[96] = "";
+	char ip[96] = "";
+	char netmask[96] = "";
+	char gateway[96] = "";
+	char line[128];
+	FILE *fp;
+
+	if (strcmp(command, "fw") && strcmp(command, "mac") &&
+	    strcmp(command, "status") && strcmp(command, "ip"))
+		return -1;
+
+	fp = fopen(AIRLIFT_START_LOG, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		if (!strncmp(line, "firmware ", 9))
+			copy_log_line(firmware, sizeof(firmware), line);
+		else if (!strncmp(line, "mac ", 4))
+			copy_log_line(mac, sizeof(mac), line);
+		else if (!strncmp(line, "status ", 7))
+			copy_log_line(status, sizeof(status), line);
+		else if (!strncmp(line, "ip ", 3))
+			copy_log_line(ip, sizeof(ip), line);
+		else if (!strncmp(line, "netmask ", 8))
+			copy_log_line(netmask, sizeof(netmask), line);
+		else if (!strncmp(line, "gateway ", 8))
+			copy_log_line(gateway, sizeof(gateway), line);
+	}
+	fclose(fp);
+
+	if (!strcmp(command, "fw") && *firmware) {
+		fputs(firmware, stdout);
+		return 0;
+	}
+	if (!strcmp(command, "mac") && *mac) {
+		fputs(mac, stdout);
+		return 0;
+	}
+	if (!strcmp(command, "status") && *status) {
+		fputs(status, stdout);
+		return 0;
+	}
+	if (!strcmp(command, "ip") && *ip) {
+		fputs(ip, stdout);
+		if (*netmask)
+			fputs(netmask, stdout);
+		if (*gateway)
+			fputs(gateway, stdout);
+		return 0;
+	}
+	return -1;
+}
+
+static int read_lock_owner(pid_t *pid, char *command, size_t command_len)
+{
+	char line[96];
+	char *end;
+	FILE *fp;
+	long value;
+
+	if (command_len)
+		command[0] = '\0';
+	fp = fopen(AIRLIFT_LOCK_PATH, "r");
+	if (!fp)
+		return -1;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	errno = 0;
+	value = strtol(line, &end, 10);
+	if (errno || value <= 0)
+		return -1;
+	while (*end == ' ' || *end == '\t')
+		end++;
+	if (command_len) {
+		size_t len = strcspn(end, "\r\n");
+
+		if (len >= command_len)
+			len = command_len - 1;
+		memcpy(command, end, len);
+		command[len] = '\0';
+	}
+	*pid = (pid_t)value;
+	return 0;
+}
+
+static int lock_owner_alive(pid_t pid)
+{
+	char path[64];
+	char comm[32];
+	FILE *fp;
+
+	if (pid <= 0)
+		return 0;
+	snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
+	fp = fopen(path, "r");
+	if (fp) {
+		int alive = 0;
+
+		if (fgets(comm, sizeof(comm), fp)) {
+			size_t len = strcspn(comm, "\r\n");
+
+			comm[len] = '\0';
+			alive = !strcmp(comm, "airliftctl");
+		}
+		fclose(fp);
+		return alive;
+	}
+	if (kill(pid, 0) == 0 || errno == EPERM)
+		return 1;
+	return 0;
+}
+
+static int airlift_lock_acquire(const char *command)
+{
+	char buf[80];
+	int attempt;
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		pid_t owner_pid = -1;
+		char owner_command[48];
+		int fd;
+		int len;
+
+		fd = open(AIRLIFT_LOCK_PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
+		if (fd >= 0) {
+			fcntl(fd, F_SETFD, FD_CLOEXEC);
+			len = snprintf(buf, sizeof(buf), "%ld %s\n",
+				       (long)getpid(), command);
+			if (len > 0) {
+				size_t write_len = (size_t)len < sizeof(buf) ?
+					(size_t)len : sizeof(buf) - 1;
+
+				write(fd, buf, write_len);
+			}
+			airlift_lock_fd = fd;
+			atexit(airlift_lock_release);
+			return 0;
+		}
+		if (errno != EEXIST) {
+			fprintf(stderr, "airliftctl: open %s: %s\n",
+				AIRLIFT_LOCK_PATH, strerror(errno));
+			return -1;
+		}
+
+		if (read_lock_owner(&owner_pid, owner_command,
+				    sizeof(owner_command)) < 0 ||
+		    !lock_owner_alive(owner_pid)) {
+			if (unlink(AIRLIFT_LOCK_PATH) < 0 && errno != ENOENT) {
+				fprintf(stderr, "airliftctl: remove stale %s: %s\n",
+					AIRLIFT_LOCK_PATH, strerror(errno));
+				return -1;
+			}
+			continue;
+		}
+
+		if (print_cached_airlift_info(command) == 0)
+			return 1;
+		if (owner_command[0]) {
+			fprintf(stderr, "airliftctl: AirLift SPI is busy; "
+				"airliftctl pid %ld owns %s for '%s'\n",
+				(long)owner_pid, AIRLIFT_LOCK_PATH,
+				owner_command);
+		} else {
+			fprintf(stderr, "airliftctl: AirLift SPI is busy; "
+				"airliftctl pid %ld owns %s\n",
+				(long)owner_pid, AIRLIFT_LOCK_PATH);
+		}
+		fprintf(stderr, "airliftctl: wait or run "
+			"'fruitjam-services stop' before '%s'\n",
+			command);
+		return -1;
+	}
+
+	fprintf(stderr, "airliftctl: could not acquire %s after stale lock cleanup\n",
+		AIRLIFT_LOCK_PATH);
+	return -1;
 }
 
 static int safe_root_path(const char *root, const char *arg, char *out, size_t out_len)
@@ -2602,6 +2821,38 @@ static int http_gpio_set_output(unsigned int gpio, int value)
 	return http_write_existing_file(path, value ? "1" : "0");
 }
 
+static int http_gpio_set_input(unsigned int gpio)
+{
+	char path[64];
+
+	http_gpio_export(gpio);
+	snprintf(path, sizeof(path), "/sys/class/gpio/gpio%u/direction", gpio);
+	return http_write_existing_file(path, "in");
+}
+
+static int http_usbhost_bus_reset(void)
+{
+	int ret = 0;
+
+	if (access(USBHOST_DEV, W_OK) == 0)
+		return http_write_existing_file(USBHOST_DEV, "reset 50");
+
+	if (http_gpio_set_output(11, 1) < 0)
+		ret = -1;
+	usleep(USBHOST_POST_RESET_US);
+	if (http_gpio_set_output(1, 0) < 0)
+		ret = -1;
+	if (http_gpio_set_output(2, 0) < 0)
+		ret = -1;
+	usleep(USBHOST_RESET_MS * 1000u);
+	if (http_gpio_set_input(1) < 0)
+		ret = -1;
+	if (http_gpio_set_input(2) < 0)
+		ret = -1;
+	usleep(USBHOST_POST_RESET_US);
+	return ret;
+}
+
 static int http_is_mounted(const char *mountpoint)
 {
 	FILE *fp = fopen("/proc/mounts", "r");
@@ -3188,9 +3439,78 @@ static const char *http_usb_device_state(int power, int dp, int dm)
 	return "invalid-both-lines-high";
 }
 
+static int http_status_text_int(const char *text, const char *key, int fallback)
+{
+	size_t key_len = strlen(key);
+	const char *p = text;
+	char *end;
+	long value;
+
+	while (p && *p) {
+		const char *line_end = strchr(p, '\n');
+		size_t line_len = line_end ? (size_t)(line_end - p) : strlen(p);
+
+		if (line_len > key_len && !strncmp(p, key, key_len) &&
+		    p[key_len] == ' ') {
+			errno = 0;
+			value = strtol(p + key_len + 1, &end, 0);
+			if (!errno && end != p + key_len + 1)
+				return (int)value;
+		}
+		if (!line_end)
+			break;
+		p = line_end + 1;
+	}
+
+	return fallback;
+}
+
+static void http_status_text_string(const char *text, const char *key,
+				    char *out, size_t out_len)
+{
+	size_t key_len = strlen(key);
+	const char *p = text;
+
+	if (!out_len)
+		return;
+	out[0] = '\0';
+	while (p && *p) {
+		const char *line_end = strchr(p, '\n');
+		size_t line_len = line_end ? (size_t)(line_end - p) : strlen(p);
+
+		if (line_len > key_len && !strncmp(p, key, key_len) &&
+		    p[key_len] == ' ') {
+			size_t n = line_len - key_len - 1;
+
+			if (n >= out_len)
+				n = out_len - 1;
+			memcpy(out, p + key_len + 1, n);
+			out[n] = '\0';
+			return;
+		}
+		if (!line_end)
+			break;
+		p = line_end + 1;
+	}
+}
+
 static void http_api_usbhost_body(const char *query, char *body, size_t body_len)
 {
 	char cmd[16];
+	char bridge_status[1024] = "";
+	char last_rx_hex[65] = "";
+	int bridge_ok = 0;
+	int pio_ready = 0;
+	int pio_configured = 0;
+	int packets = 0;
+	int tx_errors = 0;
+	int last_tx_result = 0;
+	int last_tx_len = 0;
+	int rx_attempts = 0;
+	int rx_errors = 0;
+	int last_rx_result = 0;
+	int last_rx_len = 0;
+	int last_rx_pid = 0;
 	int power;
 	int dp;
 	int dm;
@@ -3199,23 +3519,67 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 	if (!http_query_param(query, "cmd", cmd, sizeof(cmd)) || !cmd[0])
 		strcpy(cmd, "status");
 	if (!strcmp(cmd, "on")) {
-		if (http_gpio_set_output(11, 1) < 0) {
+		if (access(USBHOST_DEV, W_OK) == 0) {
+			if (http_write_existing_file(USBHOST_DEV, "on") < 0) {
+				http_json_error_body(body, body_len, "cannot enable USB host power");
+				return;
+			}
+		} else if (http_gpio_set_output(11, 1) < 0) {
 			http_json_error_body(body, body_len, "cannot enable USB host power");
 			return;
 		}
 	} else if (!strcmp(cmd, "off")) {
-		if (http_gpio_set_output(11, 0) < 0) {
+		if (access(USBHOST_DEV, W_OK) == 0) {
+			if (http_write_existing_file(USBHOST_DEV, "off") < 0) {
+				http_json_error_body(body, body_len, "cannot disable USB host power");
+				return;
+			}
+		} else if (http_gpio_set_output(11, 0) < 0) {
 			http_json_error_body(body, body_len, "cannot disable USB host power");
+			return;
+		}
+	} else if (!strcmp(cmd, "in-token") || !strcmp(cmd, "get-device-8")) {
+		if (access(USBHOST_DEV, W_OK) != 0) {
+			http_json_error_body(body, body_len,
+					     "USB host PIO probe requires kernel bridge");
+			return;
+		}
+		(void)http_write_existing_file(USBHOST_DEV, cmd);
+	} else if (!strcmp(cmd, "reset")) {
+		if (http_usbhost_bus_reset() < 0) {
+			http_json_error_body(body, body_len, "cannot reset USB host bus");
 			return;
 		}
 	} else if (strcmp(cmd, "status")) {
 		http_json_error_body(body, body_len, "bad USB host command");
-		return;
+			return;
 	}
 
-	power = http_gpio_value(11);
-	dp = http_gpio_value(1);
-	dm = http_gpio_value(2);
+	if (access(USBHOST_DEV, R_OK) == 0 &&
+	    http_read_text_file(USBHOST_DEV, bridge_status,
+				sizeof(bridge_status)) == 0) {
+		bridge_ok = 1;
+		power = http_status_text_int(bridge_status, "power", -1);
+		dp = http_status_text_int(bridge_status, "dp", -1);
+		dm = http_status_text_int(bridge_status, "dm", -1);
+		pio_ready = http_status_text_int(bridge_status, "pio_ready", 0);
+		pio_configured = http_status_text_int(bridge_status, "pio_configured", 0);
+		packets = http_status_text_int(bridge_status, "packets", 0);
+		tx_errors = http_status_text_int(bridge_status, "tx_errors", 0);
+		last_tx_result = http_status_text_int(bridge_status, "last_tx_result", 0);
+		last_tx_len = http_status_text_int(bridge_status, "last_tx_len", 0);
+		rx_attempts = http_status_text_int(bridge_status, "rx_attempts", 0);
+		rx_errors = http_status_text_int(bridge_status, "rx_errors", 0);
+		last_rx_result = http_status_text_int(bridge_status, "last_rx_result", 0);
+		last_rx_len = http_status_text_int(bridge_status, "last_rx_len", 0);
+		last_rx_pid = http_status_text_int(bridge_status, "last_rx_pid", 0);
+		http_status_text_string(bridge_status, "last_rx_hex", last_rx_hex,
+					sizeof(last_rx_hex));
+	} else {
+		power = http_gpio_value(11);
+		dp = http_gpio_value(1);
+		dm = http_gpio_value(2);
+	}
 	http_buf_init(&b, body, body_len);
 	http_buf_printf(&b,
 			"{\"ok\":%s,\"source\":\"airlift-direct-gpio\",\"cmd\":",
@@ -3223,7 +3587,34 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 	http_buf_json_string(&b, cmd);
 	http_buf_printf(&b, ",\"power\":%d,\"dp\":%d,\"dm\":%d,\"stack\":",
 			power, dp, dm);
-	http_buf_json_string(&b, "power/status only; no Linux PIO-USB host stack yet");
+	http_buf_json_string(&b, access(USBHOST_DEV, R_OK) == 0 ?
+			     "kernel bridge line-state; PIO2 host program staged; HID report polling not implemented yet" :
+			     "sysfs line-state only; PIO USB host/HID report polling not implemented yet");
+	http_buf_printf(&b, ",\"present\":%s,\"hid\":false,"
+			"\"driver\":\"%s\","
+			"\"pio_ready\":%s,"
+			"\"pio_configured\":%s,"
+			"\"packets\":%d,\"tx_errors\":%d,"
+			"\"last_tx_result\":%d,\"last_tx_len\":%d,"
+			"\"rx_attempts\":%d,\"rx_errors\":%d,"
+			"\"last_rx_result\":%d,\"last_rx_len\":%d,"
+			"\"last_rx_pid\":%d,\"last_rx_hex\":",
+			power > 0 &&
+			((dp == 1 && dm == 0) || (dp == 0 && dm == 1)) ?
+			"true" : "false",
+			bridge_ok ? "kernel-line-state" : "sysfs-line-state",
+			pio_ready ? "true" : "false",
+			pio_configured ? "true" : "false",
+			packets, tx_errors, last_tx_result, last_tx_len,
+			rx_attempts, rx_errors, last_rx_result, last_rx_len,
+			last_rx_pid);
+	http_buf_json_string(&b, last_rx_hex);
+	http_buf_printf(&b,
+			",\"probe_ok\":%s,\"next\":\"pio-packet-io\","
+			"\"first_milestone\":\"boot-protocol-keyboard\"",
+			rx_attempts > 0 && last_rx_result == 0 ? "true" : "false");
+	if (!strcmp(cmd, "reset"))
+		http_buf_printf(&b, ",\"reset_ms\":%u", USBHOST_RESET_MS);
 	http_buf_puts(&b, ",\"device\":");
 	http_buf_json_string(&b, http_usb_device_state(power, dp, dm));
 	http_buf_puts(&b, "}");
@@ -3678,6 +4069,8 @@ static int serve_http_client(struct airlift *air, uint8_t sock)
 	char line[192];
 	char target[160];
 	char path[192];
+	const char *root = SD_WEB_ROOT;
+	const char *file_target;
 	char *query;
 	char *sp;
 
@@ -3709,8 +4102,6 @@ static int serve_http_client(struct airlift *air, uint8_t sock)
 	query = strchr(target, '?');
 	if (query)
 		*query++ = '\0';
-	if (!strcmp(target, "/"))
-		snprintf(target, sizeof(target), "/index.html");
 	if (!strcmp(target, "/cgi-bin/fruitjam.cgi")) {
 		http_send_fruitjam_api(air, sock, query);
 		goto out;
@@ -3723,7 +4114,18 @@ static int serve_http_client(struct airlift *air, uint8_t sock)
 		http_reply_text(air, sock, 404, "Not Found", "cgi not found\n");
 		goto out;
 	}
-	if (safe_root_path(WWW_ROOT, target, path, sizeof(path)) < 0) {
+
+	file_target = target;
+	if (!strcmp(target, PLAYGROUND_PREFIX)) {
+		root = PLAYGROUND_ROOT;
+		file_target = "/";
+	} else if (!strncmp(target, PLAYGROUND_PREFIX "/", strlen(PLAYGROUND_PREFIX) + 1)) {
+		root = PLAYGROUND_ROOT;
+		file_target = target + strlen(PLAYGROUND_PREFIX);
+	}
+	if (!strcmp(file_target, "/"))
+		file_target = "/index.html";
+	if (safe_root_path(root, file_target, path, sizeof(path)) < 0) {
 		http_reply_text(air, sock, 403, "Forbidden", "bad path\n");
 		goto out;
 	}
@@ -5128,6 +5530,12 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return 2;
 	}
+
+	ret = airlift_lock_acquire(argv[arg]);
+	if (ret > 0)
+		return 0;
+	if (ret < 0)
+		return 1;
 
 	if (airlift_open(&air, spidev, verbose) < 0)
 		return 1;

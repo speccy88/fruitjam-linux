@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fred Makes <fred@example.com>
+Date: Tue, 16 Jun 2026 23:55:00 +0000
+Subject: [PATCH] misc: add fruitjam usbhost burst setup probe
+
+The fast gated probe still waits for the SETUP ACK before attempting the IN
+data stage.  Add a narrower diagnostic that sends SETUP token and DATA0 as a
+burst, intentionally ignores the handshake, and then probes the IN stage.  If a
+device returns descriptor bytes here, the setup stage succeeded and only the ACK
+capture path is late; if it still times out, the device did not accept the setup
+transaction.
+---
+ drivers/misc/fruitjam_usbhost.c | 78 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 222222222222..333333333333 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -2065,6 +2065,65 @@ static int fj_usbhost_pio_get_device8_fast(struct fruitjam_usbhost *uh)
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_get_device8_burst(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	/*
++	 * Diagnostic only: minimize the token-to-DATA0 gap, skip the ACK wait,
++	 * and see whether the device advances to the IN data stage.
++	 */
++	fj_usbhost_pio_disable_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_SETUP, 0, 0,
++					&encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	ret = fj_usbhost_pio_send_data0(uh, get_device8_setup,
++					sizeof(get_device8_setup),
++					&encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	fj_usbhost_pio_record_tx(uh, 0, encoded_len);
++
++	/*
++	 * Clear any late/stale handshake state, then ask for the first 8 bytes
++	 * of the descriptor.  This makes the result independent from whether
++	 * Linux saw the SETUP ACK in time.
++	 */
++	fj_usbhost_pio_disable_receive(uh);
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	fj_usbhost_pio_record_tx(uh, 0, encoded_len);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_send_sof(struct fruitjam_usbhost *uh, u16 frame,
+ 				   u8 *encoded_len)
+ {
+@@ -2147,6 +2206,13 @@ static int fj_usbhost_pio_get_device8_active_fast(struct fruitjam_usbhost *uh)
+ 	return ret ? ret : fj_usbhost_pio_get_device8_fast(uh);
+ }
+ 
++static int fj_usbhost_pio_get_device8_active_burst(struct fruitjam_usbhost *uh)
++{
++	int ret = fj_usbhost_pio_reset_active(uh);
++
++	return ret ? ret : fj_usbhost_pio_get_device8_burst(uh);
++}
++
+ static void fj_usbhost_pio_release(struct fruitjam_usbhost *uh)
+ {
+ 	if (!uh->pio)
+@@ -2426,6 +2492,8 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_combo(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_fast(uh);
++	} else if (!strcmp(cmd, "get-device-8-burst")) {
++		ret = fj_usbhost_pio_get_device8_burst(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8")) {
+ 		ret = fj_usbhost_pio_get_device8_active(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-gated")) {
+@@ -2434,6 +2502,8 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_active_combo(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_active_fast(uh);
++	} else if (!strcmp(cmd, "reset-get-device-8-burst")) {
++		ret = fj_usbhost_pio_get_device8_active_burst(uh);
+ 	} else if (!strcmp(cmd, "status")) {
+ 		/* read-only command for shell scripts that write then read */
+ 	} else {
+-- 
+2.39.5

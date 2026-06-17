@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 18:37:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost gated RX probes
+
+The first PIO transaction probes can self-receive, but real device responses
+arrive too quickly for Linux to clear the RX/EOP flags after host TX. Add
+diagnostic variants that gate the EOP detector on the TX-EOP IRQ in PIO
+hardware so receive starts after host transmit without depending on CPU timing.
+---
+ drivers/misc/fruitjam_usbhost.c | 130 +++++++++++++++++++++++++++++++
+ 1 file changed, 130 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index aaaaaaaaaaaa..bbbbbbbbbbbb 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -143,6 +143,8 @@
+ #define FJ_PIO_RX_OSR_ONES_INSTR	0xa0ebu
+ #define FJ_PIO_RX_SET_X_ZERO_INSTR	0xe020u
+ #define FJ_PIO_EOP_INIT_INSTR		(FJ_PIO_EOP_OFFSET)
++#define FJ_PIO_EOP_START_INSTR		(FJ_PIO_EOP_OFFSET + 1u)
++#define FJ_PIO_WAIT_TX_EOP_INSTR	0x20c0u
+ #define FJ_PIO_INSTR_OP_MASK		0xe000u
+ #define FJ_PIO_INSTR_JMP		0x0000u
+ #define FJ_PIO_INSTR_ADDR_MASK		0x001fu
+@@ -487,6 +489,55 @@ static void fj_usbhost_pio_clear_rx_irq(struct fruitjam_usbhost *uh)
+ 	}
+ }
+ 
++static void fj_usbhost_pio_clear_tx_irq(struct fruitjam_usbhost *uh)
++{
++	u32 waited;
++
++	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++	for (waited = 0; waited < FJ_USBHOST_FIFO_TIMEOUT_US; waited++) {
++		if (!(readl(uh->pio + FJ_PIO_IRQ) & FJ_PIO_IRQ_TX_EOP))
++			break;
++		udelay(1);
++	}
++}
++
++static void fj_usbhost_pio_disable_receive(struct fruitjam_usbhost *uh)
++{
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_eop);
++	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
++	fj_usbhost_pio_clear_rx_irq(uh);
++}
++
++static void fj_usbhost_pio_prepare_receive_after_tx(struct fruitjam_usbhost *uh)
++{
++	void __iomem *rx_sm = fj_usbhost_pio_sm(uh, uh->sm_rx);
++	void __iomem *eop_sm = fj_usbhost_pio_sm(uh, uh->sm_eop);
++
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_eop);
++	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
++	fj_usbhost_pio_clear_rx_irq(uh);
++	fj_usbhost_pio_clear_tx_irq(uh);
++
++	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
++	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++
++	/*
++	 * Jump past the EOP program's self-synchronizing entry point, then stall
++	 * on TX-EOP.  The TX program raises IRQ0 at host EOP, releasing this SM at
++	 * PIO timing so it watches only for the device response.
++	 */
++	fj_usbhost_pio_sm_restart(uh, uh->sm_eop);
++	writel(FJ_PIO_EOP_START_INSTR, eop_sm + FJ_PIO_SM_INSTR);
++	writel(FJ_PIO_WAIT_TX_EOP_INSTR, eop_sm + FJ_PIO_SM_INSTR);
++
++	fj_usbhost_pio_sm_enable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_eop);
++}
++
+ static void fj_usbhost_pio_configure_gpio(struct fruitjam_usbhost *uh)
+ {
+ 	u32 func = FJ_GPIO_FUNC_PIO0 + uh->pio_index;
+@@ -1215,6 +1266,85 @@ static int fj_usbhost_pio_get_device8(struct fruitjam_usbhost *uh)
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_in_token_gated(struct fruitjam_usbhost *uh)
++{
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	return fj_usbhost_pio_receive_raw(uh, false);
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
++static int fj_usbhost_pio_get_device8_gated(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	fj_usbhost_pio_disable_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_SETUP, 0, 0,
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_data0(uh, get_device8_setup,
++					sizeof(get_device8_setup),
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_receive_raw(uh, false);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	return fj_usbhost_pio_receive_raw(uh, true);
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static void fj_usbhost_pio_release(struct fruitjam_usbhost *uh)
+ {
+ 	if (!uh->pio)
+-- 
+2.39.5

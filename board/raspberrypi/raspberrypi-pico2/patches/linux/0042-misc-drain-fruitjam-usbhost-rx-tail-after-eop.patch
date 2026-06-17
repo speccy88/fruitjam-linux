@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 21:50:00 -0400
+Subject: [PATCH] misc: drain Fruit Jam usbhost RX tail after EOP
+
+The RX EOP detector can report packet completion before the decoder has pushed
+the last few bytes into the RX FIFO.  The first bounded drain only waited when
+the packet looked completely empty, which let longer self-RX packets truncate
+at EOP.  Keep draining until the FIFO has stayed quiet briefly after EOP, still
+with a hard bound so a broken packet cannot spin in the kernel.
+---
+ drivers/misc/fruitjam_usbhost.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1137,14 +1137,19 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ 			break;
+ 		}
+ 		if (irq & FJ_PIO_IRQ_RX_EOP) {
+-			u32 drain_waited;
++			u32 drain_waited, quiet;
+ 
+-			for (drain_waited = 0; !len && drain_waited < 50;
+-			     drain_waited++) {
++			for (drain_waited = 0, quiet = 0;
++			     drain_waited < 50 && quiet < 8; drain_waited++) {
++				u32 before = len;
++
+ 				FJ_USBHOST_DRAIN_RX_FIFO();
+-				if (len)
+-					break;
+-				udelay(1);
++				if (len == before)
++					quiet++;
++				else
++					quiet = 0;
++				if (quiet < 8)
++					udelay(1);
+ 			}
+ 			ret = len ? 0 : -ENODATA;
+ 			break;
+-- 
+2.39.5

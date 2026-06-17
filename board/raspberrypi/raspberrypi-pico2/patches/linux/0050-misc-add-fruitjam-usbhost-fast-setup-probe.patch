@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fred Makes <fred@example.com>
+Date: Tue, 16 Jun 2026 23:35:00 +0000
+Subject: [PATCH] misc: add fruitjam usbhost fast setup probe
+
+The diagnostic GET_DESCRIPTOR paths recorded TX status between the SETUP
+token and DATA0 packet, and again between the IN token and receive loop.  Those
+register reads are useful for bring-up, but they add a large host-side gap in
+the middle of timing-critical USB transactions.
+
+Add a fast gated probe that keeps the same PIO packet helpers but avoids debug
+reads between transaction phases.  This better matches Pico-PIO-USB's host
+sequence while still using the existing kernel bridge and status counters.
+---
+ drivers/misc/fruitjam_usbhost.c | 88 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1900,6 +1900,73 @@ static int fj_usbhost_pio_get_device8_gated(struct fruitjam_usbhost *uh)
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_get_device8_fast(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	/*
++	 * Do not record TX debug state between SETUP token and DATA0.  The
++	 * device expects the DATA0 packet immediately after the token phase.
++	 */
++	fj_usbhost_pio_disable_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_SETUP, 0, 0,
++					&encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_data0(uh, get_device8_setup,
++					sizeof(get_device8_setup),
++					&encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	ret = fj_usbhost_pio_receive_raw(uh, false);
++	fj_usbhost_pio_record_tx(uh, 0, encoded_len);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++
++	/*
++	 * Likewise, enter the receive loop immediately after the IN token.
++	 * An 8-byte descriptor packet is larger than the joined RX FIFO if the
++	 * CPU spends time reading diagnostics before draining it.
++	 */
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	fj_usbhost_pio_record_tx(uh, 0, encoded_len);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_send_sof(struct fruitjam_usbhost *uh, u16 frame,
+ 				   u8 *encoded_len)
+ {
+@@ -1948,6 +2015,13 @@ static int fj_usbhost_pio_get_device8_active_combo(struct fruitjam_usbhost *uh)
+ 	return ret ? ret : fj_usbhost_pio_get_device8_combo(uh);
+ }
+ 
++static int fj_usbhost_pio_get_device8_active_fast(struct fruitjam_usbhost *uh)
++{
++	int ret = fj_usbhost_pio_reset_active(uh);
++
++	return ret ? ret : fj_usbhost_pio_get_device8_fast(uh);
++}
++
+ static void fj_usbhost_pio_release(struct fruitjam_usbhost *uh)
+ {
+ 	if (!uh->pio)
+@@ -2330,12 +2404,16 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_gated_cpu(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-combo")) {
+ 		ret = fj_usbhost_pio_get_device8_combo(uh);
++	} else if (!strcmp(cmd, "get-device-8-fast")) {
++		ret = fj_usbhost_pio_get_device8_fast(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8")) {
+ 		ret = fj_usbhost_pio_get_device8_active(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-gated")) {
+ 		ret = fj_usbhost_pio_get_device8_active_gated(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-combo")) {
+ 		ret = fj_usbhost_pio_get_device8_active_combo(uh);
++	} else if (!strcmp(cmd, "reset-get-device-8-fast")) {
++		ret = fj_usbhost_pio_get_device8_active_fast(uh);
+ 	} else if (!strcmp(cmd, "status")) {
+ 		/* read-only command for shell scripts that write then read */
+ 	} else {
+-- 
+2.39.5

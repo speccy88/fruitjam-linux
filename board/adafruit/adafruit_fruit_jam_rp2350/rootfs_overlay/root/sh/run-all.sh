@@ -54,6 +54,9 @@ check_exec /usr/bin/fruitjam-adc
 check_exec /usr/bin/fruitjam-dvi
 check_exec /usr/bin/fruitjam-i2c
 check_exec /usr/bin/fruitjam-usbhost
+check_exec /usr/bin/fruitjam-hidkeys
+check_exec /usr/bin/fruitjam-mem
+check_exec /usr/bin/free
 check_exec /usr/bin/wget
 check_path /dev/neopixels
 check_path /dev/fruitjam-audio
@@ -126,8 +129,12 @@ do
 	echo "gpio$gpio value $value"
 done
 
+section memory
+fruitjam-mem
+
 section usbhost
-fruitjam-usbhost status
+sh /root/sh/14-usbhost-status.sh
+sh /root/sh/16-hidkeys-decode.sh
 
 section i2c
 fruitjam-i2c ping 0x18

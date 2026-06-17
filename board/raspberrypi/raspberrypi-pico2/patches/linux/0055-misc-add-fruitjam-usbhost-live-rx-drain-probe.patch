@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fred Makes <fred@example.com>
+Date: Wed, 17 Jun 2026 02:28:00 +0000
+Subject: [PATCH] misc: add fruitjam usbhost live rx drain probe
+
+The existing SETUP DATA0 self-RX probes intentionally leave the RX FIFO
+undrained until after TX has completed. On hardware the 12-byte DATA0 packet
+always reports as 9 bytes, which can be RX FIFO backpressure rather than a
+transmit-tail bug.
+
+Add a live-drain diagnostic that DMA-feeds the TX state machine while polling
+and draining the RX FIFO. This keeps the wire path close to the normal DMA
+transmitter but removes FIFO saturation as a variable, so the next hardware
+test can prove whether the full DATA0 packet, including CRC16, is visible.
+---
+ drivers/misc/fruitjam_usbhost.c | 160 ++++++++++++++++++++++++++++++++
+ 1 file changed, 160 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 666666666666..777777777777 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1088,6 +1088,98 @@ static void fj_usbhost_dma_abort(struct fruitjam_usbhost *uh)
+ 	writel(0, uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
+ }
+ 
++static int fj_usbhost_pio_tx_encoded_capture_dma(struct fruitjam_usbhost *uh,
++						 const u8 *encoded,
++						 u8 encoded_len,
++						 u32 *rx_len)
++{
++	u32 ch = uh->tx_dma_channel;
++	u32 ctrl;
++	u32 waited;
++	int ret = -ETIMEDOUT;
++
++	if (!uh->dma || !uh->pio_phys || ch > 15)
++		return -ENODEV;
++
++	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
++	*rx_len = 0;
++
++	fj_usbhost_dma_abort(uh);
++	memcpy(uh->tx_dma_buf, encoded, encoded_len);
++	wmb();
++
++	ctrl = FJ_DMA_CTRL_TREQ(fj_usbhost_pio_tx_dreq(uh)) |
++	       FJ_DMA_CTRL_CHAIN_TO(ch) |
++	       FJ_DMA_CTRL_INCR_READ |
++	       FJ_DMA_CTRL_SIZE_BYTE |
++	       FJ_DMA_CTRL_HIGH_PRIORITY |
++	       FJ_DMA_CTRL_IRQ_QUIET |
++	       FJ_DMA_CTRL_EN;
++
++	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++	writel(FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx), uh->pio + FJ_PIO_FDEBUG);
++	writel((u32)virt_to_phys(uh->tx_dma_buf),
++	       uh->dma + FJ_DMA_CH_READ_ADDR(ch));
++	writel((u32)(uh->pio_phys + FJ_PIO_TXF(uh->sm_tx)),
++	       uh->dma + FJ_DMA_CH_WRITE_ADDR(ch));
++	writel(encoded_len, uh->dma + FJ_DMA_CH_TRANS_COUNT(ch));
++	writel(FJ_PIO_TX_START_INSTR,
++	       fj_usbhost_pio_sm(uh, uh->sm_tx) + FJ_PIO_SM_INSTR);
++	writel(ctrl, uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++
++	for (waited = 0; waited < FJ_USBHOST_TX_TIMEOUT_US; waited++) {
++		u32 irq;
++
++		ret = fj_usbhost_pio_capture_drain(uh, rx_len);
++		if (ret)
++			break;
++
++		irq = readl(uh->pio + FJ_PIO_IRQ);
++		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
++			ret = -EILSEQ;
++			break;
++		}
++		if (irq & FJ_PIO_IRQ_TX_EOP) {
++			u32 drain_waited, quiet;
++
++			for (drain_waited = 0, quiet = 0;
++			     drain_waited < 50 && quiet < 8; drain_waited++) {
++				u32 before = *rx_len;
++
++				ret = fj_usbhost_pio_capture_drain(uh, rx_len);
++				if (ret)
++					break;
++				if (*rx_len == before)
++					quiet++;
++				else
++					quiet = 0;
++				if (quiet < 8)
++					udelay(1);
++			}
++			ret = ret ?: 0;
++			break;
++		}
++		udelay(1);
++	}
++
++	for (waited = 0; waited < FJ_USBHOST_DMA_TIMEOUT_US; waited++) {
++		if (!(readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch)) &
++		      FJ_DMA_CTRL_BUSY))
++			break;
++		udelay(1);
++	}
++
++	uh->last_dma_ctrl = readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++	if (uh->last_dma_ctrl & (FJ_DMA_CTRL_AHB_ERROR |
++				 FJ_DMA_CTRL_READ_ERROR |
++				 FJ_DMA_CTRL_WRITE_ERROR))
++		ret = ret ?: -EIO;
++	uh->last_dma_result = ret;
++	if (!ret)
++		uh->tx_dma_packets++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_tx_encoded_dma(struct fruitjam_usbhost *uh,
+ 					 const u8 *encoded, u8 encoded_len)
+ {
+@@ -1918,6 +2010,72 @@ out_error:
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_setup_data_self_rx_drain(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 packet[16];
++	u8 encoded[FJ_USBHOST_TX_ENCODED_MAX];
++	u8 encoded_len;
++	u32 rx_len = 0;
++	u16 crc;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	packet[0] = FJ_USB_SYNC;
++	packet[1] = FJ_USB_PID_DATA0;
++	memcpy(packet + 2, get_device8_setup, sizeof(get_device8_setup));
++	crc = fj_usbhost_crc16_data(get_device8_setup, sizeof(get_device8_setup));
++	packet[10] = crc & 0xff;
++	packet[11] = crc >> 8;
++
++	encoded_len = fj_usbhost_encode_tx(packet, 12, encoded);
++	if (encoded_len > sizeof(encoded)) {
++		ret = -EOVERFLOW;
++		goto out_error;
++	}
++
++	fj_usbhost_pio_prepare_receive(uh);
++	fj_usbhost_pio_clear_rx_irq(uh);
++	ret = fj_usbhost_pio_tx_encoded_capture_dma(uh, encoded, encoded_len,
++						    &rx_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_record_rx(uh, ret, rx_len);
++	if (!ret)
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "setup-data-self-rx-drain expected=12 got=%u", rx_len);
++	else
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "setup-data-self-rx-drain error=%d got=%u", ret,
++			  rx_len);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->last_rx_irq = uh->pio ? readl(uh->pio + FJ_PIO_IRQ) : 0;
++	uh->last_rx_flevel = uh->pio ? readl(uh->pio + FJ_PIO_FLEVEL) : 0;
++	uh->last_pio_fstat = uh->pio ? readl(uh->pio + FJ_PIO_FSTAT) : 0;
++	uh->last_pio_fdebug = uh->pio ? readl(uh->pio + FJ_PIO_FDEBUG) : 0;
++	uh->last_pio_irq = uh->last_rx_irq;
++	uh->rx_errors++;
++	scnprintf(uh->last_probe_summary,
++		  sizeof(uh->last_probe_summary),
++		  "setup-data-self-rx-drain setup-error=%d", ret);
++	return ret;
++}
++
+ static int fj_usbhost_pio_get_device8(struct fruitjam_usbhost *uh)
+ {
+ 	static const u8 get_device8_setup[8] = {
+@@ -2763,6 +2921,8 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_setup_data_self_rx_noeop(uh);
+ 	} else if (!strcmp(cmd, "setup-data-self-rx-cpu")) {
+ 		ret = fj_usbhost_pio_setup_data_self_rx_cpu(uh);
++	} else if (!strcmp(cmd, "setup-data-self-rx-drain")) {
++		ret = fj_usbhost_pio_setup_data_self_rx_drain(uh);
+ 	} else if (!strcmp(cmd, "data-len-sweep")) {
+ 		ret = fj_usbhost_pio_data_len_sweep(uh);
+ 	} else if (!strcmp(cmd, "get-device-8")) {
+-- 
+2.39.5

@@ -33,6 +33,9 @@
 #define WAV_BIN "/usr/bin/fruitjam-wavplay"
 #define WAV_DIR "/mnt/sd/wavs"
 #define FRUITJAMCTL_BIN "/usr/bin/fruitjamctl"
+#define USBHOST_DEV "/dev/fruitjam-usbhost"
+#define USBHOST_RESET_MS 50u
+#define USBHOST_POST_RESET_US 100000u
 #define BERRY_SCRIPT_MAX 63
 #define WAV_FILE_MAX 95
 #define WAV_LIST_MAX 64
@@ -44,6 +47,7 @@ static const char *const berry_scripts[] = {
 	"03-buttons.be",
 	"04-adc-summary.be",
 	"05-usbhost-status.be",
+	"06-fruitjam-module.be",
 	"neopixels.be",
 	"neopixel-colors.be",
 	"neopixel-rainbow-10s.be",
@@ -395,6 +399,38 @@ static int gpio_set_output(unsigned int gpio, int value)
 	return write_existing_file(path, value ? "1" : "0");
 }
 
+static int gpio_set_input(unsigned int gpio)
+{
+	char path[64];
+
+	gpio_export(gpio);
+	snprintf(path, sizeof(path), "/sys/class/gpio/gpio%u/direction", gpio);
+	return write_existing_file(path, "in");
+}
+
+static int usbhost_bus_reset(void)
+{
+	int ret = 0;
+
+	if (access(USBHOST_DEV, W_OK) == 0)
+		return write_existing_file(USBHOST_DEV, "reset 50");
+
+	if (gpio_set_output(11, 1) < 0)
+		ret = -1;
+	usleep(USBHOST_POST_RESET_US);
+	if (gpio_set_output(1, 0) < 0)
+		ret = -1;
+	if (gpio_set_output(2, 0) < 0)
+		ret = -1;
+	usleep(USBHOST_RESET_MS * 1000u);
+	if (gpio_set_input(1) < 0)
+		ret = -1;
+	if (gpio_set_input(2) < 0)
+		ret = -1;
+	usleep(USBHOST_POST_RESET_US);
+	return ret;
+}
+
 static void print_button_json(const char *name, unsigned int gpio)
 {
 	int value = gpio_value(gpio);
@@ -602,9 +638,78 @@ static const char *usb_device_state(int power, int dp, int dm)
 	return "invalid-both-lines-high";
 }
 
+static int status_text_int(const char *text, const char *key, int fallback)
+{
+	size_t key_len = strlen(key);
+	const char *p = text;
+	char *end;
+	long value;
+
+	while (p && *p) {
+		const char *line_end = strchr(p, '\n');
+		size_t line_len = line_end ? (size_t)(line_end - p) : strlen(p);
+
+		if (line_len > key_len && !strncmp(p, key, key_len) &&
+		    p[key_len] == ' ') {
+			errno = 0;
+			value = strtol(p + key_len + 1, &end, 0);
+			if (!errno && end != p + key_len + 1)
+				return (int)value;
+		}
+		if (!line_end)
+			break;
+		p = line_end + 1;
+	}
+
+	return fallback;
+}
+
+static void status_text_string(const char *text, const char *key,
+			       char *out, size_t out_len)
+{
+	size_t key_len = strlen(key);
+	const char *p = text;
+
+	if (!out_len)
+		return;
+	out[0] = '\0';
+	while (p && *p) {
+		const char *line_end = strchr(p, '\n');
+		size_t line_len = line_end ? (size_t)(line_end - p) : strlen(p);
+
+		if (line_len > key_len && !strncmp(p, key, key_len) &&
+		    p[key_len] == ' ') {
+			size_t n = line_len - key_len - 1;
+
+			if (n >= out_len)
+				n = out_len - 1;
+			memcpy(out, p + key_len + 1, n);
+			out[n] = '\0';
+			return;
+		}
+		if (!line_end)
+			break;
+		p = line_end + 1;
+	}
+}
+
 static void action_usbhost(void)
 {
 	const char *cmd = param("cmd");
+	char bridge_status[1024] = "";
+	char last_rx_hex[65] = "";
+	int bridge_ok = 0;
+	int pio_ready = 0;
+	int pio_configured = 0;
+	int packets = 0;
+	int tx_errors = 0;
+	int last_tx_result = 0;
+	int last_tx_len = 0;
+	int rx_attempts = 0;
+	int rx_errors = 0;
+	int last_rx_result = 0;
+	int last_rx_len = 0;
+	int last_rx_pid = 0;
 	int power;
 	int dp;
 	int dm;
@@ -612,29 +717,87 @@ static void action_usbhost(void)
 	if (!cmd || !*cmd)
 		cmd = "status";
 	if (!strcmp(cmd, "on")) {
-		if (gpio_set_output(11, 1) < 0) {
+		if (access(USBHOST_DEV, W_OK) == 0) {
+			if (write_existing_file(USBHOST_DEV, "on") < 0) {
+				json_error("cannot enable USB host power");
+				return;
+			}
+		} else if (gpio_set_output(11, 1) < 0) {
 			json_error("cannot enable USB host power");
 			return;
 		}
 	} else if (!strcmp(cmd, "off")) {
-		if (gpio_set_output(11, 0) < 0) {
+		if (access(USBHOST_DEV, W_OK) == 0) {
+			if (write_existing_file(USBHOST_DEV, "off") < 0) {
+				json_error("cannot disable USB host power");
+				return;
+			}
+		} else if (gpio_set_output(11, 0) < 0) {
 			json_error("cannot disable USB host power");
+			return;
+		}
+	} else if (!strcmp(cmd, "in-token") || !strcmp(cmd, "get-device-8")) {
+		if (access(USBHOST_DEV, W_OK) != 0) {
+			json_error("USB host PIO probe requires kernel bridge");
+			return;
+		}
+		(void)write_existing_file(USBHOST_DEV, cmd);
+	} else if (!strcmp(cmd, "reset")) {
+		if (usbhost_bus_reset() < 0) {
+			json_error("cannot reset USB host bus");
 			return;
 		}
 	} else if (strcmp(cmd, "status")) {
 		json_error("bad USB host command");
-		return;
+			return;
 	}
 
-	power = gpio_value(11);
-	dp = gpio_value(1);
-	dm = gpio_value(2);
+	if (access(USBHOST_DEV, R_OK) == 0 &&
+	    read_text_file(USBHOST_DEV, bridge_status, sizeof(bridge_status)) == 0) {
+		bridge_ok = 1;
+		power = status_text_int(bridge_status, "power", -1);
+		dp = status_text_int(bridge_status, "dp", -1);
+		dm = status_text_int(bridge_status, "dm", -1);
+		pio_ready = status_text_int(bridge_status, "pio_ready", 0);
+		pio_configured = status_text_int(bridge_status, "pio_configured", 0);
+		packets = status_text_int(bridge_status, "packets", 0);
+		tx_errors = status_text_int(bridge_status, "tx_errors", 0);
+		last_tx_result = status_text_int(bridge_status, "last_tx_result", 0);
+		last_tx_len = status_text_int(bridge_status, "last_tx_len", 0);
+		rx_attempts = status_text_int(bridge_status, "rx_attempts", 0);
+		rx_errors = status_text_int(bridge_status, "rx_errors", 0);
+		last_rx_result = status_text_int(bridge_status, "last_rx_result", 0);
+		last_rx_len = status_text_int(bridge_status, "last_rx_len", 0);
+		last_rx_pid = status_text_int(bridge_status, "last_rx_pid", 0);
+		status_text_string(bridge_status, "last_rx_hex", last_rx_hex,
+				   sizeof(last_rx_hex));
+	} else {
+		power = gpio_value(11);
+		dp = gpio_value(1);
+		dm = gpio_value(2);
+	}
 	printf("{\"ok\":%s,\"source\":\"direct-cgi-gpio\",\"cmd\":",
 	       power >= 0 ? "true" : "false");
 	json_string(cmd);
 	printf(",\"power\":%d,\"dp\":%d,\"dm\":%d,\"stack\":",
 	       power, dp, dm);
-	json_string("power/status only; no Linux PIO-USB host stack yet");
+	json_string(access(USBHOST_DEV, R_OK) == 0 ?
+		    "kernel bridge line-state; PIO2 host program staged; HID report polling not implemented yet" :
+		    "sysfs line-state only; PIO USB host/HID report polling not implemented yet");
+	printf(",\"present\":%s,\"hid\":false,\"driver\":\"%s\",\"pio_ready\":%s,\"pio_configured\":%s,\"packets\":%d,\"tx_errors\":%d,\"last_tx_result\":%d,\"last_tx_len\":%d,\"rx_attempts\":%d,\"rx_errors\":%d,\"last_rx_result\":%d,\"last_rx_len\":%d,\"last_rx_pid\":%d,\"last_rx_hex\":",
+	       power > 0 && ((dp == 1 && dm == 0) || (dp == 0 && dm == 1)) ?
+	       "true" : "false",
+	       bridge_ok ? "kernel-line-state" : "sysfs-line-state",
+	       pio_ready ? "true" : "false",
+	       pio_configured ? "true" : "false",
+	       packets, tx_errors, last_tx_result, last_tx_len,
+	       rx_attempts, rx_errors, last_rx_result, last_rx_len,
+	       last_rx_pid);
+	json_string(last_rx_hex);
+	printf(",\"probe_ok\":%s,\"next\":\"pio-packet-io\",\"first_milestone\":\"boot-protocol-keyboard\"",
+	       rx_attempts > 0 && last_rx_result == 0 ? "true" : "false");
+	if (!strcmp(cmd, "reset"))
+		printf(",\"reset_ms\":%u", USBHOST_RESET_MS);
 	printf(",\"device\":");
 	json_string(usb_device_state(power, dp, dm));
 	puts("}");

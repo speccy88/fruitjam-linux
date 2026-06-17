@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 13:20:00 -0400
+Subject: [PATCH] misc: initialize Fruit Jam usbhost TX idle latch
+
+Pico-PIO-USB initializes the TX state machine's output latch to the
+full-speed idle J state before handing D+/D- to PIO.  The Fruit Jam bridge
+configured the pin mux and PIO side-set program, but did not seed that latch.
+
+Mirror the upstream setup by executing SET PINS against the TX state machine
+for D+ high and D- low while preserving the normal TX pinctrl/execctrl
+configuration.
+---
+ drivers/misc/fruitjam_usbhost.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 555555555555..666666666666 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -116,6 +116,7 @@
+ #define FJ_PIO_EXECCTRL_JMP_PIN(v)	(((v) & 0x1f) << 24)
+ #define FJ_PIO_EXECCTRL_WRAP_TOP(v)	(((v) & 0x1f) << 12)
+ #define FJ_PIO_EXECCTRL_WRAP_BOTTOM(v)	(((v) & 0x1f) << 7)
++#define FJ_PIO_EXECCTRL_OUT_STICKY	BIT(17)
+ #define FJ_PIO_SHIFTCTRL_FJOIN_TX	BIT(30)
+ #define FJ_PIO_SHIFTCTRL_FJOIN_RX	BIT(31)
+ #define FJ_PIO_SHIFTCTRL_PULL_THRESH(v)	(((v) & 0x1f) << 25)
+@@ -150,6 +151,7 @@
+ #define FJ_PIO_INSTR_OP_MASK		0xe000u
+ #define FJ_PIO_INSTR_JMP		0x0000u
+ #define FJ_PIO_INSTR_ADDR_MASK		0x001fu
++#define FJ_PIO_SET_PINS_INSTR(v)	(0xe000u | ((v) & 0x1fu))
+ 
+ #define FJ_SIO_GPIO_IN			0x004
+ #define FJ_SIO_GPIO_HI_IN		0x008
+@@ -441,6 +443,31 @@ static void fj_usbhost_bus_reset_override(struct fruitjam_usbhost *uh,
+ 	fj_gpio_bus_reset_override(uh, uh->dm_gpio, assert);
+ }
+ 
++static void fj_usbhost_pio_set_pin_latch(struct fruitjam_usbhost *uh,
++					 u32 sm, u32 gpio, bool high)
++{
++	void __iomem *sm_base = fj_usbhost_pio_sm(uh, sm);
++	u32 saved_pinctrl;
++	u32 saved_execctrl;
++	u32 execctrl;
++
++	if (gpio > 31)
++		return;
++
++	saved_pinctrl = readl(sm_base + FJ_PIO_SM_PINCTRL);
++	saved_execctrl = readl(sm_base + FJ_PIO_SM_EXECCTRL);
++	execctrl = saved_execctrl & ~FJ_PIO_EXECCTRL_OUT_STICKY;
++
++	writel(execctrl, sm_base + FJ_PIO_SM_EXECCTRL);
++	writel(FJ_PIO_PINCTRL_SET_COUNT(1) |
++	       FJ_PIO_PINCTRL_SET_BASE(gpio),
++	       sm_base + FJ_PIO_SM_PINCTRL);
++	writel(FJ_PIO_SET_PINS_INSTR(high ? 1 : 0),
++	       sm_base + FJ_PIO_SM_INSTR);
++	writel(saved_pinctrl, sm_base + FJ_PIO_SM_PINCTRL);
++	writel(saved_execctrl, sm_base + FJ_PIO_SM_EXECCTRL);
++}
++
+ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+ {
+ 	u32 pin_base = min(uh->dp_gpio, uh->dm_gpio);
+@@ -460,6 +487,9 @@ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+ 
+ 	fj_usbhost_pio_configure_gpio(uh);
+ 
++	fj_usbhost_pio_set_pin_latch(uh, uh->sm_tx, uh->dp_gpio, true);
++	fj_usbhost_pio_set_pin_latch(uh, uh->sm_tx, uh->dm_gpio, false);
++
+ 	writel(fj_usbhost_clkdiv(uh, 48000000u), tx_sm + FJ_PIO_SM_CLKDIV);
+ 	writel(FJ_PIO_EXECCTRL_WRAP_TOP(FJ_PIO_TX_WRAP) |
+ 	       FJ_PIO_EXECCTRL_WRAP_BOTTOM(FJ_PIO_TX_WRAP_TARGET),
+-- 
+2.39.5

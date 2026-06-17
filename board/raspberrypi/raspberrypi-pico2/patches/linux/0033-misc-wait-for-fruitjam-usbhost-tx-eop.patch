@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 13:24:00 -0400
+Subject: [PATCH] misc: wait for Fruit Jam usbhost TX EOP
+
+The PIO TXSTALL debug bit is not a packet-complete signal.  It can latch
+briefly while DMA starts feeding the TX FIFO, and it also appears naturally
+when the TX state machine is parked after a transfer.
+
+Match Pico-PIO-USB's completion criterion by waiting for the explicit TX EOP
+IRQ before the host transaction code clears RX flags and waits for the device
+response.
+---
+ drivers/misc/fruitjam_usbhost.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 777777777777..888888888888 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -761,24 +761,22 @@ static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
+ 	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
+ 	u32 waited;
+ 
++	/* TXSTALL can latch during DMA startup or idle; EOP is completion. */
+ 	for (waited = 0; waited < FJ_USBHOST_TX_TIMEOUT_US; waited++) {
+ 		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
+-		u32 fdebug = readl(uh->pio + FJ_PIO_FDEBUG);
+ 
+ 		if (irq & FJ_PIO_IRQ_TX_EOP) {
+ 			writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
+ 			for (waited = 0; waited < FJ_USBHOST_FIFO_TIMEOUT_US; waited++) {
+ 				if ((readl(tx_sm + FJ_PIO_SM_ADDR) & 0x1f) >=
+ 				    FJ_USB_TX_ENCODED_COMP)
+ 					break;
+ 				udelay(1);
+ 			}
+ 			return 0;
+ 		}
+-		if (fdebug & FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx))
+-			return 0;
+ 		udelay(1);
+ 	}
+ 
+ 	return -ETIMEDOUT;
+ }
+-- 
+2.39.5

@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fred Makes <fred@example.com>
+Date: Wed, 17 Jun 2026 01:36:00 +0000
+Subject: [PATCH] misc: add fruitjam usbhost tight setup probe
+
+The fast and streamed diagnostics bracket the SETUP transaction in useful but
+non-upstream ways.  Add a tighter diagnostic that mirrors Pico-PIO-USB's normal
+host setup flow more closely: prepare RX before the SETUP token, send SETUP and
+DATA0 without reading debug registers between them, then clear RX IRQs after the
+DATA0 packet before waiting for the device handshake.
+
+This keeps the token-to-DATA0 gap as small as the current Linux bridge can make
+it while preserving a normal packet release between the two packets.
+---
+ drivers/misc/fruitjam_usbhost.c | 81 ++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 555555555555..666666666666 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -2043,6 +2043,69 @@ static int fj_usbhost_pio_get_device8_fast(struct fruitjam_usbhost *uh)
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_get_device8_tight(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	/*
++	 * Mirror upstream Pico-PIO-USB setup timing: prepare RX before the
++	 * token, keep the SETUP token and DATA0 sends adjacent, then clear RX
++	 * IRQs after the DATA0 packet before waiting for the device ACK.
++	 */
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_SETUP, 0, 0,
++					&encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	ret = fj_usbhost_pio_send_data0(uh, get_device8_setup,
++					sizeof(get_device8_setup),
++					&encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	fj_usbhost_pio_clear_rx_irq(uh);
++	ret = fj_usbhost_pio_receive_raw(uh, false);
++	fj_usbhost_pio_record_tx(uh, 0, encoded_len);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	if (ret) {
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		return ret;
++	}
++	fj_usbhost_pio_clear_rx_irq(uh);
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	fj_usbhost_pio_record_tx(uh, 0, encoded_len);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_get_device8_burst(struct fruitjam_usbhost *uh)
+ {
+ 	static const u8 get_device8_setup[8] = {
+@@ -2203,6 +2265,13 @@ static int fj_usbhost_pio_get_device8_active_fast(struct fruitjam_usbhost *uh)
+ 	return ret ? ret : fj_usbhost_pio_get_device8_fast(uh);
+ }
+ 
++static int fj_usbhost_pio_get_device8_active_tight(struct fruitjam_usbhost *uh)
++{
++	int ret = fj_usbhost_pio_reset_active(uh);
++
++	return ret ? ret : fj_usbhost_pio_get_device8_tight(uh);
++}
++
+ static int fj_usbhost_pio_get_device8_active_burst(struct fruitjam_usbhost *uh)
+ {
+ 	int ret = fj_usbhost_pio_reset_active(uh);
+@@ -2530,5 +2599,7 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 	} else if (!strcmp(cmd, "get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_fast(uh);
++	} else if (!strcmp(cmd, "get-device-8-tight")) {
++		ret = fj_usbhost_pio_get_device8_tight(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-burst")) {
+ 		ret = fj_usbhost_pio_get_device8_burst(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-stream")) {
+@@ -2548,5 +2620,7 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 	} else if (!strcmp(cmd, "reset-get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_active_fast(uh);
++	} else if (!strcmp(cmd, "reset-get-device-8-tight")) {
++		ret = fj_usbhost_pio_get_device8_active_tight(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-burst")) {
+ 		ret = fj_usbhost_pio_get_device8_active_burst(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-stream")) {
+-- 
+2.39.5

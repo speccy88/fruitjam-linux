@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 19:25:00 -0400
+Subject: [PATCH] misc: preserve Fruit Jam usbhost TX-EOP after DMA start
+
+The DMA transmit path cleared TX-EOP before starting the state machine, then
+cleared it again immediately after enabling DMA.  Short USB packets can finish
+before the CPU reaches the second clear, which erases the completion bit that
+fj_usbhost_pio_wait_tx_complete() needs to see.  Leave TX-EOP latched after DMA
+start so both ordinary and gated probes can observe completion reliably.
+---
+ drivers/misc/fruitjam_usbhost.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index cccccccccccc..dddddddddddd 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -909,7 +909,10 @@ static int fj_usbhost_pio_tx_encoded_dma(struct fruitjam_usbhost *uh,
+ 	writel(FJ_PIO_TX_START_INSTR,
+ 	       fj_usbhost_pio_sm(uh, uh->sm_tx) + FJ_PIO_SM_INSTR);
+ 	writel(ctrl, uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
+-	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++	/*
++	 * Leave TX-EOP latched for fj_usbhost_pio_wait_tx_complete(); short
++	 * packets can finish before the CPU reaches this point.
++	 */
+ 
+ 	ret = fj_usbhost_pio_wait_tx_complete(uh);
+ 	for (waited = 0; waited < FJ_USBHOST_DMA_TIMEOUT_US; waited++) {
+-- 
+2.39.5

@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 00:00:00 +0000
+Subject: [PATCH] misc: relocate Fruit Jam usbhost PIO jump targets
+
+The Fruit Jam USB host bridge loads the Pico-PIO-USB TX, RX, and EOP
+programs as one 32-word block. TX starts at offset 0, but RX starts at
+offset 5 and EOP starts at offset 15. Their generated PIO JMP
+instructions are relative to each subprogram origin and need the same
+offset relocation that Pico-PIO-USB applies when copying PIO programs.
+
+Without this relocation, the RX/EOP state machines jump into the wrong
+instruction ranges, so TX can complete while RX never sees packet start
+or EOP.
+---
+ drivers/misc/fruitjam_usbhost.c | 35 ++++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 333333333333..444444444444 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -140,6 +140,9 @@
+ #define FJ_PIO_TX_INIT_INSTR		(FJ_PIO_TX_J_SIDE | 1u)
+ #define FJ_PIO_RX_INIT_INSTR		(FJ_PIO_RX_OFFSET)
+ #define FJ_PIO_RX_OSR_ONES_INSTR	0xe020u
++#define FJ_PIO_INSTR_OP_MASK		0xe000u
++#define FJ_PIO_INSTR_JMP		0x0000u
++#define FJ_PIO_INSTR_ADDR_MASK		0x001fu
+ 
+ #define FJ_SIO_GPIO_IN			0x004
+ #define FJ_SIO_GPIO_HI_IN		0x008
+@@ -250,6 +253,27 @@ static const u16 fj_usbhost_pio_program[FJ_USBHOST_PIO_PROGRAM_WORDS] = {
+ 	0x00ca, 0x0006,
+ };
+ 
++static u32 fj_usbhost_pio_program_offset(u32 index)
++{
++	if (index >= FJ_PIO_EOP_OFFSET)
++		return FJ_PIO_EOP_OFFSET;
++	if (index >= FJ_PIO_RX_OFFSET)
++		return FJ_PIO_RX_OFFSET;
++	return FJ_PIO_TX_OFFSET;
++}
++
++static u16 fj_usbhost_pio_relocate_instr(u16 instr, u32 offset)
++{
++	u16 target;
++
++	if ((instr & FJ_PIO_INSTR_OP_MASK) != FJ_PIO_INSTR_JMP)
++		return instr;
++
++	target = (instr & FJ_PIO_INSTR_ADDR_MASK) + offset;
++	return (instr & ~FJ_PIO_INSTR_ADDR_MASK) |
++	       (target & FJ_PIO_INSTR_ADDR_MASK);
++}
++
+ static u32 fj_gpio_mask(unsigned int gpio)
+ {
+ 	return BIT(gpio & 31);
+@@ -570,9 +594,14 @@ static int fj_usbhost_pio_init(struct fruitjam_usbhost *uh)
+ 		return -ETIMEDOUT;
+ 
+ 	writel(0, uh->pio + FJ_PIO_GPIOBASE);
+-	for (i = 0; i < ARRAY_SIZE(fj_usbhost_pio_program); i++)
+-		writel(fj_usbhost_pio_program[i],
++	for (i = 0; i < ARRAY_SIZE(fj_usbhost_pio_program); i++) {
++		u32 offset = fj_usbhost_pio_program_offset(i);
++		u16 instr = fj_usbhost_pio_relocate_instr(
++			fj_usbhost_pio_program[i], offset);
++
++		writel(instr,
+ 		       uh->pio + FJ_PIO_INSTR_MEM + i * 4);
++	}
+ 	wmb();
+ 
+ 	uh->pio_ready = true;
+-- 
+2.39.5

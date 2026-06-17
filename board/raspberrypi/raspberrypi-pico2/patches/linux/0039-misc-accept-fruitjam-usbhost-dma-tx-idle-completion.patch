@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 19:40:00 -0400
+Subject: [PATCH] misc: accept Fruit Jam usbhost DMA TX idle completion
+
+The gated RX probe lets the EOP state machine wait on TX-EOP so receive begins
+at PIO timing.  That can consume the IRQ before the CPU completion loop observes
+it.  Keep the IRQ path as the preferred completion signal, but also accept the
+DMA path returning to the TX wrap target with no DMA error and TXSTALL latched
+after the per-packet clear.
+---
+ drivers/misc/fruitjam_usbhost.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index dddddddddddd..eeeeeeeeeeee 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -760,6 +760,29 @@ static int fj_usbhost_pio_write_tx_byte(struct fruitjam_usbhost *uh, u8 byte)
+ 	return -ETIMEDOUT;
+ }
+ 
++static bool fj_usbhost_pio_dma_tx_idle(struct fruitjam_usbhost *uh,
++				       void __iomem *tx_sm)
++{
++	u32 ch = uh->tx_dma_channel;
++	u32 dma_ctrl;
++	u32 tx_addr;
++	u32 fdebug;
++
++	if (!uh->dma || ch > 15)
++		return false;
++
++	dma_ctrl = readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++	if (dma_ctrl & (FJ_DMA_CTRL_BUSY | FJ_DMA_CTRL_AHB_ERROR |
++			FJ_DMA_CTRL_READ_ERROR | FJ_DMA_CTRL_WRITE_ERROR))
++		return false;
++
++	tx_addr = readl(tx_sm + FJ_PIO_SM_ADDR) & 0x1f;
++	fdebug = readl(uh->pio + FJ_PIO_FDEBUG);
++
++	return tx_addr == FJ_PIO_TX_WRAP_TARGET &&
++	       (fdebug & FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx));
++}
++
+ static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
+ {
+ 	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
+@@ -829,5 +852,8 @@ static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
+ 			return 0;
+ 		}
++		if (fj_usbhost_pio_dma_tx_idle(uh, tx_sm))
++			return 0;
++
+ 		udelay(1);
+ 	}
+ 
+-- 
+2.39.5

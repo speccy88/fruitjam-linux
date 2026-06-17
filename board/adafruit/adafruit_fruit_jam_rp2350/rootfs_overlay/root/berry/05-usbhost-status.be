@@ -102,4 +102,5 @@ end
 print("usbhost power gpio11=" + str(power))
 print("usbhost dp gpio1=" + str(dp) + " dm gpio2=" + str(dm))
 print("usbhost device " + device)
+print("usbhost hid-ready sysfs-line-state; next pio-packet-io")
 print("05-usbhost-status.be: ok")

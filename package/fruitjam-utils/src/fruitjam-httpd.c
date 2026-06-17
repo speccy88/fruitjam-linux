@@ -4,8 +4,9 @@
  *
  * BusyBox httpd is useful, but the flat binary can require a larger
  * contiguous allocation than is available while AirLift services are resident.
- * This helper only serves /www and the two Fruit Jam CGI endpoints needed by
- * local wget tests.
+ * This helper serves user web files from /mnt/sd/www, the built-in hardware
+ * playground from /www at /playground, and the two Fruit Jam CGI endpoints
+ * needed by local wget tests.
  */
 
 #define _DEFAULT_SOURCE
@@ -25,7 +26,15 @@
 #include <unistd.h>
 
 #define DEFAULT_PORT 80
-#define WWW_ROOT "/www"
+#ifndef PLAYGROUND_ROOT
+#define PLAYGROUND_ROOT "/www"
+#endif
+#ifndef SD_WEB_ROOT
+#define SD_WEB_ROOT "/mnt/sd/www"
+#endif
+#ifndef PLAYGROUND_PREFIX
+#define PLAYGROUND_PREFIX "/playground"
+#endif
 
 static int write_all(int fd, const char *buf, size_t len)
 {
@@ -84,7 +93,7 @@ static const char *content_type(const char *path)
 	return "application/octet-stream";
 }
 
-static int serve_file(int fd, const char *path)
+static int serve_file_root(int fd, const char *root, const char *path)
 {
 	char full[220];
 	char header[192];
@@ -99,7 +108,7 @@ static int serve_file(int fd, const char *path)
 	}
 	if (!strcmp(path, "/"))
 		path = "/index.html";
-	if (snprintf(full, sizeof(full), "%s%s", WWW_ROOT, path) >= (int)sizeof(full)) {
+	if (snprintf(full, sizeof(full), "%s%s", root, path) >= (int)sizeof(full)) {
 		send_error(fd, 414, "URI Too Long");
 		return 1;
 	}
@@ -141,6 +150,21 @@ static int serve_file(int fd, const char *path)
 	}
 	close(in);
 	return 0;
+}
+
+static int serve_file(int fd, const char *target)
+{
+	const char *path = target;
+	const char *root = SD_WEB_ROOT;
+
+	if (!strcmp(target, PLAYGROUND_PREFIX)) {
+		root = PLAYGROUND_ROOT;
+		path = "/";
+	} else if (!strncmp(target, PLAYGROUND_PREFIX "/", strlen(PLAYGROUND_PREFIX) + 1)) {
+		root = PLAYGROUND_ROOT;
+		path = target + strlen(PLAYGROUND_PREFIX);
+	}
+	return serve_file_root(fd, root, path);
 }
 
 static int serve_cgi(int fd, const char *script, const char *method,

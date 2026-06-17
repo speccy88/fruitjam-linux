@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 13:35:00 -0400
+Subject: [PATCH] misc: reset Fruit Jam usbhost TX SM to idle release
+
+Pico-PIO-USB uses the TX program's instruction 2 as its reset target for
+host mode.  That instruction releases D+/D- with `set pindirs, 0` while
+side-setting the full-speed idle J value.  The Fruit Jam bridge had been
+initializing TX to instruction 1, the blocking `out pc, 2` instruction.
+
+Use the same idle/release reset target as upstream so the TX state machine
+parks off the bus between explicit packet starts.
+---
+ drivers/misc/fruitjam_usbhost.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 666666666666..777777777777 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -139,6 +139,6 @@
+ #define FJ_PIO_TX_J_SIDE		0x0800u
+ #define FJ_PIO_TX_START_INSTR		(FJ_PIO_TX_J_SIDE | 4u)
+-#define FJ_PIO_TX_INIT_INSTR		(FJ_PIO_TX_J_SIDE | 1u)
++#define FJ_PIO_TX_INIT_INSTR		(FJ_PIO_TX_J_SIDE | 2u)
+ #define FJ_PIO_RX_INIT_INSTR		(FJ_PIO_RX_OFFSET)
+ #define FJ_PIO_RX_OSR_ONES_INSTR	0xa0ebu
+ #define FJ_PIO_RX_SET_X_ZERO_INSTR	0xe020u
+-- 
+2.39.5

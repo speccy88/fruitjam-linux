@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 00:00:00 +0000
+Subject: [PATCH] misc: initialize Fruit Jam usbhost RX OSR
+
+Pico-PIO-USB initializes the RX decoder OSR with all ones using
+`mov osr, !null`, and separately resets X to zero before each receive.
+The Fruit Jam bridge only executed the `set x, 0` instruction while its
+constant was named as though it loaded OSR ones.
+
+Load OSR with ones during RX setup and refresh it before receive probes,
+then execute the actual X reset instruction explicitly.
+---
+ drivers/misc/fruitjam_usbhost.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 555555555555..666666666666 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -139,7 +139,8 @@
+ #define FJ_PIO_TX_START_INSTR		(FJ_PIO_TX_J_SIDE | 4u)
+ #define FJ_PIO_TX_INIT_INSTR		(FJ_PIO_TX_J_SIDE | 1u)
+ #define FJ_PIO_RX_INIT_INSTR		(FJ_PIO_RX_OFFSET)
+-#define FJ_PIO_RX_OSR_ONES_INSTR	0xe020u
++#define FJ_PIO_RX_OSR_ONES_INSTR	0xa0ebu
++#define FJ_PIO_RX_SET_X_ZERO_INSTR	0xe020u
+ #define FJ_PIO_INSTR_OP_MASK		0xe000u
+ #define FJ_PIO_INSTR_JMP		0x0000u
+ #define FJ_PIO_INSTR_ADDR_MASK		0x001fu
+@@ -463,6 +464,7 @@ static void fj_usbhost_pio_prepare_receive(struct fruitjam_usbhost *uh)
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
+ 	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	fj_usbhost_pio_sm_enable(uh, uh->sm_rx);
+ }
+ 
+@@ -550,6 +552,7 @@ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+ 	writel(FJ_PIO_PINCTRL_IN_BASE(uh->dp_gpio), rx_sm + FJ_PIO_SM_PINCTRL);
+ 	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 
+ 	writel(fj_usbhost_clkdiv(uh, 96000000u), eop_sm + FJ_PIO_SM_CLKDIV);
+ 	writel(FJ_PIO_EXECCTRL_JMP_PIN(uh->dm_gpio) |
+-- 
+2.39.5

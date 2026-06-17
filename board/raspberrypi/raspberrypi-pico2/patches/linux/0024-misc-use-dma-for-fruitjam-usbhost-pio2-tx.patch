@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 15:20:00 -0400
+Subject: [PATCH] misc: use DMA for Fruit Jam USB host PIO2 TX
+
+The PIO USB host transmitter is paced at 48 MHz and upstream Pico-PIO-USB
+feeds it with DMA. A Linux MMIO loop can report that the TX state machine
+eventually consumed a packet while still stalling the packet on the wire.
+
+Add an optional, polled, byte-wide DMA feed for the Fruit Jam USB-host
+bridge. The board DTS assigns channel 2, leaving the DVI helper's channel
+0/1 pair alone. If the DMA window is not present the bridge falls back to
+the existing CPU-fed path.
+
+---
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -27,6 +27,8 @@
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
+ 
++#include <asm/page.h>
++
+ #define FJ_USBHOST_DEFAULT_DP_GPIO	1u
+ #define FJ_USBHOST_DEFAULT_DM_GPIO	2u
+ #define FJ_USBHOST_DEFAULT_POWER_GPIO	11u
+@@ -48,6 +50,11 @@
+ #define FJ_USBHOST_FIFO_TIMEOUT_US	1000u
+ #define FJ_USBHOST_TX_ENCODED_MAX	96u
+ #define FJ_USBHOST_RX_BYTES_MAX		32u
++#define FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 2u
++#define FJ_USBHOST_DMA_TIMEOUT_US	2000u
++
++#define FJ_PIO_SM_ADDR			0x0c
++#define FJ_RESET_DMA			2u
+ 
+ #define FJ_USB_SYNC			0x80u
+ #define FJ_USB_PID_IN			0x69u
+@@ -161,6 +168,24 @@
+ #define FJ_PADS_DRIVE_12MA		(BIT(5) | BIT(4))
+ #define FJ_PADS_SLEWFAST		BIT(0)
+ 
++#define FJ_DMA_CH_STRIDE		0x040
++#define FJ_DMA_CH_READ_ADDR(ch)		((ch) * FJ_DMA_CH_STRIDE + 0x000)
++#define FJ_DMA_CH_WRITE_ADDR(ch)	((ch) * FJ_DMA_CH_STRIDE + 0x004)
++#define FJ_DMA_CH_TRANS_COUNT(ch)	((ch) * FJ_DMA_CH_STRIDE + 0x008)
++#define FJ_DMA_CH_CTRL_TRIG(ch)		((ch) * FJ_DMA_CH_STRIDE + 0x00c)
++#define FJ_DMA_CHAN_ABORT		0x464
++#define FJ_DMA_CTRL_AHB_ERROR		BIT(31)
++#define FJ_DMA_CTRL_READ_ERROR		BIT(30)
++#define FJ_DMA_CTRL_WRITE_ERROR		BIT(29)
++#define FJ_DMA_CTRL_BUSY		BIT(26)
++#define FJ_DMA_CTRL_IRQ_QUIET		BIT(23)
++#define FJ_DMA_CTRL_TREQ(v)		(((v) & 0x3f) << 17)
++#define FJ_DMA_CTRL_CHAIN_TO(v)		(((v) & 0xf) << 13)
++#define FJ_DMA_CTRL_INCR_READ		BIT(4)
++#define FJ_DMA_CTRL_SIZE_BYTE		(0u << 2)
++#define FJ_DMA_CTRL_HIGH_PRIORITY	BIT(1)
++#define FJ_DMA_CTRL_EN			BIT(0)
++
+ struct fruitjam_usbhost {
+ 	struct device *dev;
+ 	struct miscdevice miscdev;
+@@ -170,6 +195,8 @@
+ 	void __iomem *pads_bank0;
+ 	void __iomem *pio;
+ 	void __iomem *resets;
++	void __iomem *dma;
++	phys_addr_t pio_phys;
+ 	u32 dp_gpio;
+ 	u32 dm_gpio;
+ 	u32 power_gpio;
+@@ -179,6 +206,10 @@
+ 	u32 sm_eop;
+ 	u32 clk_sys_hz;
+ 	u32 last_reset_ms;
++	u32 tx_dma_channel;
++	u32 tx_dma_packets;
++	u32 last_dma_ctrl;
++	int last_dma_result;
+ 	u32 packets;
+ 	u32 tx_errors;
+ 	u32 last_tx_len;
+@@ -194,6 +225,7 @@
+ 	int last_tx_result;
+ 	int last_rx_result;
+ 	u8 last_rx_bytes[FJ_USBHOST_RX_BYTES_MAX];
++	u8 tx_dma_buf[FJ_USBHOST_TX_ENCODED_MAX];
+ 	bool pio_ready;
+ 	bool pio_configured;
+ };
+@@ -592,6 +624,28 @@
+ 	return bit_idx >> 2;
+ }
+ 
++static void fj_usbhost_deassert_reset(struct fruitjam_usbhost *uh, u32 bit)
++{
++	u32 mask = BIT(bit);
++	u32 reset;
++	u32 waited;
++
++	if (!uh->resets)
++		return;
++
++	reset = readl(uh->resets + FJ_RESETS_RESET);
++	if (!(reset & mask) && (readl(uh->resets + FJ_RESETS_DONE) & mask))
++		return;
++
++	reset &= ~mask;
++	writel(reset, uh->resets + FJ_RESETS_RESET);
++	for (waited = 0; waited < 100000; waited++) {
++		if (readl(uh->resets + FJ_RESETS_DONE) & mask)
++			break;
++		cpu_relax();
++	}
++}
++
+ static int fj_usbhost_pio_write_tx_byte(struct fruitjam_usbhost *uh, u8 byte)
+ {
+ 	u32 waited;
+@@ -608,23 +662,10 @@
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int fj_usbhost_pio_tx_encoded(struct fruitjam_usbhost *uh,
+-				     const u8 *encoded, u8 encoded_len)
+-{
++static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
++{
++	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
+ 	u32 waited;
+-	int i;
+-	int ret;
+-
+-	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
+-	writel(FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx), uh->pio + FJ_PIO_FDEBUG);
+-	writel(FJ_PIO_TX_START_INSTR,
+-	       fj_usbhost_pio_sm(uh, uh->sm_tx) + FJ_PIO_SM_INSTR);
+-
+-	for (i = 0; i < encoded_len; i++) {
+-		ret = fj_usbhost_pio_write_tx_byte(uh, encoded[i]);
+-		if (ret)
+-			return ret;
+-	}
+ 
+ 	for (waited = 0; waited < FJ_USBHOST_TX_TIMEOUT_US; waited++) {
+ 		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
+@@ -632,6 +673,12 @@
+ 
+ 		if (irq & FJ_PIO_IRQ_TX_EOP) {
+ 			writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++			for (waited = 0; waited < FJ_USBHOST_FIFO_TIMEOUT_US; waited++) {
++				if ((readl(tx_sm + FJ_PIO_SM_ADDR) & 0x1f) >=
++				    FJ_USB_TX_ENCODED_COMP)
++					break;
++				udelay(1);
++			}
+ 			return 0;
+ 		}
+ 		if (fdebug & FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx))
+@@ -640,6 +687,115 @@
+ 	}
+ 
+ 	return -ETIMEDOUT;
++}
++
++static int fj_usbhost_pio_tx_encoded_cpu(struct fruitjam_usbhost *uh,
++					 const u8 *encoded, u8 encoded_len)
++{
++	int i;
++	int ret;
++
++	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++	writel(FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx), uh->pio + FJ_PIO_FDEBUG);
++	writel(FJ_PIO_TX_START_INSTR,
++	       fj_usbhost_pio_sm(uh, uh->sm_tx) + FJ_PIO_SM_INSTR);
++
++	for (i = 0; i < encoded_len; i++) {
++		ret = fj_usbhost_pio_write_tx_byte(uh, encoded[i]);
++		if (ret)
++			return ret;
++	}
++
++	return fj_usbhost_pio_wait_tx_complete(uh);
++}
++
++static u32 fj_usbhost_pio_tx_dreq(struct fruitjam_usbhost *uh)
++{
++	return uh->pio_index * 8u + uh->sm_tx;
++}
++
++static void fj_usbhost_dma_abort(struct fruitjam_usbhost *uh)
++{
++	u32 ch = uh->tx_dma_channel;
++	u32 waited;
++
++	if (!uh->dma || ch > 15)
++		return;
++
++	writel(BIT(ch), uh->dma + FJ_DMA_CHAN_ABORT);
++	for (waited = 0; waited < FJ_USBHOST_DMA_TIMEOUT_US; waited++) {
++		if (!(readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch)) &
++		      FJ_DMA_CTRL_BUSY))
++			break;
++		udelay(1);
++	}
++	writel(0, uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++}
++
++static int fj_usbhost_pio_tx_encoded_dma(struct fruitjam_usbhost *uh,
++					 const u8 *encoded, u8 encoded_len)
++{
++	u32 ch = uh->tx_dma_channel;
++	u32 ctrl;
++	u32 waited;
++	int ret;
++
++	if (!uh->dma || !uh->pio_phys || ch > 15)
++		return -ENODEV;
++
++	fj_usbhost_dma_abort(uh);
++	memcpy(uh->tx_dma_buf, encoded, encoded_len);
++	wmb();
++
++	ctrl = FJ_DMA_CTRL_TREQ(fj_usbhost_pio_tx_dreq(uh)) |
++	       FJ_DMA_CTRL_CHAIN_TO(ch) |
++	       FJ_DMA_CTRL_INCR_READ |
++	       FJ_DMA_CTRL_SIZE_BYTE |
++	       FJ_DMA_CTRL_HIGH_PRIORITY |
++	       FJ_DMA_CTRL_IRQ_QUIET |
++	       FJ_DMA_CTRL_EN;
++
++	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++	writel(FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx), uh->pio + FJ_PIO_FDEBUG);
++	writel((u32)virt_to_phys(uh->tx_dma_buf),
++	       uh->dma + FJ_DMA_CH_READ_ADDR(ch));
++	writel((u32)(uh->pio_phys + FJ_PIO_TXF(uh->sm_tx)),
++	       uh->dma + FJ_DMA_CH_WRITE_ADDR(ch));
++	writel(encoded_len, uh->dma + FJ_DMA_CH_TRANS_COUNT(ch));
++	writel(FJ_PIO_TX_START_INSTR,
++	       fj_usbhost_pio_sm(uh, uh->sm_tx) + FJ_PIO_SM_INSTR);
++	writel(ctrl, uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++
++	ret = fj_usbhost_pio_wait_tx_complete(uh);
++	for (waited = 0; waited < FJ_USBHOST_DMA_TIMEOUT_US; waited++) {
++		if (!(readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch)) &
++		      FJ_DMA_CTRL_BUSY))
++			break;
++		udelay(1);
++	}
++
++	uh->last_dma_ctrl = readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++	if (uh->last_dma_ctrl & (FJ_DMA_CTRL_AHB_ERROR |
++				 FJ_DMA_CTRL_READ_ERROR |
++				 FJ_DMA_CTRL_WRITE_ERROR))
++		ret = ret ?: -EIO;
++	uh->last_dma_result = ret;
++	if (!ret)
++		uh->tx_dma_packets++;
++	return ret;
++}
++
++static int fj_usbhost_pio_tx_encoded(struct fruitjam_usbhost *uh,
++				     const u8 *encoded, u8 encoded_len)
++{
++	int ret;
++
++	ret = fj_usbhost_pio_tx_encoded_dma(uh, encoded, encoded_len);
++	if (ret != -ENODEV)
++		return ret;
++	uh->last_dma_result = ret;
++	return fj_usbhost_pio_tx_encoded_cpu(uh, encoded, encoded_len);
+ }
+ 
+ static int fj_usbhost_pio_tx_packet(struct fruitjam_usbhost *uh,
+@@ -989,6 +1145,11 @@
+ 			 "tx_errors %u\n"
+ 			 "last_tx_result %d\n"
+ 			 "last_tx_len %u\n"
++			 "tx_dma %u\n"
++			 "tx_dma_channel %u\n"
++			 "tx_dma_packets %u\n"
++			 "last_dma_result %d\n"
++			 "last_dma_ctrl 0x%08x\n"
+ 			 "rx_attempts %u\n"
+ 			 "rx_errors %u\n"
+ 			 "last_rx_result %d\n"
+@@ -1010,6 +1171,8 @@
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+ 			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->packets,
+ 			 uh->tx_errors, uh->last_tx_result, uh->last_tx_len,
++			 uh->dma ? 1 : 0, uh->tx_dma_channel, uh->tx_dma_packets,
++			 uh->last_dma_result, uh->last_dma_ctrl,
+ 			 uh->rx_attempts, uh->rx_errors, uh->last_rx_result,
+ 			 uh->last_rx_len, uh->last_rx_pid, uh->last_rx_irq,
+ 			 uh->last_rx_flevel, rx_hex,
+@@ -1156,6 +1319,7 @@
+ 	uh->sm_rx = FJ_USBHOST_SM_RX_DEFAULT;
+ 	uh->sm_eop = FJ_USBHOST_SM_EOP_DEFAULT;
+ 	uh->clk_sys_hz = FJ_USBHOST_CLK_SYS_HZ_DEFAULT;
++	uh->tx_dma_channel = FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT;
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dp-gpio", &uh->dp_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dm-gpio", &uh->dm_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,power-gpio", &uh->power_gpio);
+@@ -1163,6 +1327,7 @@
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,sm-tx", &uh->sm_tx);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,sm-rx", &uh->sm_rx);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,sm-eop", &uh->sm_eop);
++	device_property_read_u32(&pdev->dev, "raspberrypi,tx-dma-channel", &uh->tx_dma_channel);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,clk-sys-hz", &uh->clk_sys_hz);
+ 
+ 	uh->sio = fj_ioremap_byname(pdev, "sio");
+@@ -1180,6 +1345,18 @@
+ 	uh->resets = fj_ioremap_optional_byname(pdev, "resets");
+ 	if (IS_ERR(uh->resets))
+ 		return PTR_ERR(uh->resets);
++	uh->dma = fj_ioremap_optional_byname(pdev, "dma");
++	if (IS_ERR(uh->dma))
++		return PTR_ERR(uh->dma);
++	if (uh->pio) {
++		struct resource *res;
++
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pio");
++		if (res)
++			uh->pio_phys = res->start;
++	}
++	if (uh->dma)
++		fj_usbhost_deassert_reset(uh, FJ_RESET_DMA);
+ 
+ 	platform_set_drvdata(pdev, uh);
+ 	fj_usbhost_configure(uh);
+@@ -1198,9 +1375,10 @@
+ 		return ret;
+ 
+ 	dev_info(&pdev->dev,
+-		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u\n",
++		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u dma=%u ch=%u\n",
+ 		 uh->dp_gpio, uh->dm_gpio, uh->power_gpio, uh->pio_index,
+-		 uh->pio_ready, uh->pio_configured);
++		 uh->pio_ready, uh->pio_configured, uh->dma ? 1 : 0,
++		 uh->tx_dma_channel);
+ 	return 0;
+ }
+ 

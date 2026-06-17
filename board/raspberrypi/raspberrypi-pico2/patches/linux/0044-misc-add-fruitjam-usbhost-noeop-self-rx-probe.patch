@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 23:05:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost no-EOP self-RX probe
+
+The SETUP DATA self-RX probe decodes the first nine bytes and then sees RX-EOP
+before the final setup byte and CRC16.  Add a diagnostic receive path that keeps
+clearing RX-EOP and drains for the full receive window, so hardware tests can
+separate an early EOP stop from a lower-level RX decoder stall.
+---
+ drivers/misc/fruitjam_usbhost.c | 96 +++++++++++++++++++++++++++++++++
+ 1 file changed, 96 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1210,6 +1210,51 @@ out:
+ 	fj_usbhost_pio_record_rx(uh, ret, len);
+ 	return ret;
+ #undef FJ_USBHOST_DRAIN_RX_FIFO
++}
++
++static int fj_usbhost_pio_receive_raw_noeop_stop(struct fruitjam_usbhost *uh)
++{
++	u32 waited;
++	u32 len = 0;
++	int ret = -ENODATA;
++
++#define FJ_USBHOST_DRAIN_RX_FIFO()						\
++	do {									\
++		while (!(readl(uh->pio + FJ_PIO_FSTAT) &			\
++			 FJ_PIO_FSTAT_RXEMPTY(uh->sm_rx))) {			\
++			if (len >= FJ_USBHOST_RX_BYTES_MAX) {			\
++				ret = -EOVERFLOW;				\
++				goto out;					\
++			}							\
++			uh->last_rx_bytes[len++] =				\
++				readl(uh->pio + FJ_PIO_RXF(uh->sm_rx)) >> 24;	\
++		}								\
++	} while (0)
++
++	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
++	for (waited = 0; waited < FJ_USBHOST_RX_TIMEOUT_US; waited++) {
++		u32 irq;
++
++		FJ_USBHOST_DRAIN_RX_FIFO();
++
++		irq = readl(uh->pio + FJ_PIO_IRQ);
++		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
++			ret = -EILSEQ;
++			break;
++		}
++		if (irq & FJ_PIO_IRQ_RX_EOP)
++			writel(FJ_PIO_IRQ_RX_EOP, uh->pio + FJ_PIO_IRQ);
++		udelay(1);
++	}
++	FJ_USBHOST_DRAIN_RX_FIFO();
++	if (len && ret == -ENODATA)
++		ret = 0;
++
++out:
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_record_rx(uh, ret, len);
++	return ret;
++#undef FJ_USBHOST_DRAIN_RX_FIFO
+ }
+ 
+ static int fj_usbhost_pio_require_configured(struct fruitjam_usbhost *uh)
+@@ -1356,6 +1401,49 @@ out_error:
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_setup_data_self_rx_noeop(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	fj_usbhost_pio_prepare_receive(uh);
++	fj_usbhost_pio_clear_rx_irq(uh);
++	ret = fj_usbhost_pio_send_data0(uh, get_device8_setup,
++					sizeof(get_device8_setup),
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	/*
++	 * Diagnostic only: keep clearing RX-EOP so a false early EOP cannot
++	 * stall the edge detector before the known 12-byte DATA0 packet ends.
++	 */
++	return fj_usbhost_pio_receive_raw_noeop_stop(uh);
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->last_rx_irq = uh->pio ? readl(uh->pio + FJ_PIO_IRQ) : 0;
++	uh->last_rx_flevel = uh->pio ? readl(uh->pio + FJ_PIO_FLEVEL) : 0;
++	uh->last_pio_fstat = uh->pio ? readl(uh->pio + FJ_PIO_FSTAT) : 0;
++	uh->last_pio_fdebug = uh->pio ? readl(uh->pio + FJ_PIO_FDEBUG) : 0;
++	uh->last_pio_irq = uh->last_rx_irq;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_setup_data_self_rx_cpu(struct fruitjam_usbhost *uh)
+ {
+ 	static const u8 get_device8_setup[8] = {
+@@ -1827,6 +1915,8 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_in_token(uh);
+ 	} else if (!strcmp(cmd, "setup-data-self-rx")) {
+ 		ret = fj_usbhost_pio_setup_data_self_rx(uh);
++	} else if (!strcmp(cmd, "setup-data-self-rx-noeop")) {
++		ret = fj_usbhost_pio_setup_data_self_rx_noeop(uh);
+ 	} else if (!strcmp(cmd, "setup-data-self-rx-cpu")) {
+ 		ret = fj_usbhost_pio_setup_data_self_rx_cpu(uh);
+ 	} else if (!strcmp(cmd, "get-device-8")) {
+-- 
+2.39.5

@@ -5,6 +5,10 @@ Hazard3 RISC-V core with no MMU. It is based on the existing RP2350 no-MMU
 Linux/Buildroot work in this tree and keeps the image small: RV32, single core,
 BusyBox, CramFS in flash, and an 8 MiB PSRAM kernel load address.
 
+For a community getting-started walkthrough, see
+[Linux on Fruit Jam](https://adafruit-playground.com/u/mikeysklar/pages/linux-on-fruit-jam)
+by Mikey Sklar on Adafruit Playground.
+
 ## Current hardware milestone
 
 * CPU mode: RP2350B Hazard3 RISC-V (`rp2350-riscv` UF2 family), not Cortex-M33.
@@ -40,6 +44,9 @@ Validated on the Fruit Jam board:
 * Berry installed at `/usr/bin/berry`.
 * `berry -e 'print("berry ok")'`.
 * Berry REPL expression evaluation.
+* `/root/berry/fruitjam.be` provides an importable Berry hardware helper module
+  for GPIO/buttons, ADC, USB-host status, device presence, audio clock, DVI
+  command writes, and NeoPixels.
 * `/root/berry/neopixels.be` runs with `berry-run /root/berry/neopixels.be` and lights the
   five onboard NeoPixels.
 * BusyBox `vi` is enabled as `/bin/vi`.
@@ -53,23 +60,38 @@ Validated on the Fruit Jam board:
   The loopback `fruitjam-services core` set starts `fruitjam-httpd`,
   `fruitjam-telnetd`, `fruitjam-ftpd`, and TFTP on demand for target-side smoke
   tests.
-* Serial login shells use standalone `/usr/bin/hush`; telnet sessions use the
-  smaller `/usr/bin/fruitjam-shell` command loop to preserve no-MMU allocation
-  headroom.
+* USB CDC login shells use standalone `/usr/bin/hush`; the hardware UART uses
+  `fruitjam-uart-login` to wait for Enter before execing `hush`, avoiding a
+  no-MMU respawn loop when nothing is attached. Telnet sessions use the smaller
+  `/usr/bin/fruitjam-shell` command loop to preserve no-MMU allocation headroom.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps` or `netstat`, and CGI still runs after status/telnet
   checks.
-* `wget -O - http://127.0.0.1/index.html` serves the bundled status page after
+* `fruitjam-mem` and `free` provide a tiny no-fork memory, uptime, load, and
+  commit-pressure summary from `/proc` without enabling heavier BusyBox procps
+  applets.
+* `fruitjam-services init` creates `/mnt/sd/www/index.html` with a small
+  "Fruit Jam stuff" placeholder only when the SD card does not already have an
+  index page. HTTP `/` serves that SD-card page; `/playground` serves the
+  built-in hardware playground from flash.
+* `wget -O - http://127.0.0.1/index.html` serves the SD-card page after
   `fruitjam-services core`, and `wget -O - http://127.0.0.1/cgi-bin/env.cgi`
   returns `Fruit Jam CGI OK`.
 * AirLift telnet on TCP/23 spawns `fruitjam-shell` and successfully echoed
   `TELNET_OK`; loopback telnet works after `fruitjam-services core`.
+* Default AirLift startup is supervised by `fruitjam-services airlift-monitor`.
+  If the inbound server exits after opening ESP32-C6 TCP listeners, the monitor
+  reruns setup and starts it again; `/tmp/airlift-start.log` records the loop.
 * microSD enumerates as `/dev/mmcblk0` and `/dev/mmcblk0p1`; `/mnt/sd` mounts
   as VFAT, accepts writes, unmounts, remounts, and preserves the test file.
 * `airliftctl` talks to the onboard ESP32-C6 AirLift over RP2350 PL022/spidev
   hardware SPI. The installed NINA firmware reported `3.3.0`; WiFi join,
   DHCP address reporting, outbound HTTP via `airliftctl tcp-get example.com /`,
   inbound HTTP, inbound telnet, and passive FTP were verified on hardware.
+  `airliftctl` serializes SPI access with a lock so direct diagnostics fail
+  safely while the long-running inbound service owns the coprocessor; read-only
+  `fw`, `mac`, `status`, and `ip` commands fall back to the last values in
+  `/tmp/airlift-start.log`.
 * `airliftctl mqtt-pub` and `mosquitto_pub --airlift` provide a userspace AirLift
   MQTT QoS 0 publish path for button actions when `MQTT_TRANSPORT=airlift` is
   set in the button config. A local broker received both a direct
@@ -151,8 +173,8 @@ hardware test report.
 
 ## Fruit Jam board-control helper
 
-The image includes `fruitjamctl`, a small `/dev/mem`-based diagnostic helper for
-the peripherals that are safe to touch before real kernel drivers exist:
+The image includes `fruitjamctl`, a small sysfs-GPIO diagnostic helper for the
+peripherals that are safe to touch before fuller kernel drivers exist:
 
 ```sh
 fruitjamctl status
@@ -169,6 +191,15 @@ with pull-ups, turn the red LED off after the bootloader handoff, deassert the
 shared TLV320/ESP32-C6 reset line, and enable USB host 5 V power. This does not
 make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
 bridge so hardware validation can proceed over UART and USB CDC.
+`/dev/fruitjam-usbhost` owns the USB host power switch plus GPIO1/GPIO2
+line-state and reset timing in the kernel. `fruitjam-usbhost status`, `json`,
+`wait`, `monitor`, and `reset` use that bridge when present and fall back to
+sysfs GPIO on older images. The bridge stages the 32-word PIO2 full-speed host
+program so USB packet work has a dedicated block that does not collide with PIO0
+NeoPixels or PIO1 audio. PIO token/data transactions and boot-keyboard report
+polling are still being developed.
+`fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events so
+the first bridge milestone has a tested key translation path ready.
 
 The `bootsel` command requests a restart into the RP2350 ROM BOOTSEL loader. It
 has been verified on Fruit Jam hardware by running `fruitjamctl bootsel` from the
@@ -310,10 +341,12 @@ Do not put real WiFi credentials in the rootfs overlay or release artifacts.
 
 This is a userspace coprocessor socket helper. It proves that the AirLift can join
 WiFi, open outbound TCP connections, and host a small inbound HTTP/telnet/FTP
-surface, but it does not create a Linux `wlan0` interface. BusyBox `wget` and
-normal Linux sockets still use loopback until a kernel netdev driver or a fuller
-userspace bridge exists. The Linux image does not flash the ESP32-C6 firmware;
-the tested board already had the Adafruit Fruit Jam NINA `3.3.0` firmware.
+surface, but it does not create a Linux `wlan0` interface. HTTP `/` serves user
+pages from `/mnt/sd/www`, while `/playground` serves the built-in hardware
+playground. BusyBox `wget` and normal Linux sockets still use loopback until a
+kernel netdev driver or a fuller userspace bridge exists. The Linux image does
+not flash the ESP32-C6 firmware; the tested board already had the Adafruit Fruit
+Jam NINA `3.3.0` firmware.
 
 ## microSD
 
@@ -343,6 +376,7 @@ and REPL support:
 ```sh
 berry -e 'print("hello fruit jam")'
 berry
+berry-run /root/berry/06-fruitjam-module.be
 berry-run /root/berry/neopixels.be
 ```
 
@@ -360,8 +394,9 @@ test
 
 * HSTX DVI has a tiny `/dev/fruitjam-dvi` RGB332 frame helper for bounded
   dashboard/text/test frames. Full fbdev/console support is not implemented.
-* USB host 5 V power can be enabled by `fruitjamctl`, but USB host and USB
-  keyboard input protocol support are not implemented.
+* USB host 5 V power and D+/D- reset/line-state ownership now have the
+  `/dev/fruitjam-usbhost` kernel bridge, but PIO packet I/O, enumeration, and
+  USB keyboard input protocol support are not implemented.
 * Buttons, GPIO29, microSD block access, button SQLite logging, GPIO20/GPIO21
   I2C, AirLift userspace socket access, and first-step TLV320 RTTTL audio work,
   but WiFi/AirLift Linux netdev support, full PCM/I2S audio, full DVI console,

@@ -27,17 +27,21 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 static const char *ftp_root = "/mnt/sd";
+static const char *sd_web_root = "/mnt/sd/www";
+static const char *sd_index_path = "/mnt/sd/www/index.html";
 static const char *tftp_root = "/tmp/tftp";
+static const char *airlift_monitor_pid = "/run/fruitjam-airlift-monitor.pid";
 static const char *const wifi_conf_paths[] = {
 	"/mnt/sd/fruitjam/wifi.conf",
 	"/etc/fruitjam-wifi.conf",
 };
+static volatile sig_atomic_t service_stop_requested;
 static int runtime_initialized;
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-services {init|httpd|telnetd|airlift-shell|airlift-inbound|ftpd|tftpd|dropbear|buttonlog|buttons|core|all|sd-refresh|stop|restart|status}\n");
+		"usage: fruitjam-services {init|httpd|telnetd|airlift-shell|airlift-inbound|airlift-monitor|ftpd|tftpd|dropbear|buttonlog|buttons|core|all|sd-refresh|stop|restart|status}\n");
 }
 
 static int write_text_file(const char *path, const char *text)
@@ -226,6 +230,35 @@ static int repair_sd_mount_if_needed(void)
 	return refresh_sd_mount();
 }
 
+static int ensure_sd_web_placeholder(void)
+{
+	static const char placeholder[] =
+		"<!doctype html>\n"
+		"<html lang=\"en\">\n"
+		"<head>\n"
+		"  <meta charset=\"utf-8\">\n"
+		"  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+		"  <title>Fruit Jam stuff</title>\n"
+		"</head>\n"
+		"<body>\n"
+		"  <h1>Fruit Jam stuff</h1>\n"
+		"  <p>This page lives on the microSD card at /mnt/sd/www/index.html.</p>\n"
+		"  <p>Replace it with your own page. The hardware playground is at <a href=\"/playground\">/playground</a>.</p>\n"
+		"</body>\n"
+		"</html>\n";
+
+	if (!sd_is_mounted())
+		return 0;
+	if (mkdir_p(sd_web_root) < 0) {
+		fprintf(stderr, "fruitjam-services: mkdir %s: %s\n",
+			sd_web_root, strerror(errno));
+		return -1;
+	}
+	if (access(sd_index_path, F_OK) == 0)
+		return 0;
+	return write_text_file(sd_index_path, placeholder);
+}
+
 static int configure_loopback(void)
 {
 	struct ifreq ifr;
@@ -284,6 +317,7 @@ static int spawn_wait(char *const argv[])
 {
 	pid_t pid = vfork();
 	int status;
+	pid_t ret;
 
 	if (pid < 0) {
 		fprintf(stderr, "fruitjam-services: vfork %s: %s\n", argv[0], strerror(errno));
@@ -293,7 +327,20 @@ static int spawn_wait(char *const argv[])
 		execv(argv[0], argv);
 		_exit(127);
 	}
-	if (waitpid(pid, &status, 0) < 0) {
+	for (;;) {
+		ret = waitpid(pid, &status, 0);
+		if (ret >= 0)
+			break;
+		if (errno == EINTR && !service_stop_requested)
+			continue;
+		if (errno == EINTR && service_stop_requested) {
+			kill(pid, SIGTERM);
+			while ((ret = waitpid(pid, &status, 0)) < 0 &&
+			       errno == EINTR)
+				;
+			if (ret >= 0)
+				break;
+		}
 		fprintf(stderr, "fruitjam-services: wait %s: %s\n", argv[0], strerror(errno));
 		return -1;
 	}
@@ -445,6 +492,8 @@ static int init_runtime(void)
 
 	if (repair_sd_mount_if_needed() != 0)
 		ret = -1;
+	if (ensure_sd_web_placeholder() != 0)
+		ret = -1;
 
 	write_text_file("/tmp/tftp/README.txt", "Fruit Jam TFTP area\n");
 	write_text_file("/mnt/sd/README.txt", "Fruit Jam SD FTP area\n");
@@ -532,14 +581,134 @@ static int start_airlift_shell(void)
 	return spawn_bg_log(argv, "/tmp/airlift-inbound.log");
 }
 
-static int start_airlift_background(void)
+static int write_pid_file(const char *path)
 {
-	char *const argv[] = {
-		"/usr/bin/fruitjam-services", "airlift-inbound", NULL
+	char text[32];
+
+	snprintf(text, sizeof(text), "%ld\n", (long)getpid());
+	return write_text_file(path, text);
+}
+
+static int read_pid_file(const char *path, pid_t *pid)
+{
+	char line[32];
+	char *end;
+	FILE *fp;
+	long value;
+
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	errno = 0;
+	value = strtol(line, &end, 10);
+	if (errno || value <= 1)
+		return -1;
+	*pid = (pid_t)value;
+	return 0;
+}
+
+static int pid_is_alive(pid_t pid)
+{
+	if (pid <= 1)
+		return 0;
+	if (kill(pid, 0) == 0 || errno == EPERM)
+		return 1;
+	return 0;
+}
+
+static void request_service_stop(int sig)
+{
+	(void)sig;
+	service_stop_requested = 1;
+}
+
+static int prepare_airlift_network(void)
+{
+	char ssid[40];
+	char password[80];
+	char *const probe[] = {
+		"/usr/bin/airliftctl", "probe", NULL
 	};
+
+	init_runtime();
+	if (spawn_wait(probe) != 0) {
+		fprintf(stderr, "fruitjam-services: AirLift probe failed\n");
+		return -1;
+	}
+	if (read_wifi_config(ssid, sizeof(ssid), password, sizeof(password)) == 0) {
+		char *const join[] = {
+			"/usr/bin/airliftctl", "join", ssid, password, NULL
+		};
+
+		if (spawn_wait(join) != 0) {
+			fprintf(stderr, "fruitjam-services: AirLift WiFi join failed\n");
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int airlift_monitor(void)
+{
+	int failures = 0;
 
 	if (access("/usr/bin/airliftctl", X_OK) < 0)
 		return 0;
+	service_stop_requested = 0;
+	signal(SIGINT, request_service_stop);
+	signal(SIGTERM, request_service_stop);
+	if (write_pid_file(airlift_monitor_pid) < 0)
+		fprintf(stderr, "fruitjam-services: cannot write %s\n",
+			airlift_monitor_pid);
+
+	while (!service_stop_requested) {
+		char *const serve[] = {
+			"/usr/bin/airliftctl", "serve-inbound", NULL
+		};
+		int ret;
+
+		if (prepare_airlift_network() != 0) {
+			if (service_stop_requested)
+				break;
+			failures++;
+			sleep(failures > 3 ? 10 : 2);
+			continue;
+		}
+
+		failures = 0;
+		fprintf(stderr, "fruitjam-services: starting AirLift inbound server\n");
+		ret = spawn_wait(serve);
+		if (service_stop_requested)
+			break;
+		fprintf(stderr, "fruitjam-services: AirLift inbound server exited %d\n",
+			ret);
+		failures++;
+		sleep(failures > 3 ? 10 : 2);
+	}
+	unlink(airlift_monitor_pid);
+	return 0;
+}
+
+static int start_airlift_background(void)
+{
+	char *const argv[] = {
+		"/usr/bin/fruitjam-services", "airlift-monitor", NULL
+	};
+	pid_t pid;
+
+	if (access("/usr/bin/airliftctl", X_OK) < 0)
+		return 0;
+	if (read_pid_file(airlift_monitor_pid, &pid) == 0) {
+		if (pid_is_alive(pid))
+			return 0;
+		unlink(airlift_monitor_pid);
+	}
 	return spawn_bg_log(argv, "/tmp/airlift-start.log");
 }
 
@@ -661,9 +830,16 @@ static void signal_services(int sig)
 
 static int stop_services(void)
 {
+	pid_t pid;
+
+	if (read_pid_file(airlift_monitor_pid, &pid) == 0 && pid_is_alive(pid))
+		kill(pid, SIGTERM);
 	signal_services(SIGTERM);
 	usleep(700000);
+	if (read_pid_file(airlift_monitor_pid, &pid) == 0 && pid_is_alive(pid))
+		kill(pid, SIGKILL);
 	signal_services(SIGKILL);
+	unlink(airlift_monitor_pid);
 	return 0;
 }
 
@@ -726,6 +902,14 @@ static void print_matching_processes(void)
 		printf("  %ld %s\n", pid, comm);
 	}
 	closedir(dir);
+	{
+		pid_t pid;
+
+			if (read_pid_file(airlift_monitor_pid, &pid) == 0 &&
+			    pid_is_alive(pid))
+				printf("  %ld fruitjam-services airlift-monitor\n",
+				       (long)pid);
+	}
 }
 
 static void print_ipv4(unsigned int addr)
@@ -796,6 +980,8 @@ int main(int argc, char **argv)
 		return start_telnet();
 	if (!strcmp(argv[1], "airlift-shell") || !strcmp(argv[1], "airlift-inbound"))
 		return start_airlift_shell();
+	if (!strcmp(argv[1], "airlift-monitor"))
+		return airlift_monitor();
 	if (!strcmp(argv[1], "ftpd"))
 		return start_ftp();
 	if (!strcmp(argv[1], "tftpd"))

@@ -1,0 +1,431 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 10:20:00 -0400
+Subject: [PATCH] misc: add Fruit Jam RP2350 USB host bridge
+
+Add a tiny Fruit Jam-specific misc driver for the RP2350 GPIO1/GPIO2 USB
+host pins and GPIO11 power switch.  This is the kernel-owned landing zone for
+the PIO USB host work: it keeps bus reset and line-state ownership out of
+userspace sysfs pokes, exposes /dev/fruitjam-usbhost, and deliberately reports
+that HID enumeration/report polling is still the next layer.
+
+The first interface is text-only and intentionally small:
+
+  read              current power, D+/D-, line state, and bridge status
+  write "on"        enable USB host 5 V
+  write "off"       disable USB host 5 V
+  write "reset MS"  drive SE0 for MS milliseconds, then release D+/D-
+
+This does not pull in Linux USB/HID/input subsystems on the no-MMU image.
+---
+ drivers/misc/Kconfig               |  13 ++
+ drivers/misc/Makefile              |   1 +
+ drivers/misc/fruitjam_usbhost.c    | 363 +++++++++++++++++++++++++++++
+ 3 files changed, 377 insertions(+)
+ create mode 100644 drivers/misc/fruitjam_usbhost.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 7a9a9f0dbb26..f81d7d98b766 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -87,6 +87,19 @@ config FRUITJAM_DVI
+ 
+ 	  If unsure, say N.
+ 
++config FRUITJAM_USBHOST_BRIDGE
++	tristate "Adafruit Fruit Jam RP2350 PIO USB host bridge"
++	depends on OF && HAS_IOMEM
++	help
++	  Say Y here to expose /dev/fruitjam-usbhost, a tiny board bridge
++	  for the Fruit Jam RP2350B GPIO1/GPIO2 PIO USB host data pins and
++	  GPIO11 host-power switch.
++
++	  This first driver owns line state and USB bus reset in the kernel.
++	  Full HID enumeration and report polling are implemented above this.
++
++	  If unsure, say N.
++
+ config IBM_ASM
+ 	tristate "Device driver for IBM RSA service processor"
+ 	depends on X86 && PCI && INPUT
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 8626aa93b661..cc2a8a1b7ab4 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -11,6 +11,7 @@ obj-$(CONFIG_FRUITJAM_AIRLIFT_GPIO) += fruitjam_airlift_gpio.o
+ obj-$(CONFIG_FRUITJAM_RP2350_ADC) += fruitjam_rp2350_adc.o
+ obj-$(CONFIG_FRUITJAM_AUDIO_CLOCK) += fruitjam_audio_clock.o
+ obj-$(CONFIG_FRUITJAM_DVI) += fruitjam_dvi.o
++obj-$(CONFIG_FRUITJAM_USBHOST_BRIDGE) += fruitjam_usbhost.o
+ obj-$(CONFIG_AD525X_DPOT_I2C)	+= ad525x_dpot-i2c.o
+ obj-$(CONFIG_AD525X_DPOT_SPI)	+= ad525x_dpot-spi.o
+ obj-$(CONFIG_ATMEL_SSC)		+= atmel-ssc.o
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+new file mode 100644
+index 000000000000..30b83cb4760d
+--- /dev/null
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -0,0 +1,363 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Minimal Adafruit Fruit Jam RP2350 USB host bridge.
++ *
++ * Fruit Jam's Type-A USB host data pins are GPIO1/GPIO2 for a PIO USB host
++ * engine, with host 5 V switched by GPIO11.  This driver is intentionally a
++ * narrow bridge: it owns pin muxing, host power, bus reset, and line-state
++ * reads in the kernel so the next patch can add PIO packet I/O without racing
++ * userspace sysfs GPIO.
++ */
++
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++
++#define FJ_USBHOST_DEFAULT_DP_GPIO	1u
++#define FJ_USBHOST_DEFAULT_DM_GPIO	2u
++#define FJ_USBHOST_DEFAULT_POWER_GPIO	11u
++#define FJ_USBHOST_DEFAULT_RESET_MS	50u
++#define FJ_USBHOST_MIN_RESET_MS		10u
++#define FJ_USBHOST_MAX_RESET_MS		1000u
++#define FJ_USBHOST_POST_RESET_MS	100u
++#define FJ_USBHOST_COMMAND_MAX		64u
++
++#define FJ_SIO_GPIO_IN			0x004
++#define FJ_SIO_GPIO_HI_IN		0x008
++#define FJ_SIO_GPIO_OUT			0x010
++#define FJ_SIO_GPIO_HI_OUT		0x014
++#define FJ_SIO_GPIO_OUT_SET		0x018
++#define FJ_SIO_GPIO_HI_OUT_SET		0x01c
++#define FJ_SIO_GPIO_OUT_CLR		0x020
++#define FJ_SIO_GPIO_HI_OUT_CLR		0x024
++#define FJ_SIO_GPIO_OE_SET		0x038
++#define FJ_SIO_GPIO_HI_OE_SET		0x03c
++#define FJ_SIO_GPIO_OE_CLR		0x040
++#define FJ_SIO_GPIO_HI_OE_CLR		0x044
++
++#define FJ_IO_GPIO_CTRL(gpio)		(0x004 + ((gpio) * 8))
++#define FJ_PADS_GPIO(gpio)		(0x004 + ((gpio) * 4))
++#define FJ_GPIO_FUNC_SIO		5u
++#define FJ_PADS_IE			BIT(6)
++#define FJ_PADS_PDE			BIT(2)
++#define FJ_PADS_DRIVE_4MA		BIT(4)
++
++struct fruitjam_usbhost {
++	struct device *dev;
++	struct miscdevice miscdev;
++	struct mutex lock;
++	void __iomem *sio;
++	void __iomem *io_bank0;
++	void __iomem *pads_bank0;
++	u32 dp_gpio;
++	u32 dm_gpio;
++	u32 power_gpio;
++	u32 last_reset_ms;
++};
++
++static u32 fj_gpio_mask(unsigned int gpio)
++{
++	return BIT(gpio & 31);
++}
++
++static void __iomem *fj_sio_reg(struct fruitjam_usbhost *uh,
++				unsigned int gpio, u32 lo, u32 hi)
++{
++	return uh->sio + (gpio < 32 ? lo : hi);
++}
++
++static void fj_gpio_func(struct fruitjam_usbhost *uh, unsigned int gpio, u32 func)
++{
++	writel(func, uh->io_bank0 + FJ_IO_GPIO_CTRL(gpio));
++}
++
++static void fj_gpio_oe(struct fruitjam_usbhost *uh, unsigned int gpio, bool output)
++{
++	u32 lo = output ? FJ_SIO_GPIO_OE_SET : FJ_SIO_GPIO_OE_CLR;
++	u32 hi = output ? FJ_SIO_GPIO_HI_OE_SET : FJ_SIO_GPIO_HI_OE_CLR;
++
++	writel(fj_gpio_mask(gpio), fj_sio_reg(uh, gpio, lo, hi));
++}
++
++static void fj_gpio_set(struct fruitjam_usbhost *uh, unsigned int gpio, bool high)
++{
++	u32 lo = high ? FJ_SIO_GPIO_OUT_SET : FJ_SIO_GPIO_OUT_CLR;
++	u32 hi = high ? FJ_SIO_GPIO_HI_OUT_SET : FJ_SIO_GPIO_HI_OUT_CLR;
++
++	writel(fj_gpio_mask(gpio), fj_sio_reg(uh, gpio, lo, hi));
++}
++
++static bool fj_gpio_in_get(struct fruitjam_usbhost *uh, unsigned int gpio)
++{
++	u32 value = readl(fj_sio_reg(uh, gpio, FJ_SIO_GPIO_IN, FJ_SIO_GPIO_HI_IN));
++
++	return !!(value & fj_gpio_mask(gpio));
++}
++
++static bool fj_gpio_out_get(struct fruitjam_usbhost *uh, unsigned int gpio)
++{
++	u32 value = readl(fj_sio_reg(uh, gpio, FJ_SIO_GPIO_OUT, FJ_SIO_GPIO_HI_OUT));
++
++	return !!(value & fj_gpio_mask(gpio));
++}
++
++static void fj_gpio_input(struct fruitjam_usbhost *uh, unsigned int gpio)
++{
++	writel(FJ_PADS_IE | FJ_PADS_PDE, uh->pads_bank0 + FJ_PADS_GPIO(gpio));
++	fj_gpio_func(uh, gpio, FJ_GPIO_FUNC_SIO);
++	fj_gpio_oe(uh, gpio, false);
++}
++
++static void fj_gpio_output(struct fruitjam_usbhost *uh, unsigned int gpio, bool high)
++{
++	writel(FJ_PADS_DRIVE_4MA, uh->pads_bank0 + FJ_PADS_GPIO(gpio));
++	fj_gpio_func(uh, gpio, FJ_GPIO_FUNC_SIO);
++	fj_gpio_set(uh, gpio, high);
++	fj_gpio_oe(uh, gpio, true);
++}
++
++static const char *fj_usbhost_state(bool power, bool dp, bool dm)
++{
++	if (!power)
++		return "power-off";
++	if (!dp && !dm)
++		return "no-device-or-reset";
++	if (dp && !dm)
++		return "full-speed-device";
++	if (!dp && dm)
++		return "low-speed-device";
++	return "invalid-both-lines-high";
++}
++
++static bool fj_usbhost_present(const char *state)
++{
++	return !strcmp(state, "full-speed-device") ||
++	       !strcmp(state, "low-speed-device");
++}
++
++static void fj_usbhost_configure(struct fruitjam_usbhost *uh)
++{
++	fj_gpio_input(uh, uh->dp_gpio);
++	fj_gpio_input(uh, uh->dm_gpio);
++	fj_gpio_output(uh, uh->power_gpio, true);
++}
++
++static void fj_usbhost_reset_bus(struct fruitjam_usbhost *uh, u32 reset_ms)
++{
++	fj_gpio_output(uh, uh->power_gpio, true);
++	msleep(FJ_USBHOST_POST_RESET_MS);
++	fj_gpio_output(uh, uh->dp_gpio, false);
++	fj_gpio_output(uh, uh->dm_gpio, false);
++	msleep(reset_ms);
++	fj_gpio_input(uh, uh->dp_gpio);
++	fj_gpio_input(uh, uh->dm_gpio);
++	msleep(FJ_USBHOST_POST_RESET_MS);
++	uh->last_reset_ms = reset_ms;
++}
++
++static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
++				    char *buf, size_t len)
++{
++	bool power = fj_gpio_out_get(uh, uh->power_gpio);
++	bool dp = fj_gpio_in_get(uh, uh->dp_gpio);
++	bool dm = fj_gpio_in_get(uh, uh->dm_gpio);
++	const char *state = fj_usbhost_state(power, dp, dm);
++
++	return scnprintf(buf, len,
++			 "power %u\n"
++			 "dp %u\n"
++			 "dm %u\n"
++			 "device %s\n"
++			 "present %u\n"
++			 "hid 0\n"
++			 "driver kernel-line-state\n"
++			 "bridge pio-packet-io-pending\n"
++			 "first_milestone boot-protocol-keyboard\n"
++			 "reports 0\n"
++			 "last_reset_ms %u\n",
++			 power, dp, dm, state, fj_usbhost_present(state),
++			 uh->last_reset_ms);
++}
++
++static ssize_t fj_usbhost_read(struct file *file, char __user *buf,
++			       size_t count, loff_t *ppos)
++{
++	struct fruitjam_usbhost *uh = container_of(file->private_data,
++			struct fruitjam_usbhost, miscdev);
++	char tmp[256];
++	int len;
++
++	mutex_lock(&uh->lock);
++	len = fj_usbhost_format_status(uh, tmp, sizeof(tmp));
++	mutex_unlock(&uh->lock);
++
++	return simple_read_from_buffer(buf, count, ppos, tmp, len);
++}
++
++static int fj_usbhost_parse_reset_ms(char *text, u32 *reset_ms)
++{
++	char *arg;
++	unsigned long value;
++	int ret;
++
++	arg = strim(text);
++	if (!*arg) {
++		*reset_ms = FJ_USBHOST_DEFAULT_RESET_MS;
++		return 0;
++	}
++
++	ret = kstrtoul(arg, 10, &value);
++	if (ret)
++		return ret;
++	if (value < FJ_USBHOST_MIN_RESET_MS || value > FJ_USBHOST_MAX_RESET_MS)
++		return -EINVAL;
++
++	*reset_ms = value;
++	return 0;
++}
++
++static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
++				size_t count, loff_t *ppos)
++{
++	struct fruitjam_usbhost *uh = container_of(file->private_data,
++			struct fruitjam_usbhost, miscdev);
++	char tmp[FJ_USBHOST_COMMAND_MAX];
++	char *cmd;
++	u32 reset_ms;
++	int ret = 0;
++
++	if (!count)
++		return 0;
++	if (count >= sizeof(tmp))
++		return -EINVAL;
++	if (copy_from_user(tmp, buf, count))
++		return -EFAULT;
++	tmp[count] = '\0';
++	cmd = strim(tmp);
++
++	mutex_lock(&uh->lock);
++	if (!strcmp(cmd, "on")) {
++		fj_gpio_output(uh, uh->power_gpio, true);
++	} else if (!strcmp(cmd, "off")) {
++		fj_gpio_output(uh, uh->power_gpio, false);
++		fj_gpio_input(uh, uh->dp_gpio);
++		fj_gpio_input(uh, uh->dm_gpio);
++	} else if (!strncmp(cmd, "reset", 5) &&
++		   (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t')) {
++		ret = fj_usbhost_parse_reset_ms(cmd + 5, &reset_ms);
++		if (!ret)
++			fj_usbhost_reset_bus(uh, reset_ms);
++	} else if (!strcmp(cmd, "status")) {
++		/* read-only command for shell scripts that write then read */
++	} else {
++		ret = -EINVAL;
++	}
++	mutex_unlock(&uh->lock);
++
++	return ret ? ret : count;
++}
++
++static const struct file_operations fj_usbhost_fops = {
++	.owner = THIS_MODULE,
++	.read = fj_usbhost_read,
++	.write = fj_usbhost_write,
++	.llseek = noop_llseek,
++};
++
++static void __iomem *fj_ioremap_byname(struct platform_device *pdev,
++				       const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return ERR_PTR(-EINVAL);
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
++static int fj_usbhost_probe(struct platform_device *pdev)
++{
++	struct fruitjam_usbhost *uh;
++	int ret;
++
++	uh = devm_kzalloc(&pdev->dev, sizeof(*uh), GFP_KERNEL);
++	if (!uh)
++		return -ENOMEM;
++
++	uh->dev = &pdev->dev;
++	mutex_init(&uh->lock);
++	uh->dp_gpio = FJ_USBHOST_DEFAULT_DP_GPIO;
++	uh->dm_gpio = FJ_USBHOST_DEFAULT_DM_GPIO;
++	uh->power_gpio = FJ_USBHOST_DEFAULT_POWER_GPIO;
++	device_property_read_u32(&pdev->dev, "raspberrypi,dp-gpio", &uh->dp_gpio);
++	device_property_read_u32(&pdev->dev, "raspberrypi,dm-gpio", &uh->dm_gpio);
++	device_property_read_u32(&pdev->dev, "raspberrypi,power-gpio", &uh->power_gpio);
++
++	uh->sio = fj_ioremap_byname(pdev, "sio");
++	if (IS_ERR(uh->sio))
++		return PTR_ERR(uh->sio);
++	uh->io_bank0 = fj_ioremap_byname(pdev, "io-bank0");
++	if (IS_ERR(uh->io_bank0))
++		return PTR_ERR(uh->io_bank0);
++	uh->pads_bank0 = fj_ioremap_byname(pdev, "pads-bank0");
++	if (IS_ERR(uh->pads_bank0))
++		return PTR_ERR(uh->pads_bank0);
++
++	platform_set_drvdata(pdev, uh);
++	fj_usbhost_configure(uh);
++
++	uh->miscdev.minor = MISC_DYNAMIC_MINOR;
++	uh->miscdev.name = "fruitjam-usbhost";
++	uh->miscdev.fops = &fj_usbhost_fops;
++	uh->miscdev.parent = &pdev->dev;
++
++	ret = misc_register(&uh->miscdev);
++	if (ret)
++		return ret;
++
++	dev_info(&pdev->dev,
++		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u\n",
++		 uh->dp_gpio, uh->dm_gpio, uh->power_gpio);
++	return 0;
++}
++
++static void fj_usbhost_remove(struct platform_device *pdev)
++{
++	struct fruitjam_usbhost *uh = platform_get_drvdata(pdev);
++
++	misc_deregister(&uh->miscdev);
++}
++
++static const struct of_device_id fj_usbhost_of_match[] = {
++	{ .compatible = "adafruit,fruit-jam-rp2350-usbhost" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, fj_usbhost_of_match);
++
++static struct platform_driver fj_usbhost_driver = {
++	.probe = fj_usbhost_probe,
++	.remove = fj_usbhost_remove,
++	.driver = {
++		.name = "fruitjam-usbhost",
++		.of_match_table = fj_usbhost_of_match,
++	},
++};
++module_platform_driver(fj_usbhost_driver);
++
++MODULE_AUTHOR("Codex");
++MODULE_DESCRIPTION("Adafruit Fruit Jam RP2350 USB host bridge");
++MODULE_LICENSE("GPL");

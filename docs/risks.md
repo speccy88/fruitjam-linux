@@ -25,12 +25,12 @@ Practical rules:
   validation.
 * UART is on GPIO8/GPIO9 using UART1. The USB-C serial device is not the Linux
   console; use a 3.3 V hardware UART adapter.
-* `fruitjamctl` touches low-risk GPIOs through `/dev/mem` for diagnostics. It is
-  not a substitute for proper kernel GPIO/LED/input/USB-host/I2S/HSTX drivers.
+* `fruitjamctl` uses the narrow sysfs GPIO path for diagnostics. It is not a
+  substitute for proper kernel LED/input/USB-host/I2S/HSTX drivers.
 * `fruitjamctl bootsel` uses the RP2350 bootrom watchdog-vector protocol and has
   been verified to re-enumerate as ROM BOOTSEL with `picotool info -a`.
-* microSD, HSTX DVI, I2S audio, AirLift networking, and USB keyboard support are
-  not implemented yet. Their pin mappings are documented to guide later work only.
+* microSD, HSTX DVI, first-step I2S tone audio, and AirLift userspace networking
+  now have narrow support. USB keyboard protocol support is still not implemented.
 * The NeoPixel driver uses PIO directly and is intentionally narrow: five onboard
   GPIO32 pixels through `/dev/neopixels`, not a general RP2350 PIO framework.
 

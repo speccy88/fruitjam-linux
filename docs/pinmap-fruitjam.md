@@ -27,9 +27,9 @@ onboard NeoPixels; the remaining entries are planning notes for later milestones
 | HSTX DVI D0N/D0P | GPIO14/GPIO15 | `/dev/fruitjam-dvi` partial path | Used by the bounded dashboard/text/test frame helper. |
 | HSTX DVI D1N/D1P | GPIO16/GPIO17 | `/dev/fruitjam-dvi` partial path | Used by the bounded dashboard/text/test frame helper. |
 | HSTX DVI D2N/D2P | GPIO18/GPIO19 | `/dev/fruitjam-dvi` partial path | Used by the bounded dashboard/text/test frame helper. |
-| USB host D+ | GPIO1 | Not implemented | Connected through the Fruit Jam USB host/hub path. |
-| USB host D- | GPIO2 | Not implemented | Connected through the Fruit Jam USB host/hub path. |
-| USB host 5V power | GPIO11 | `fruitjamctl` power switch only | Power-enable/control for USB host 5 V path; Linux USB host protocol driver is not implemented. |
+| USB host D+ | GPIO1 | `/dev/fruitjam-usbhost` line/reset bridge plus staged PIO2 host program | Connected through the Fruit Jam PIO USB host path; packet transactions and HID polling are still pending. |
+| USB host D- | GPIO2 | `/dev/fruitjam-usbhost` line/reset bridge plus staged PIO2 host program | Connected through the Fruit Jam PIO USB host path; packet transactions and HID polling are still pending. |
+| USB host 5V power | GPIO11 | `/dev/fruitjam-usbhost` and `fruitjamctl` power switch | Power-enable/control for USB host 5 V path; Linux USB host protocol driver is not implemented. |
 | ESP32-C6 SPI SCK | GPIO30 | AirLift userspace SPI | RP2350 PL022/spidev path used by `airliftctl`. |
 | ESP32-C6 SPI MOSI | GPIO31 | AirLift userspace SPI | Shared board SPI MOSI, used by `airliftctl`. |
 | ESP32-C6 SPI MISO | GPIO28 | AirLift userspace SPI | Shared board SPI MISO, used by `airliftctl`. |

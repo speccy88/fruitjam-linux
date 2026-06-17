@@ -69,7 +69,7 @@
 #define MHZ		1000000UL
 
 #define PLL_USB_HZ	(48UL * MHZ)
-#define PLL_SYS_HZ	(150UL * MHZ)
+#define PLL_SYS_HZ	(144UL * MHZ)
 #define XOSC_HZ		(12UL * MHZ)
 
 #define CLK_USB		PLL_USB_HZ
@@ -165,7 +165,7 @@ static inline void set_usb_pll(void) {
 
 static inline void set_sys_pll(void) {
 	PLL_SYS_BASE[PLL_CS_REG] = 1; // REFDIV = 1
-	PLL_SYS_BASE[PLL_FBDIV_INT_REG] = 125; // 12MHz*125 = 1500MHz
+	PLL_SYS_BASE[PLL_FBDIV_INT_REG] = 120; // 12MHz*120 = 1440MHz
 
 	// Power up the PLL
 	PLL_SYS_BASE[PLL_PWR_REG] &= NBIT(PLL_PWR_PD_SHIFT) & NBIT(PLL_PWR_VCOPD_SHIFT);
@@ -173,7 +173,7 @@ static inline void set_sys_pll(void) {
 	// Wait for PLL to lock
 	loop_until_bit_is_set(PLL_SYS_BASE[PLL_CS_REG], PLL_CS_LOCK_SHIFT);
 
-	// 1500MHz / (5 * 2) = 150MHz
+	// 1440MHz / (5 * 2) = 144MHz
 	PLL_SYS_BASE[PLL_PRIM_REG] = (5 << PLL_PRIM_PDIV1_SHIFT) | (2 << PLL_PRIM_PDIV2_SHIFT);
 
 	// Enable PLL output

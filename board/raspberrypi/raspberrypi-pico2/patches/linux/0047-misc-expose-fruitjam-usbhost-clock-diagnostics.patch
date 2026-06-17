@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fredrik Holmqvist <fredrik@adafruit.com>
+Date: Tue, 16 Jun 2026 16:52:00 -0400
+Subject: [PATCH] misc: expose Fruit Jam usbhost clock diagnostics
+
+The Fruit Jam bootloader and DT run clk_sys at 144 MHz.  The usbhost bridge
+already accepts a DT override, but the fallback still said 150 MHz and status
+did not report the active clock or PIO dividers.  That makes USB full-speed
+timing failures hard to distinguish from packet sequencing failures.
+
+Default the board-specific bridge to 144 MHz and include the active clock and
+TX/RX/EOP PIO CLKDIV registers in /dev/fruitjam-usbhost status output.
+---
+ drivers/misc/fruitjam_usbhost.c | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -45,1 +45,1 @@
+-#define FJ_USBHOST_CLK_SYS_HZ_DEFAULT	150000000u
++#define FJ_USBHOST_CLK_SYS_HZ_DEFAULT	144000000u
+@@ -1802,6 +1802,9 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 	u32 tx_addr = tx_sm ? readl(tx_sm + FJ_PIO_SM_ADDR) & 0x1f : 0;
+ 	u32 rx_addr = rx_sm ? readl(rx_sm + FJ_PIO_SM_ADDR) & 0x1f : 0;
+ 	u32 eop_addr = eop_sm ? readl(eop_sm + FJ_PIO_SM_ADDR) & 0x1f : 0;
++	u32 tx_clkdiv = tx_sm ? readl(tx_sm + FJ_PIO_SM_CLKDIV) : 0;
++	u32 rx_clkdiv = rx_sm ? readl(rx_sm + FJ_PIO_SM_CLKDIV) : 0;
++	u32 eop_clkdiv = eop_sm ? readl(eop_sm + FJ_PIO_SM_CLKDIV) : 0;
+ 	u32 tx_execctrl = tx_sm ? readl(tx_sm + FJ_PIO_SM_EXECCTRL) : 0;
+ 	u32 rx_execctrl = rx_sm ? readl(rx_sm + FJ_PIO_SM_EXECCTRL) : 0;
+ 	u32 eop_execctrl = eop_sm ? readl(eop_sm + FJ_PIO_SM_EXECCTRL) : 0;
+@@ -1840,6 +1843,10 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 			 "pio_configured %u\n"
+ 			 "pio_program %s\n"
+ 			 "tx_sm %u\nrx_sm %u\neop_sm %u\n"
++			 "clk_sys_hz %u\n"
++			 "tx_clkdiv 0x%08x\n"
++			 "rx_clkdiv 0x%08x\n"
++			 "eop_clkdiv 0x%08x\n"
+ 			 "packets %u\n"
+ 			 "tx_errors %u\n"
+ 			 "last_tx_result %d\n"
+@@ -1882,10 +1889,11 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 					 "pio-packet-io-pending",
+ 			 uh->pio_index, uh->pio_ready, uh->pio_configured,
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+-			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->packets,
+-			 uh->tx_errors, uh->last_tx_result, uh->last_tx_len,
+-			 uh->dma ? 1 : 0, uh->tx_dma_channel, uh->tx_dma_packets,
+-			 uh->last_dma_result, uh->last_dma_ctrl,
++			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->clk_sys_hz,
++			 tx_clkdiv, rx_clkdiv, eop_clkdiv,
++			 uh->packets, uh->tx_errors, uh->last_tx_result,
++			 uh->last_tx_len, uh->dma ? 1 : 0, uh->tx_dma_channel,
++			 uh->tx_dma_packets, uh->last_dma_result, uh->last_dma_ctrl,
+ 			 uh->rx_attempts, uh->rx_errors, uh->last_rx_result,
+ 			 uh->last_rx_len, uh->last_rx_pid, uh->last_rx_irq,
+ 			 uh->last_rx_flevel, rx_hex,
+@@ -2117,10 +2125,10 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 		return ret;
+ 
+ 	dev_info(&pdev->dev,
+-		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u dma=%u ch=%u\n",
++		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u clk_sys_hz=%u dma=%u ch=%u\n",
+ 		 uh->dp_gpio, uh->dm_gpio, uh->power_gpio, uh->pio_index,
+-		 uh->pio_ready, uh->pio_configured, uh->dma ? 1 : 0,
+-		 uh->tx_dma_channel);
++		 uh->pio_ready, uh->pio_configured, uh->clk_sys_hz,
++		 uh->dma ? 1 : 0, uh->tx_dma_channel);
+ 	return 0;
+ }
+ 
+-- 
+2.39.5

@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 11:10:00 -0400
+Subject: [PATCH] misc: stage Fruit Jam USB host PIO2 engine
+
+Move the Fruit Jam USB host bridge one step closer to real boot-keyboard
+support by reserving PIO2 for the USB host packet engine and loading the
+32-word Pico-PIO-USB full-speed host program into its instruction RAM.
+
+PIO0 is used by NeoPixels and PIO1 is used by the current audio clock/tone
+path, so the USB bridge must not share either block.  This patch does not
+start transactions or claim HID polling is complete; it exposes a small
+status/self-test surface so the next patch can add token/data transfers on a
+known-good, non-conflicting PIO block.
+---
+ drivers/misc/fruitjam_usbhost.c | 139 +++++++++++++++++++++++++++++++-
+ 1 file changed, 136 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 30b83cb4760d..99bf2ad6cc17 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -35,6 +36,24 @@
+ #define FJ_USBHOST_POST_RESET_MS	100u
+ #define FJ_USBHOST_COMMAND_MAX		64u
+ 
++#define FJ_USBHOST_PIO_INDEX_DEFAULT	2u
++#define FJ_USBHOST_SM_TX_DEFAULT	0u
++#define FJ_USBHOST_SM_RX_DEFAULT	1u
++#define FJ_USBHOST_SM_EOP_DEFAULT	2u
++#define FJ_USBHOST_CLK_SYS_HZ_DEFAULT	150000000u
++#define FJ_USBHOST_PIO_PROGRAM_WORDS	32u
++#define FJ_USBHOST_PIO_PROGRAM_NAME	"pico-pio-usb-fs-host-32word"
++
++#define FJ_PIO_CTRL			0x000
++#define FJ_PIO_INSTR_MEM		0x048
++#define FJ_PIO_GPIOBASE			0x168
++
++#define FJ_RESETS_RESET			0x000
++#define FJ_RESETS_DONE			0x008
++#define FJ_RESET_PIO0			11u
++
++#define FJ_PIO_CTRL_SM_ENABLE(sm)	BIT(sm)
++
+ #define FJ_SIO_GPIO_IN			0x004
+ #define FJ_SIO_GPIO_HI_IN		0x008
+ #define FJ_SIO_GPIO_OUT			0x010
+@@ -61,12 +103,36 @@ struct fruitjam_usbhost {
+ 	void __iomem *sio;
+ 	void __iomem *io_bank0;
+ 	void __iomem *pads_bank0;
++	void __iomem *pio;
++	void __iomem *resets;
+ 	u32 dp_gpio;
+ 	u32 dm_gpio;
+ 	u32 power_gpio;
++	u32 pio_index;
++	u32 sm_tx;
++	u32 sm_rx;
++	u32 sm_eop;
++	u32 clk_sys_hz;
+ 	u32 last_reset_ms;
++	bool pio_ready;
+ };
+ 
++/*
++ * Generated instruction words from Pico-PIO-USB's full-speed host TX/RX/EOP
++ * programs.  The upstream project is MIT-licensed and reports FS/LS host,
++ * hub, and multi-port support; this driver only stages the minimal single
++ * Fruit Jam root-port program before adding transactions.
++ */
++static const u16 fj_usbhost_pio_program[FJ_USBHOST_PIO_PROGRAM_WORDS] = {
++	0xc700, 0x6ba2, 0xeb80, 0x73a2, 0xe883,
++	0xe046, 0x20c4, 0x0066, 0x00c7, 0x0028,
++	0x4061, 0xa029, 0x0025, 0x40e1, 0x0081,
++	0xc022, 0x00c1, 0xc103, 0xc104, 0x00cc,
++	0x00cc, 0x00cc, 0x00cc, 0x00cc, 0x00cc,
++	0xa126, 0x0040, 0xa1c3, 0xc004, 0x4001,
++	0x00ca, 0x0006,
++};
++
+ static u32 fj_gpio_mask(unsigned int gpio)
+ {
+ 	return BIT(gpio & 31);
+@@ -138,6 +198,57 @@ static bool fj_usbhost_present(const char *state)
+ 	       !strcmp(state, "low-speed-device");
+ }
+ 
++static bool fj_usbhost_pio_available(struct fruitjam_usbhost *uh)
++{
++	return uh->pio && uh->resets && uh->pio_index <= 2 &&
++	       uh->sm_tx <= 3 && uh->sm_rx <= 3 && uh->sm_eop <= 3 &&
++	       uh->sm_tx != uh->sm_rx && uh->sm_tx != uh->sm_eop &&
++	       uh->sm_rx != uh->sm_eop;
++}
++
++static void fj_usbhost_pio_sm_disable(struct fruitjam_usbhost *uh, u32 sm)
++{
++	u32 ctrl = readl(uh->pio + FJ_PIO_CTRL);
++
++	ctrl &= ~FJ_PIO_CTRL_SM_ENABLE(sm);
++	writel(ctrl, uh->pio + FJ_PIO_CTRL);
++}
++
++static int fj_usbhost_pio_init(struct fruitjam_usbhost *uh)
++{
++	u32 reset_bit = BIT(FJ_RESET_PIO0 + uh->pio_index);
++	u32 reset;
++	int i;
++
++	uh->pio_ready = false;
++	if (!fj_usbhost_pio_available(uh))
++		return -ENODEV;
++
++	fj_usbhost_pio_sm_disable(uh, uh->sm_tx);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_eop);
++
++	reset = readl(uh->resets + FJ_RESETS_RESET);
++	reset &= ~reset_bit;
++	writel(reset, uh->resets + FJ_RESETS_RESET);
++	for (i = 0; i < 100000; i++) {
++		if (readl(uh->resets + FJ_RESETS_DONE) & reset_bit)
++			break;
++		cpu_relax();
++	}
++	if (i == 100000)
++		return -ETIMEDOUT;
++
++	writel(0, uh->pio + FJ_PIO_GPIOBASE);
++	for (i = 0; i < ARRAY_SIZE(fj_usbhost_pio_program); i++)
++		writel(fj_usbhost_pio_program[i],
++		       uh->pio + FJ_PIO_INSTR_MEM + i * 4);
++	wmb();
++
++	uh->pio_ready = true;
++	return 0;
++}
++
+ static void fj_usbhost_configure(struct fruitjam_usbhost *uh)
+ {
+ 	fj_gpio_input(uh, uh->dp_gpio);
+@@ -172,7 +287,12 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 			 "present %u\n"
+ 			 "hid 0\n"
+ 			 "driver kernel-line-state\n"
+-			 "bridge pio-packet-io-pending\n"
++			 "bridge %s\n"
++			 "pio %u\n"
++			 "pio_ready %u\n"
++			 "pio_program %s\n"
++			 "tx_sm %u\nrx_sm %u\neop_sm %u\n"
++			 "packets 0\n"
+ 			 "first_milestone boot-protocol-keyboard\n"
+ 			 "reports 0\n"
+ 			 "last_reset_ms %u\n",
+@@ -180,5 +300,9 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 			 power, dp, dm, state, fj_usbhost_present(state),
+-			 uh->last_reset_ms);
++			 uh->pio_ready ? "pio-packet-io-program-loaded" :
++					 "pio-packet-io-pending",
++			 uh->pio_index, uh->pio_ready,
++			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
++			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->last_reset_ms);
+ }
+ 
+ static ssize_t fj_usbhost_read(struct file *file, char __user *buf,
+@@ -285,6 +411,18 @@ static void __iomem *fj_ioremap_byname(struct platform_device *pdev,
+ 	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
+ }
+ 
++static void __iomem *fj_ioremap_optional_byname(struct platform_device *pdev,
++						const char *name)
++{
++	struct resource *res;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++	if (!res)
++		return NULL;
++
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res));
++}
++
+ static int fj_usbhost_probe(struct platform_device *pdev)
+ {
+ 	struct fruitjam_usbhost *uh;
+@@ -302,9 +441,19 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	uh->dp_gpio = FJ_USBHOST_DEFAULT_DP_GPIO;
+ 	uh->dm_gpio = FJ_USBHOST_DEFAULT_DM_GPIO;
+ 	uh->power_gpio = FJ_USBHOST_DEFAULT_POWER_GPIO;
++	uh->pio_index = FJ_USBHOST_PIO_INDEX_DEFAULT;
++	uh->sm_tx = FJ_USBHOST_SM_TX_DEFAULT;
++	uh->sm_rx = FJ_USBHOST_SM_RX_DEFAULT;
++	uh->sm_eop = FJ_USBHOST_SM_EOP_DEFAULT;
++	uh->clk_sys_hz = FJ_USBHOST_CLK_SYS_HZ_DEFAULT;
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dp-gpio", &uh->dp_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dm-gpio", &uh->dm_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,power-gpio", &uh->power_gpio);
++	device_property_read_u32(&pdev->dev, "raspberrypi,pio", &uh->pio_index);
++	device_property_read_u32(&pdev->dev, "raspberrypi,sm-tx", &uh->sm_tx);
++	device_property_read_u32(&pdev->dev, "raspberrypi,sm-rx", &uh->sm_rx);
++	device_property_read_u32(&pdev->dev, "raspberrypi,sm-eop", &uh->sm_eop);
++	device_property_read_u32(&pdev->dev, "raspberrypi,clk-sys-hz", &uh->clk_sys_hz);
+ 
+ 	uh->sio = fj_ioremap_byname(pdev, "sio");
+ 	if (IS_ERR(uh->sio))
+@@ -316,9 +464,19 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	uh->pads_bank0 = fj_ioremap_byname(pdev, "pads-bank0");
+ 	if (IS_ERR(uh->pads_bank0))
+ 		return PTR_ERR(uh->pads_bank0);
++	uh->pio = fj_ioremap_optional_byname(pdev, "pio");
++	if (IS_ERR(uh->pio))
++		return PTR_ERR(uh->pio);
++	uh->resets = fj_ioremap_optional_byname(pdev, "resets");
++	if (IS_ERR(uh->resets))
++		return PTR_ERR(uh->resets);
+ 
+ 	platform_set_drvdata(pdev, uh);
+ 	fj_usbhost_configure(uh);
++	ret = fj_usbhost_pio_init(uh);
++	if (ret && ret != -ENODEV)
++		dev_warn(&pdev->dev, "USB host PIO%u init failed: %d\n",
++			 uh->pio_index, ret);
+ 
+ 	uh->miscdev.minor = MISC_DYNAMIC_MINOR;
+ 	uh->miscdev.name = "fruitjam-usbhost";
+@@ -331,8 +486,9 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 		return ret;
+ 
+ 	dev_info(&pdev->dev,
+-		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u\n",
+-		 uh->dp_gpio, uh->dm_gpio, uh->power_gpio);
++		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u\n",
++		 uh->dp_gpio, uh->dm_gpio, uh->power_gpio, uh->pio_index,
++		 uh->pio_ready);
+ 	return 0;
+ }
+ 

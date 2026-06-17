@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 20:35:00 -0400
+Subject: [PATCH] misc: drain Fruit Jam usbhost RX FIFO after EOP
+
+The EOP detector and NRZI decoder are separate PIO state machines.  On short
+device replies the EOP flag can be visible to the CPU before the decoder's final
+autopush has reached the RX FIFO.  Drain for a short bounded window after EOP
+before deciding that the packet was empty.
+---
+ drivers/misc/fruitjam_usbhost.c | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index eeeeeeeeeeee..ffffffffffff 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1106,6 +1106,19 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ 	u32 len = 0;
+ 	int ret = -ETIMEDOUT;
+ 
++#define FJ_USBHOST_DRAIN_RX_FIFO()						\
++	do {									\
++		while (!(readl(uh->pio + FJ_PIO_FSTAT) &			\
++			 FJ_PIO_FSTAT_RXEMPTY(uh->sm_rx))) {			\
++			if (len >= FJ_USBHOST_RX_BYTES_MAX) {			\
++				ret = -EOVERFLOW;				\
++				goto out;					\
++			}							\
++			uh->last_rx_bytes[len++] =				\
++				readl(uh->pio + FJ_PIO_RXF(uh->sm_rx)) >> 24;	\
++		}								\
++	} while (0)
++
+ 	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
+ 	for (waited = 0; waited < FJ_USBHOST_RX_TIMEOUT_US; waited++) {
+ 		u32 irq;
+@@ -1116,19 +1129,20 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+-		while (!(readl(uh->pio + FJ_PIO_FSTAT) &
+-			 FJ_PIO_FSTAT_RXEMPTY(uh->sm_rx))) {
+-			if (len >= FJ_USBHOST_RX_BYTES_MAX) {
+-				ret = -EOVERFLOW;
+-				goto out;
+-			}
+-			uh->last_rx_bytes[len++] =
+-				readl(uh->pio + FJ_PIO_RXF(uh->sm_rx)) >> 24;
+-		}
++		FJ_USBHOST_DRAIN_RX_FIFO();
+ 
+ 		irq = readl(uh->pio + FJ_PIO_IRQ);
+ 		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
+ 			ret = -EILSEQ;
+ 			break;
+ 		}
+ 		if (irq & FJ_PIO_IRQ_RX_EOP) {
++			u32 drain_waited;
++
++			for (drain_waited = 0; !len && drain_waited < 50;
++			     drain_waited++) {
++				FJ_USBHOST_DRAIN_RX_FIFO();
++				if (len)
++					break;
++				udelay(1);
++			}
+ 			ret = len ? 0 : -ENODATA;
+ 			break;
+ 		}
+@@ -1143,6 +1157,7 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ 	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+ 	fj_usbhost_pio_record_rx(uh, ret, len);
+ 	return ret;
++#undef FJ_USBHOST_DRAIN_RX_FIFO
+ }
+ 
+ static int fj_usbhost_pio_require_configured(struct fruitjam_usbhost *uh)
+-- 
+2.39.5

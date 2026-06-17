@@ -44,11 +44,17 @@ check_exec /usr/bin/fruitjam-adc
 check_exec /usr/bin/fruitjam-dvi
 check_exec /usr/bin/fruitjam-i2c
 check_exec /usr/bin/fruitjam-usbhost
+check_exec /usr/bin/fruitjam-hidkeys
+check_exec /usr/bin/fruitjam-mem
+check_exec /usr/bin/free
 check_exec /usr/bin/wget
 check_path /dev/neopixels
 check_path /dev/fruitjam-audio
 check_path /dev/fruitjam-dvi
 check_path /dev/i2c-0
 check_path /mnt/sd
+
+echo "== memory =="
+fruitjam-mem
 
 echo "00-board-info.sh: ok"

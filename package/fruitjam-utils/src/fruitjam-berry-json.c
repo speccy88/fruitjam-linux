@@ -34,6 +34,7 @@ static const char *const berry_scripts[] = {
 	"03-buttons.be",
 	"04-adc-summary.be",
 	"05-usbhost-status.be",
+	"06-fruitjam-module.be",
 	"neopixels.be",
 	"neopixel-colors.be",
 	"neopixel-rainbow-10s.be",

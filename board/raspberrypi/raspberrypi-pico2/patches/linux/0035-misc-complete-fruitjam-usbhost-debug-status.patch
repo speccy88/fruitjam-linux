@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 14:06:00 -0400
+Subject: [PATCH] misc: complete Fruit Jam usbhost debug status
+
+The previous patch adds the low-level debug fields to the status format.
+Pass the matching values into scnprintf and keep the larger status buffer
+off the kernel stack.
+---
+ drivers/misc/fruitjam_usbhost.c | 28 ++++++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 999999999999..aaaaaaaaaaaa 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1362,7 +1362,12 @@
+ 			 uh->last_rx_len, uh->last_rx_pid, uh->last_rx_irq,
+ 			 uh->last_rx_flevel, rx_hex,
+ 			 uh->last_pio_fstat, uh->last_pio_fdebug,
+-			 uh->last_pio_irq, uh->last_reset_ms);
++			 uh->last_pio_irq, pio_ctrl,
++			 tx_addr, rx_addr, eop_addr,
++			 tx_execctrl, rx_execctrl, eop_execctrl,
++			 tx_pinctrl, rx_pinctrl, eop_pinctrl,
++			 dp_ctrl, dm_ctrl, dp_pad, dm_pad,
++			 uh->last_reset_ms);
+ }
+ 
+ static ssize_t fj_usbhost_read(struct file *file, char __user *buf,
+@@ -1370,14 +1375,22 @@
+ {
+ 	struct fruitjam_usbhost *uh = container_of(file->private_data,
+ 			struct fruitjam_usbhost, miscdev);
+-	char tmp[1024];
++	char *tmp;
+ 	int len;
++	int ret;
+ 
++	tmp = kzalloc(2048, GFP_KERNEL);
++	if (!tmp)
++		return -ENOMEM;
++
+ 	mutex_lock(&uh->lock);
+-	len = fj_usbhost_format_status(uh, tmp, sizeof(tmp));
++	len = fj_usbhost_format_status(uh, tmp, 2048);
+ 	mutex_unlock(&uh->lock);
+ 
+-	return simple_read_from_buffer(buf, count, ppos, tmp, len);
++	ret = simple_read_from_buffer(buf, count, ppos, tmp, len);
++	kfree(tmp);
++
++	return ret;
+ }
+ 
+ static int fj_usbhost_parse_reset_ms(char *text, u32 *reset_ms)
+-- 
+2.39.5

@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 17:05:00 +0000
+Subject: [PATCH] misc: initialize Fruit Jam usbhost EOP SM PC
+
+Pico-PIO-USB initializes every state machine with pio_sm_init(), which
+loads the initial program counter with a jmp to the program offset.  The
+Fruit Jam bridge was doing that manually for TX and RX, but left the EOP
+state machine at reset/stale PC while only programming its control
+registers.
+
+Jump the EOP state machine to the edge detector program before enabling it.
+Also let the self-RX diagnostic release the initial RX_EOP wait before
+transmitting so it can intentionally observe the host-driven packet.
+---
+ drivers/misc/fruitjam_usbhost.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 333333333333..444444444444 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -141,6 +141,7 @@
+ #define FJ_PIO_RX_INIT_INSTR		(FJ_PIO_RX_OFFSET)
+ #define FJ_PIO_RX_OSR_ONES_INSTR	0xa0ebu
+ #define FJ_PIO_RX_SET_X_ZERO_INSTR	0xe020u
++#define FJ_PIO_EOP_INIT_INSTR		(FJ_PIO_EOP_OFFSET)
+ #define FJ_PIO_INSTR_OP_MASK		0xe000u
+ #define FJ_PIO_INSTR_JMP		0x0000u
+ #define FJ_PIO_INSTR_ADDR_MASK		0x001fu
+@@ -560,6 +561,7 @@
+ 	       FJ_PIO_EXECCTRL_WRAP_BOTTOM(FJ_PIO_EOP_WRAP_TARGET),
+ 	       eop_sm + FJ_PIO_SM_EXECCTRL);
+ 	writel(FJ_PIO_PINCTRL_IN_BASE(uh->dp_gpio), eop_sm + FJ_PIO_SM_PINCTRL);
++	writel(FJ_PIO_EOP_INIT_INSTR, eop_sm + FJ_PIO_SM_INSTR);
+ 
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_tx);
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
+@@ -1070,6 +1072,7 @@
+ 		    ((token >> 8) & 0x7);
+ 
+ 	fj_usbhost_pio_prepare_receive(uh);
++	fj_usbhost_pio_clear_rx_irq(uh);
+ 	ret = fj_usbhost_pio_tx_packet(uh, packet, sizeof(packet),
+ 				       &encoded_len);
+ 	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+-- 
+2.39.5

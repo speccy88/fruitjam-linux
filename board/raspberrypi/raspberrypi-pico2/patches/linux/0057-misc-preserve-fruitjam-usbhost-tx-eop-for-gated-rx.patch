@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 00:36:00 +0000
+Subject: [PATCH] misc: preserve Fruit Jam usbhost TX-EOP for gated RX
+
+The gated receive probes arm the EOP state machine before TX and make it
+wait on the host TX-EOP IRQ before watching for the device response.  The
+TX-complete helper also consumed that IRQ as soon as the CPU observed it,
+which could race the EOP state machine and leave the receive gate closed.
+
+Leave TX-EOP latched until the next packet setup clears stale TX state.  Keep
+the existing short-packet behavior that treats observed TX-EOP as completion
+even if the CPU samples the state machine before it reaches the post-EOP
+compare window.
+---
+ drivers/misc/fruitjam_usbhost.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -984,6 +984,12 @@ static bool fj_usbhost_pio_dma_tx_idle(struct fruitjam_usbhost *uh,
+ 	       (fdebug & FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx));
+ }
+ 
++static bool fj_usbhost_pio_tx_comp_done(struct fruitjam_usbhost *uh, u32 addr)
++{
++	return uh->low_speed ? addr > FJ_USB_TX_ENCODED_COMP :
++			       addr >= FJ_USB_TX_ENCODED_COMP;
++}
++
+ static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
+ {
+ 	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
+@@ -994,14 +1000,13 @@ static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
+ 		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
+ 
+ 		if (irq & FJ_PIO_IRQ_TX_EOP) {
+-			writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
+ 			for (waited = 0; waited < FJ_USBHOST_FIFO_TIMEOUT_US; waited++) {
+-				if ((readl(tx_sm + FJ_PIO_SM_ADDR) & 0x1f) >=
+-				    FJ_USB_TX_ENCODED_COMP)
++				if (fj_usbhost_pio_tx_comp_done(
++					    uh, readl(tx_sm + FJ_PIO_SM_ADDR) & 0x1f))
+ 					break;
+ 				udelay(1);
+ 			}
+ 			return 0;
+ 		}
+ 		if (fj_usbhost_pio_dma_tx_idle(uh, tx_sm))
+ 			return 0;
+-- 
+2.39.5

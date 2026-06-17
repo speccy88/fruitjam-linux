@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fred Makes <fred@example.com>
+Date: Wed, 17 Jun 2026 00:48:00 +0000
+Subject: [PATCH] misc: wait for fruitjam usbhost streamed tx idle
+
+The streamed SETUP diagnostic emits both the SETUP token and DATA0 packet in a
+single PIO transfer.  The normal TX completion helper returns on the first TX
+EOP, which is only the SETUP token boundary for this diagnostic.  Add a narrow
+idle wait so the IN token cannot start until DMA is done and the TX state
+machine has reached its released idle stall after DATA0.
+---
+ drivers/misc/fruitjam_usbhost.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 444444444444..555555555555 100644
+@@ -953,7 +953,24 @@ static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
+ 		}
+ 		if (fj_usbhost_pio_dma_tx_idle(uh, tx_sm))
+ 			return 0;
++
++		udelay(1);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int fj_usbhost_pio_wait_tx_stream_idle(struct fruitjam_usbhost *uh)
++{
++	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
++	u32 waited;
+ 
++	/* A streamed setup has one EOP per packet; wait for the final idle. */
++	for (waited = 0; waited < FJ_USBHOST_TX_TIMEOUT_US; waited++) {
++		if (fj_usbhost_pio_dma_tx_idle(uh, tx_sm)) {
++			writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++			return 0;
++		}
+ 		udelay(1);
+ 	}
+ 
+@@ -1322,7 +1339,10 @@ static int fj_usbhost_pio_tx_two_packets_no_release(
+ 		return ret;
+ 	}
+ 
+-	return fj_usbhost_pio_tx_encoded(uh, encoded, *encoded_len);
++	ret = fj_usbhost_pio_tx_encoded(uh, encoded, *encoded_len);
++	if (ret)
++		return ret;
++	return fj_usbhost_pio_wait_tx_stream_idle(uh);
+ }
+ 
+ static int fj_usbhost_pio_send_setup_data0_stream(struct fruitjam_usbhost *uh,
+-- 
+2.39.5

@@ -774,6 +774,7 @@ def tool_inventory_command() -> str:
         "fruitjam-wavplay",
         "fruitjam-dvi",
         "fruitjam-usbhost",
+        "fruitjam-hidkeys",
         "fruitjam-services",
         "fruitjam-buttons",
         "berry-run",

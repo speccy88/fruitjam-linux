@@ -1,0 +1,588 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 13:05:00 -0400
+Subject: [PATCH] misc: add Fruit Jam USB host PIO2 RX probes
+
+Add bounded receive-side probes to the Fruit Jam USB host bridge.
+The new in-token and get-device-8 commands keep the stack honest:
+they expose raw RX bytes, PIO IRQ state, and result counters without
+claiming HID enumeration/report support yet.
+
+---
+ drivers/misc/fruitjam_usbhost.c | 400 ++++++++++++++++++++++++++++++-
+ 1 file changed, 390 insertions(+), 10 deletions(-)
+
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -44,11 +44,18 @@
+ #define FJ_USBHOST_PIO_PROGRAM_WORDS	32u
+ #define FJ_USBHOST_PIO_PROGRAM_NAME	"pico-pio-usb-fs-host-32word"
+ #define FJ_USBHOST_TX_TIMEOUT_US	2000u
++#define FJ_USBHOST_RX_TIMEOUT_US	2000u
+ #define FJ_USBHOST_FIFO_TIMEOUT_US	1000u
+-#define FJ_USBHOST_TX_ENCODED_MAX	16u
++#define FJ_USBHOST_TX_ENCODED_MAX	96u
++#define FJ_USBHOST_RX_BYTES_MAX		32u
+ 
+ #define FJ_USB_SYNC			0x80u
++#define FJ_USB_PID_IN			0x69u
+ #define FJ_USB_PID_SOF			0xa5u
++#define FJ_USB_PID_SETUP		0x2du
++#define FJ_USB_PID_DATA0		0xc3u
++#define FJ_USB_PID_DATA1		0x4bu
++#define FJ_USB_PID_ACK			0xd2u
+ 
+ #define FJ_USB_TX_ENCODED_SE0		0u
+ #define FJ_USB_TX_ENCODED_K		1u
+@@ -60,6 +67,7 @@
+ #define FJ_PIO_FDEBUG			0x008
+ #define FJ_PIO_FLEVEL			0x00c
+ #define FJ_PIO_TXF(sm)			(0x010 + ((sm) * 4))
++#define FJ_PIO_RXF(sm)			(0x020 + ((sm) * 4))
+ #define FJ_PIO_IRQ			0x030
+ #define FJ_PIO_INSTR_MEM		0x048
+ #define FJ_PIO_SM_BASE(sm)		(0x0c8 + ((sm) * 0x18))
+@@ -78,8 +86,19 @@
+ #define FJ_PIO_CTRL_SM_RESTART(sm)	BIT(4 + (sm))
+ #define FJ_PIO_CTRL_CLKDIV_RESTART(sm)	BIT(8 + (sm))
+ #define FJ_PIO_FSTAT_TXFULL(sm)	BIT(16 + (sm))
++#define FJ_PIO_FSTAT_RXEMPTY(sm)	BIT(8 + (sm))
++#define FJ_PIO_FLEVEL_RX_SHIFT(sm)	(4 + ((sm) * 8))
++#define FJ_PIO_FLEVEL_RX_MASK(sm)	(0xfu << FJ_PIO_FLEVEL_RX_SHIFT(sm))
+ #define FJ_PIO_FDEBUG_TXSTALL(sm)	BIT(24 + (sm))
+ #define FJ_PIO_IRQ_TX_EOP		BIT(0)
++#define FJ_PIO_IRQ_RX_BS_ERR		BIT(1)
++#define FJ_PIO_IRQ_RX_EOP		BIT(2)
++#define FJ_PIO_IRQ_RX_START		BIT(3)
++#define FJ_PIO_IRQ_DECODER_TRIGGER	BIT(4)
++#define FJ_PIO_IRQ_RX_ALL		(FJ_PIO_IRQ_RX_BS_ERR | \
++					 FJ_PIO_IRQ_RX_EOP | \
++					 FJ_PIO_IRQ_RX_START | \
++					 FJ_PIO_IRQ_DECODER_TRIGGER)
+ 
+ #define FJ_PIO_EXECCTRL_JMP_PIN(v)	(((v) & 0x1f) << 24)
+ #define FJ_PIO_EXECCTRL_WRAP_TOP(v)	(((v) & 0x1f) << 12)
+@@ -130,6 +149,10 @@
+ 
+ #define FJ_IO_GPIO_CTRL(gpio)		(0x004 + ((gpio) * 8))
+ #define FJ_PADS_GPIO(gpio)		(0x004 + ((gpio) * 4))
++#define FJ_IO_GPIO_CTRL_FUNCSEL_MASK	0x0000001fu
++#define FJ_IO_GPIO_CTRL_INOVER_MASK	0x00030000u
++#define FJ_IO_GPIO_CTRL_INOVER_NORMAL	0x00000000u
++#define FJ_IO_GPIO_CTRL_INOVER_INVERT	0x00010000u
+ #define FJ_GPIO_FUNC_SIO		5u
+ #define FJ_GPIO_FUNC_PIO0		6u
+ #define FJ_PADS_IE			BIT(6)
+@@ -159,10 +182,18 @@
+ 	u32 packets;
+ 	u32 tx_errors;
+ 	u32 last_tx_len;
++	u32 rx_attempts;
++	u32 rx_errors;
++	u32 last_rx_len;
++	u32 last_rx_pid;
++	u32 last_rx_irq;
++	u32 last_rx_flevel;
+ 	u32 last_pio_fstat;
+ 	u32 last_pio_fdebug;
+ 	u32 last_pio_irq;
+ 	int last_tx_result;
++	int last_rx_result;
++	u8 last_rx_bytes[FJ_USBHOST_RX_BYTES_MAX];
+ 	bool pio_ready;
+ 	bool pio_configured;
+ };
+@@ -196,9 +227,26 @@
+ 
+ static void fj_gpio_func(struct fruitjam_usbhost *uh, unsigned int gpio, u32 func)
+ {
+-	writel(func, uh->io_bank0 + FJ_IO_GPIO_CTRL(gpio));
++	void __iomem *ctrl = uh->io_bank0 + FJ_IO_GPIO_CTRL(gpio);
++	u32 value = readl(ctrl);
++
++	value &= ~(FJ_IO_GPIO_CTRL_FUNCSEL_MASK | FJ_IO_GPIO_CTRL_INOVER_MASK);
++	value |= func & FJ_IO_GPIO_CTRL_FUNCSEL_MASK;
++	writel(value, ctrl);
+ }
+ 
++static void fj_gpio_inover(struct fruitjam_usbhost *uh, unsigned int gpio,
++			   bool invert)
++{
++	void __iomem *ctrl = uh->io_bank0 + FJ_IO_GPIO_CTRL(gpio);
++	u32 value = readl(ctrl);
++
++	value &= ~FJ_IO_GPIO_CTRL_INOVER_MASK;
++	value |= invert ? FJ_IO_GPIO_CTRL_INOVER_INVERT :
++			  FJ_IO_GPIO_CTRL_INOVER_NORMAL;
++	writel(value, ctrl);
++}
++
+ static void fj_gpio_oe(struct fruitjam_usbhost *uh, unsigned int gpio, bool output)
+ {
+ 	u32 lo = output ? FJ_SIO_GPIO_OE_SET : FJ_SIO_GPIO_OE_CLR;
+@@ -220,6 +268,13 @@
+ 	u32 value = readl(fj_sio_reg(uh, gpio, FJ_SIO_GPIO_IN, FJ_SIO_GPIO_HI_IN));
+ 
+ 	return !!(value & fj_gpio_mask(gpio));
++}
++
++static bool fj_gpio_wire_get(struct fruitjam_usbhost *uh, unsigned int gpio)
++{
++	bool value = fj_gpio_in_get(uh, gpio);
++
++	return uh->pio_configured ? !value : value;
+ }
+ 
+ static bool fj_gpio_out_get(struct fruitjam_usbhost *uh, unsigned int gpio)
+@@ -314,6 +369,39 @@
+ 		div_int = 0xffff;
+ 
+ 	return (div_int << 16) | (div_frac << 8);
++}
++
++static void fj_usbhost_pio_sm_clear_fifos(struct fruitjam_usbhost *uh, u32 sm)
++{
++	void __iomem *shiftctrl = fj_usbhost_pio_sm(uh, sm) + FJ_PIO_SM_SHIFTCTRL;
++	u32 value = readl(shiftctrl);
++
++	writel(value ^ FJ_PIO_SHIFTCTRL_FJOIN_RX, shiftctrl);
++	writel(value, shiftctrl);
++}
++
++static void fj_usbhost_pio_prepare_receive(struct fruitjam_usbhost *uh)
++{
++	void __iomem *rx_sm = fj_usbhost_pio_sm(uh, uh->sm_rx);
++
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
++	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_rx);
++}
++
++static void fj_usbhost_pio_clear_rx_irq(struct fruitjam_usbhost *uh)
++{
++	u32 waited;
++
++	writel(FJ_PIO_IRQ_RX_ALL, uh->pio + FJ_PIO_IRQ);
++	for (waited = 0; waited < FJ_USBHOST_FIFO_TIMEOUT_US; waited++) {
++		if (!(readl(uh->pio + FJ_PIO_IRQ) & FJ_PIO_IRQ_RX_ALL))
++			break;
++		udelay(1);
++	}
+ }
+ 
+ static void fj_usbhost_pio_configure_gpio(struct fruitjam_usbhost *uh)
+@@ -328,6 +416,8 @@
+ 	       FJ_PADS_SLEWFAST, uh->pads_bank0 + FJ_PADS_GPIO(uh->dm_gpio));
+ 	fj_gpio_func(uh, uh->dp_gpio, func);
+ 	fj_gpio_func(uh, uh->dm_gpio, func);
++	fj_gpio_inover(uh, uh->dp_gpio, true);
++	fj_gpio_inover(uh, uh->dm_gpio, true);
+ }
+ 
+ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+@@ -518,36 +608,13 @@
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int fj_usbhost_pio_tx_test(struct fruitjam_usbhost *uh)
++static int fj_usbhost_pio_tx_encoded(struct fruitjam_usbhost *uh,
++				     const u8 *encoded, u8 encoded_len)
+ {
+-	u8 packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SOF, 0, 0 };
+-	u8 encoded[FJ_USBHOST_TX_ENCODED_MAX];
+-	u16 frame = uh->packets & 0x7ff;
+-	u16 token = frame;
+-	u8 encoded_len;
+ 	u32 waited;
+ 	int i;
+ 	int ret;
+-
+-	if (!fj_usbhost_pio_available(uh)) {
+-		ret = -ENODEV;
+-		goto out_no_pio;
+-	}
+-	if (!uh->pio_configured) {
+-		ret = fj_usbhost_pio_configure_sms(uh);
+-		if (ret)
+-			goto out_no_pio;
+-	}
+ 
+-	packet[2] = token & 0xff;
+-	packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
+-		    ((token >> 8) & 0x7);
+-	encoded_len = fj_usbhost_encode_tx(packet, sizeof(packet), encoded);
+-	if (encoded_len > sizeof(encoded)) {
+-		ret = -EOVERFLOW;
+-		goto out;
+-	}
+-
+ 	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
+ 	writel(FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx), uh->pio + FJ_PIO_FDEBUG);
+ 	writel(FJ_PIO_TX_START_INSTR,
+@@ -556,27 +623,119 @@
+ 	for (i = 0; i < encoded_len; i++) {
+ 		ret = fj_usbhost_pio_write_tx_byte(uh, encoded[i]);
+ 		if (ret)
+-			goto out;
++			return ret;
+ 	}
+ 
+-	ret = -ETIMEDOUT;
+ 	for (waited = 0; waited < FJ_USBHOST_TX_TIMEOUT_US; waited++) {
+ 		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
+ 		u32 fdebug = readl(uh->pio + FJ_PIO_FDEBUG);
+ 
+ 		if (irq & FJ_PIO_IRQ_TX_EOP) {
+ 			writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
+-			ret = 0;
+-			break;
++			return 0;
+ 		}
+-		if (fdebug & FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx)) {
+-			ret = 0;
+-			break;
+-		}
++		if (fdebug & FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx))
++			return 0;
+ 		udelay(1);
+ 	}
+ 
+-out:
++	return -ETIMEDOUT;
++}
++
++static int fj_usbhost_pio_tx_packet(struct fruitjam_usbhost *uh,
++				    const u8 *packet, u8 packet_len,
++				    u8 *encoded_len)
++{
++	u8 encoded[FJ_USBHOST_TX_ENCODED_MAX];
++	u8 len;
++
++	len = fj_usbhost_encode_tx(packet, packet_len, encoded);
++	if (len > sizeof(encoded))
++		return -EOVERFLOW;
++	*encoded_len = len;
++	return fj_usbhost_pio_tx_encoded(uh, encoded, len);
++}
++
++static int fj_usbhost_pio_send_token(struct fruitjam_usbhost *uh,
++				     u8 pid, u8 addr, u8 ep,
++				     u8 *encoded_len)
++{
++	u16 token = ((u16)(ep & 0xf) << 7) | (addr & 0x7f);
++	u8 packet[4] = { FJ_USB_SYNC, pid, 0, 0 };
++
++	packet[2] = token & 0xff;
++	packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
++		    ((token >> 8) & 0x1f);
++	return fj_usbhost_pio_tx_packet(uh, packet, sizeof(packet), encoded_len);
++}
++
++static u16 fj_usbhost_crc16_data(const u8 *data, u8 len)
++{
++	u16 crc = 0xffff;
++	u8 i;
++
++	while (len--) {
++		crc ^= *data++;
++		for (i = 0; i < 8; i++)
++			crc = (crc & 1) ? (crc >> 1) ^ 0xa001 : crc >> 1;
++	}
++
++	return crc ^ 0xffff;
++}
++
++static int fj_usbhost_pio_send_data0(struct fruitjam_usbhost *uh,
++				     const u8 *payload, u8 payload_len,
++				     u8 *encoded_len)
++{
++	u8 packet[16];
++	u16 crc;
++
++	if (payload_len > 8)
++		return -EINVAL;
++
++	packet[0] = FJ_USB_SYNC;
++	packet[1] = FJ_USB_PID_DATA0;
++	memcpy(packet + 2, payload, payload_len);
++	crc = fj_usbhost_crc16_data(payload, payload_len);
++	packet[2 + payload_len] = crc & 0xff;
++	packet[3 + payload_len] = crc >> 8;
++
++	return fj_usbhost_pio_tx_packet(uh, packet, payload_len + 4,
++					encoded_len);
++}
++
++static int fj_usbhost_pio_send_ack(struct fruitjam_usbhost *uh)
++{
++	u8 packet[2] = { FJ_USB_SYNC, FJ_USB_PID_ACK };
++	u8 encoded_len = 0;
++
++	return fj_usbhost_pio_tx_packet(uh, packet, sizeof(packet), &encoded_len);
++}
++
++static int fj_usbhost_pio_tx_test(struct fruitjam_usbhost *uh)
++{
++	u8 packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SOF, 0, 0 };
++	u16 frame = uh->packets & 0x7ff;
++	u16 token = frame;
++	u8 encoded_len = 0;
++	int ret;
++
++	if (!fj_usbhost_pio_available(uh)) {
++		ret = -ENODEV;
++		goto out_no_pio;
++	}
++	if (!uh->pio_configured) {
++		ret = fj_usbhost_pio_configure_sms(uh);
++		if (ret)
++			goto out_no_pio;
++	}
++
++	packet[2] = token & 0xff;
++	packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
++		    ((token >> 8) & 0x7);
++	ret = fj_usbhost_pio_tx_packet(uh, packet, sizeof(packet),
++				       &encoded_len);
++
+ 	uh->last_tx_result = ret;
+ 	uh->last_tx_len = ret ? 0 : encoded_len;
+ 	uh->last_pio_fstat = readl(uh->pio + FJ_PIO_FSTAT);
+@@ -598,6 +757,167 @@
+ 	return ret;
+ }
+ 
++static void fj_usbhost_pio_record_rx(struct fruitjam_usbhost *uh, int ret,
++				     u32 len)
++{
++	uh->last_rx_result = ret;
++	uh->last_rx_len = len;
++	uh->last_rx_pid = len >= 2 ? uh->last_rx_bytes[1] : 0;
++	uh->last_rx_irq = readl(uh->pio + FJ_PIO_IRQ);
++	uh->last_rx_flevel = readl(uh->pio + FJ_PIO_FLEVEL);
++	uh->last_pio_fstat = readl(uh->pio + FJ_PIO_FSTAT);
++	uh->last_pio_fdebug = readl(uh->pio + FJ_PIO_FDEBUG);
++	uh->last_pio_irq = uh->last_rx_irq;
++	uh->rx_attempts++;
++	if (ret)
++		uh->rx_errors++;
++}
++
++static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data)
++{
++	u32 waited;
++	u32 len = 0;
++	int ret = -ETIMEDOUT;
++
++	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
++	for (waited = 0; waited < FJ_USBHOST_RX_TIMEOUT_US; waited++) {
++		u32 irq;
++
++		while (!(readl(uh->pio + FJ_PIO_FSTAT) &
++			 FJ_PIO_FSTAT_RXEMPTY(uh->sm_rx))) {
++			if (len >= FJ_USBHOST_RX_BYTES_MAX) {
++				ret = -EOVERFLOW;
++				goto out;
++			}
++			uh->last_rx_bytes[len++] =
++				readl(uh->pio + FJ_PIO_RXF(uh->sm_rx)) >> 24;
++		}
++
++		irq = readl(uh->pio + FJ_PIO_IRQ);
++		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
++			ret = -EILSEQ;
++			break;
++		}
++		if (irq & FJ_PIO_IRQ_RX_EOP) {
++			ret = len ? 0 : -ENODATA;
++			break;
++		}
++		udelay(1);
++	}
++
++out:
++	if (!ret && ack_data && len >= 2 &&
++	    (uh->last_rx_bytes[1] == FJ_USB_PID_DATA0 ||
++	     uh->last_rx_bytes[1] == FJ_USB_PID_DATA1))
++		fj_usbhost_pio_send_ack(uh);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_record_rx(uh, ret, len);
++	return ret;
++}
++
++static int fj_usbhost_pio_require_configured(struct fruitjam_usbhost *uh)
++{
++	if (!fj_usbhost_pio_available(uh))
++		return -ENODEV;
++	if (uh->pio_configured)
++		return 0;
++	return fj_usbhost_pio_configure_sms(uh);
++}
++
++static void fj_usbhost_pio_record_tx(struct fruitjam_usbhost *uh, int ret,
++				     u8 encoded_len)
++{
++	uh->last_tx_result = ret;
++	uh->last_tx_len = ret ? 0 : encoded_len;
++	uh->last_pio_fstat = readl(uh->pio + FJ_PIO_FSTAT);
++	uh->last_pio_fdebug = readl(uh->pio + FJ_PIO_FDEBUG);
++	uh->last_pio_irq = readl(uh->pio + FJ_PIO_IRQ);
++	if (ret)
++		uh->tx_errors++;
++	else
++		uh->packets++;
++}
++
++static int fj_usbhost_pio_in_token(struct fruitjam_usbhost *uh)
++{
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	fj_usbhost_pio_clear_rx_irq(uh);
++	return fj_usbhost_pio_receive_raw(uh, false);
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
++static int fj_usbhost_pio_get_device8(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_SETUP, 0, 0,
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_send_data0(uh, get_device8_setup,
++					sizeof(get_device8_setup),
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	fj_usbhost_pio_clear_rx_irq(uh);
++	ret = fj_usbhost_pio_receive_raw(uh, false);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	fj_usbhost_pio_clear_rx_irq(uh);
++	return fj_usbhost_pio_receive_raw(uh, true);
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static void fj_usbhost_pio_release(struct fruitjam_usbhost *uh)
+ {
+ 	if (!uh->pio)
+@@ -638,10 +958,19 @@
+ 				    char *buf, size_t len)
+ {
+ 	bool power = fj_gpio_out_get(uh, uh->power_gpio);
+-	bool dp = fj_gpio_in_get(uh, uh->dp_gpio);
+-	bool dm = fj_gpio_in_get(uh, uh->dm_gpio);
++	bool dp = fj_gpio_wire_get(uh, uh->dp_gpio);
++	bool dm = fj_gpio_wire_get(uh, uh->dm_gpio);
+ 	const char *state = fj_usbhost_state(power, dp, dm);
++	char rx_hex[FJ_USBHOST_RX_BYTES_MAX * 2 + 1];
++	static const char hex[] = "0123456789abcdef";
++	u32 i;
+ 
++	for (i = 0; i < uh->last_rx_len && i < FJ_USBHOST_RX_BYTES_MAX; i++) {
++		rx_hex[i * 2] = hex[uh->last_rx_bytes[i] >> 4];
++		rx_hex[i * 2 + 1] = hex[uh->last_rx_bytes[i] & 0xf];
++	}
++	rx_hex[i * 2] = '\0';
++
+ 	return scnprintf(buf, len,
+ 			 "power %u\n"
+ 			 "dp %u\n"
+@@ -660,6 +989,14 @@
+ 			 "tx_errors %u\n"
+ 			 "last_tx_result %d\n"
+ 			 "last_tx_len %u\n"
++			 "rx_attempts %u\n"
++			 "rx_errors %u\n"
++			 "last_rx_result %d\n"
++			 "last_rx_len %u\n"
++			 "last_rx_pid 0x%02x\n"
++			 "last_rx_irq 0x%08x\n"
++			 "last_rx_flevel 0x%08x\n"
++			 "last_rx_hex %s\n"
+ 			 "pio_fstat 0x%08x\n"
+ 			 "pio_fdebug 0x%08x\n"
+ 			 "pio_irq 0x%08x\n"
+@@ -673,6 +1010,9 @@
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+ 			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->packets,
+ 			 uh->tx_errors, uh->last_tx_result, uh->last_tx_len,
++			 uh->rx_attempts, uh->rx_errors, uh->last_rx_result,
++			 uh->last_rx_len, uh->last_rx_pid, uh->last_rx_irq,
++			 uh->last_rx_flevel, rx_hex,
+ 			 uh->last_pio_fstat, uh->last_pio_fdebug,
+ 			 uh->last_pio_irq, uh->last_reset_ms);
+ }
+@@ -682,7 +1022,7 @@
+ {
+ 	struct fruitjam_usbhost *uh = container_of(file->private_data,
+ 			struct fruitjam_usbhost, miscdev);
+-	char tmp[512];
++	char tmp[1024];
+ 	int len;
+ 
+ 	mutex_lock(&uh->lock);
+@@ -752,6 +1092,10 @@
+ 		ret = fj_usbhost_pio_configure_sms(uh);
+ 	} else if (!strcmp(cmd, "tx-test")) {
+ 		ret = fj_usbhost_pio_tx_test(uh);
++	} else if (!strcmp(cmd, "in-token")) {
++		ret = fj_usbhost_pio_in_token(uh);
++	} else if (!strcmp(cmd, "get-device-8")) {
++		ret = fj_usbhost_pio_get_device8(uh);
+ 	} else if (!strcmp(cmd, "status")) {
+ 		/* read-only command for shell scripts that write then read */
+ 	} else {

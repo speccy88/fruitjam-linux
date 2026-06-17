@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 23:58:00 -0400
+Subject: [PATCH] misc: ignore empty Fruit Jam usbhost RX EOP events
+
+The gated GET_DESCRIPTOR probe can see RX_START/RX_EOP with no decoded bytes
+immediately after host TX.  Treat that as a timing artifact from the host EOP
+window, clear the receive IRQs, and keep waiting for a real device packet.
+---
+ drivers/misc/fruitjam_usbhost.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1204 +1204,10 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
++			if (!len) {
++				/*
++				 * Gated receive can start in the host EOP window:
++				 * ignore the empty event and keep waiting for the
++				 * device response packet.
++				 */
++				writel(FJ_PIO_IRQ_RX_ALL, uh->pio + FJ_PIO_IRQ);
++				continue;
++			}
+ 			ret = len ? 0 : -ENODATA;
+-- 
+2.39.5

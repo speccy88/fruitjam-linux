@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 19:01:00 -0400
+Subject: [PATCH] misc: expose Fruit Jam usbhost gated RX commands
+
+Wire the gated receive probes into the tiny misc-device command parser so they
+can be exercised from the target shell while keeping the older probes available
+for comparison.
+---
+ drivers/misc/fruitjam_usbhost.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index bbbbbbbbbbbb..cccccccccccc 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1589,6 +1589,10 @@
+ 		ret = fj_usbhost_pio_in_token(uh);
+ 	} else if (!strcmp(cmd, "get-device-8")) {
+ 		ret = fj_usbhost_pio_get_device8(uh);
++	} else if (!strcmp(cmd, "in-token-gated")) {
++		ret = fj_usbhost_pio_in_token_gated(uh);
++	} else if (!strcmp(cmd, "get-device-8-gated")) {
++		ret = fj_usbhost_pio_get_device8_gated(uh);
+ 	} else if (!strcmp(cmd, "status")) {
+ 		/* read-only command for shell scripts that write then read */
+ 	} else {
+-- 
+2.39.5

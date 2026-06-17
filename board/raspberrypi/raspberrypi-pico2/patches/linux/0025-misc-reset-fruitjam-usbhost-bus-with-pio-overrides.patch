@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 00:00:00 +0000
+Subject: [PATCH] misc: reset Fruit Jam usbhost bus with PIO overrides
+
+Match Pico-PIO-USB's host reset behavior more closely by keeping the
+DP/DM pins under PIO ownership and asserting SE0 with IO-bank output
+overrides. Remuxing the pins through SIO during bus reset can disturb
+the PIO input inversion and drive configuration just before the first
+enumeration transactions.
+---
+ drivers/misc/fruitjam_usbhost.c | 45 +++++++++++++++++++++++++-------
+ 1 file changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -157,6 +157,10 @@
+ #define FJ_IO_GPIO_CTRL(gpio)		(0x004 + ((gpio) * 8))
+ #define FJ_PADS_GPIO(gpio)		(0x004 + ((gpio) * 4))
+ #define FJ_IO_GPIO_CTRL_FUNCSEL_MASK	0x0000001fu
++#define FJ_IO_GPIO_CTRL_OUTOVER_MASK	0x00003000u
++#define FJ_IO_GPIO_CTRL_OUTOVER_LOW	0x00002000u
++#define FJ_IO_GPIO_CTRL_OEOVER_MASK	0x0000c000u
++#define FJ_IO_GPIO_CTRL_OEOVER_HIGH	0x0000c000u
+ #define FJ_IO_GPIO_CTRL_INOVER_MASK	0x00030000u
+ #define FJ_IO_GPIO_CTRL_INOVER_NORMAL	0x00000000u
+ #define FJ_IO_GPIO_CTRL_INOVER_INVERT	0x00010000u
+@@ -279,6 +283,20 @@ static void fj_gpio_inover(struct fruitjam_usbhost *uh, unsigned int gpio,
+ 	writel(value, ctrl);
+ }
+ 
++static void fj_gpio_bus_reset_override(struct fruitjam_usbhost *uh,
++				       unsigned int gpio, bool assert)
++{
++	void __iomem *ctrl = uh->io_bank0 + FJ_IO_GPIO_CTRL(gpio);
++	u32 value = readl(ctrl);
++
++	value &= ~(FJ_IO_GPIO_CTRL_OUTOVER_MASK |
++		   FJ_IO_GPIO_CTRL_OEOVER_MASK);
++	if (assert)
++		value |= FJ_IO_GPIO_CTRL_OUTOVER_LOW |
++			 FJ_IO_GPIO_CTRL_OEOVER_HIGH;
++	writel(value, ctrl);
++}
++
+ static void fj_gpio_oe(struct fruitjam_usbhost *uh, unsigned int gpio, bool output)
+ {
+ 	u32 lo = output ? FJ_SIO_GPIO_OE_SET : FJ_SIO_GPIO_OE_CLR;
+@@ -450,8 +468,17 @@ static void fj_usbhost_pio_configure_gpio(struct fruitjam_usbhost *uh)
+ 	fj_gpio_func(uh, uh->dm_gpio, func);
+ 	fj_gpio_inover(uh, uh->dp_gpio, true);
+ 	fj_gpio_inover(uh, uh->dm_gpio, true);
++	fj_gpio_bus_reset_override(uh, uh->dp_gpio, false);
++	fj_gpio_bus_reset_override(uh, uh->dm_gpio, false);
+ }
+ 
++static void fj_usbhost_bus_reset_override(struct fruitjam_usbhost *uh,
++					  bool assert)
++{
++	fj_gpio_bus_reset_override(uh, uh->dp_gpio, assert);
++	fj_gpio_bus_reset_override(uh, uh->dm_gpio, assert);
++}
++
+ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+ {
+ 	u32 pin_base = min(uh->dp_gpio, uh->dm_gpio);
+@@ -1094,18 +1121,28 @@ static void fj_usbhost_configure(struct fruitjam_usbhost *uh)
+ 
+ static void fj_usbhost_reset_bus(struct fruitjam_usbhost *uh, u32 reset_ms)
+ {
+-	bool restore_pio = uh->pio_ready;
++	bool use_pio = uh->pio_ready;
+ 
+-	fj_usbhost_pio_release(uh);
++	if (use_pio && !uh->pio_configured &&
++	    fj_usbhost_pio_configure_sms(uh))
++		use_pio = false;
++	if (!use_pio)
++		fj_usbhost_pio_release(uh);
+ 	fj_gpio_output(uh, uh->power_gpio, true);
+ 	msleep(FJ_USBHOST_POST_RESET_MS);
+-	fj_gpio_output(uh, uh->dp_gpio, false);
+-	fj_gpio_output(uh, uh->dm_gpio, false);
+-	msleep(reset_ms);
+-	fj_gpio_input(uh, uh->dp_gpio);
+-	fj_gpio_input(uh, uh->dm_gpio);
++	if (use_pio) {
++		fj_usbhost_bus_reset_override(uh, true);
++		msleep(reset_ms);
++		fj_usbhost_bus_reset_override(uh, false);
++	} else {
++		fj_gpio_output(uh, uh->dp_gpio, false);
++		fj_gpio_output(uh, uh->dm_gpio, false);
++		msleep(reset_ms);
++		fj_gpio_input(uh, uh->dp_gpio);
++		fj_gpio_input(uh, uh->dm_gpio);
++	}
+ 	msleep(FJ_USBHOST_POST_RESET_MS);
+-	if (restore_pio)
++	if (!use_pio && uh->pio_ready)
+ 		fj_usbhost_pio_configure_sms(uh);
+ 	uh->last_reset_ms = reset_ms;
+ }
+-- 
+2.39.5

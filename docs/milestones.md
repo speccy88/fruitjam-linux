@@ -134,8 +134,8 @@ was received by a local MQTT broker as topic `fruitjam/buttons/button2`.
 
 * Continue separating Fruit Jam constants from SparkFun/Pico 2 defaults.
 * Validate every pin in `docs/pinmap-fruitjam.md` against schematic and hardware.
-* Replace remaining `fruitjamctl` `/dev/mem` diagnostics with real GPIO/LED/input
-  drivers once RP2350 GPIO/pinctrl support exists.
+* Keep `fruitjamctl` on the narrow sysfs GPIO path and add real LED/input drivers
+  once RP2350 GPIO/pinctrl support grows beyond bring-up needs.
 * Add more robust early boot diagnostics if useful while keeping UART stable.
 
 ## Milestone D: microSD support
@@ -237,7 +237,16 @@ work.
 
 * Start with boot-protocol HID keyboard only.
 * First useful test: typed characters appear in the Linux shell.
-* Investigate Linux-side minimal host/input code versus a second-core firmware bridge.
+* Use `fruitjam-usbhost wait`/`monitor` for line-state smoke checks and
+  `fruitjam-usbhost reset` through `/dev/fruitjam-usbhost` for the first
+  kernel-owned bus-reset primitive while PIO packet I/O is developed.
+* Keep USB host on PIO2. PIO0 is used by NeoPixels and PIO1 is used by the
+  current audio helper, while Pico-PIO-USB needs one complete PIO block for the
+  TX/RX/EOP state machines and all 32 instruction words.
+* The bridge now stages the 32-word full-speed host PIO program and reports
+  `pio_ready`; this is the packet-engine landing zone, not HID enumeration yet.
+* Keep the next step Linux-side and minimal: add PIO packet send/receive to the
+  kernel bridge, then poll one boot-protocol keyboard endpoint.
 * Do not include mouse, storage, arbitrary hub hotplug, or composite-device support in the first keyboard milestone.
 
 ## Milestone G: AirLift networking

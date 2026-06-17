@@ -2,7 +2,8 @@ config BR2_PACKAGE_FRUITJAM_UTILS
 	bool "Adafruit Fruit Jam board utilities"
 	help
 		Small no-MMU friendly userspace helpers for board-level Fruit Jam
-		GPIO diagnostics before full kernel drivers exist. The helper uses
-		/dev/mem to access RP2350 SIO/IO_BANK0/PADS registers and can read
+		GPIO diagnostics before full kernel drivers exist. The helpers use
+		sysfs GPIO or tiny kernel devices rather than /dev/mem, and can read
 		the three onboard buttons, control the active-low red LED, assert the
-		shared peripheral reset, and enable USB host 5V power.
+		shared peripheral reset, enable USB host 5V power, and report/reset
+		USB host D+/D- line state for HID bring-up diagnostics.

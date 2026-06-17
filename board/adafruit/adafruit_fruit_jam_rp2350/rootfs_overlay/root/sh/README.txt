@@ -25,8 +25,9 @@ Files:
   11-file-remove.sh        Create/remove a temp file with standalone rm.
   12-dvi-dashboard.sh      Render a compact dashboard to /dev/fruitjam-dvi.
   13-dvi-command.sh        Render command output, by default service status, to DVI.
-  14-usbhost-status.sh     Report USB host power and D+/D- line status.
+  14-usbhost-status.sh     Report USB host status and issue a bus reset.
   15-wav-analyze.sh        Analyze the first SD WAV file without playing audio.
+  16-hidkeys-decode.sh     Decode synthetic USB HID boot-keyboard reports.
   serial-over-tcp.sh       Long-running TCP bridge for a character device.
   run-all.sh               Runs finite shell hardware checks; RTTTL is direct.
 

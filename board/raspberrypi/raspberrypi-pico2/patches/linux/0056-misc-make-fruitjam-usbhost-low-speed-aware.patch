@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 16 Jun 2026 23:58:00 +0000
+Subject: [PATCH] misc: make Fruit Jam usbhost low-speed aware
+
+The Fruit Jam HID dongle can present as a low-speed device.  The staged
+PIO host bridge was still configured only for full-speed signaling:
+DP/DM idle latch, TX side-set program, TX clock, EOP clock, RX jmp pin,
+and EOP detector pins all stayed in the full-speed orientation.
+
+Select the host speed from the current line state when configuring the
+PIO state machines.  For low-speed devices, swap to the dmdp TX program,
+use the 6 MHz TX and 12 MHz EOP clocks, swap the RX/EOP jmp pins to the
+low-speed orientation, and wait through the longer EOP completion window
+before arming receive.  Re-sample the line state after bus reset so the
+next token uses the settled device speed.
+---
+ drivers/misc/fruitjam_usbhost.c | 91 +++++++++++++++++++++++++++------
+ 1 file changed, 76 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 7a65b9ce9a37..b6e85f0f2338 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -139,9 +139,10 @@
+ #define FJ_PIO_RX_WRAP			11u
+ #define FJ_PIO_EOP_WRAP_TARGET		18u
+ #define FJ_PIO_EOP_WRAP		24u
+-#define FJ_PIO_TX_J_SIDE		0x0800u
+-#define FJ_PIO_TX_START_INSTR		(FJ_PIO_TX_J_SIDE | 4u)
+-#define FJ_PIO_TX_INIT_INSTR		(FJ_PIO_TX_J_SIDE | 2u)
++#define FJ_PIO_TX_SIDE_FULL		0x0800u
++#define FJ_PIO_TX_SIDE_LOW		0x1000u
++#define FJ_PIO_TX_START_INSTR		fj_usbhost_pio_tx_start_instr(uh)
++#define FJ_PIO_TX_INIT_INSTR		fj_usbhost_pio_tx_init_instr(uh)
+ #define FJ_PIO_RX_INIT_INSTR		(FJ_PIO_RX_OFFSET)
+ #define FJ_PIO_RX_OSR_ONES_INSTR	0xa0ebu
+ #define FJ_PIO_RX_SET_X_ZERO_INSTR	0xe020u
+@@ -244,6 +243,7 @@ struct fruitjam_usbhost {
+ 	u8 tx_dma_buf[FJ_USBHOST_TX_ENCODED_MAX];
+ 	bool pio_ready;
+ 	bool pio_configured;
++	bool low_speed;
+ 	char last_probe_summary[FJ_USBHOST_PROBE_SUMMARY_MAX];
+ };
+ 
+@@ -262,6 +262,24 @@ static const u16 fj_usbhost_pio_program[FJ_USBHOST_PIO_PROGRAM_WORDS] = {
+ 	0x00ca, 0x0006,
+ };
+ 
++static const u16 fj_usbhost_tx_program_dpdm[] = {
++	0xc700, 0x6ba2, 0xeb80, 0x73a2, 0xe883,
++};
++
++static const u16 fj_usbhost_tx_program_dmdp[] = {
++	0xc700, 0x73a2, 0xf380, 0x6ba2, 0xf083,
++};
++
++static void fj_usbhost_pio_load_tx_program(struct fruitjam_usbhost *uh)
++{
++	const u16 *program = uh->low_speed ? fj_usbhost_tx_program_dmdp :
++					     fj_usbhost_tx_program_dpdm;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(fj_usbhost_tx_program_dpdm); i++)
++		writel(program[i], uh->pio + FJ_PIO_INSTR_MEM + i * 4);
++}
++
+ static u32 fj_usbhost_pio_program_offset(u32 index)
+ {
+ 	if (index >= FJ_PIO_EOP_OFFSET)
+@@ -367,6 +381,15 @@ static bool fj_gpio_out_get(struct fruitjam_usbhost *uh, unsigned int gpio)
+ 	return !!(value & fj_gpio_mask(gpio));
+ }
+ 
++static bool fj_usbhost_low_speed_line(struct fruitjam_usbhost *uh)
++{
++	bool power = fj_gpio_out_get(uh, uh->power_gpio);
++	bool dp = fj_gpio_wire_get(uh, uh->dp_gpio);
++	bool dm = fj_gpio_wire_get(uh, uh->dm_gpio);
++
++	return power && !dp && dm;
++}
++
+ static void fj_gpio_input(struct fruitjam_usbhost *uh, unsigned int gpio)
+ {
+ 	writel(FJ_PADS_IE | FJ_PADS_PDE, uh->pads_bank0 + FJ_PADS_GPIO(gpio));
+@@ -441,6 +465,21 @@ static u32 fj_usbhost_clkdiv(struct fruitjam_usbhost *uh, u32 target_hz)
+ 	return (div_int << 16) | (div_frac << 8);
+ }
+ 
++static u32 fj_usbhost_pio_tx_idle_side(struct fruitjam_usbhost *uh)
++{
++	return uh->low_speed ? FJ_PIO_TX_SIDE_LOW : FJ_PIO_TX_SIDE_FULL;
++}
++
++static u32 fj_usbhost_pio_tx_start_instr(struct fruitjam_usbhost *uh)
++{
++	return fj_usbhost_pio_tx_idle_side(uh) | 4u;
++}
++
++static u32 fj_usbhost_pio_tx_init_instr(struct fruitjam_usbhost *uh)
++{
++	return fj_usbhost_pio_tx_idle_side(uh) | 2u;
++}
++
+ static void fj_usbhost_pio_sm_clear_fifos(struct fruitjam_usbhost *uh, u32 sm)
+ {
+ 	void __iomem *shiftctrl = fj_usbhost_pio_sm(uh, sm) + FJ_PIO_SM_SHIFTCTRL;
+@@ -594,6 +639,10 @@ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+ 	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
+ 	void __iomem *rx_sm = fj_usbhost_pio_sm(uh, uh->sm_rx);
+ 	void __iomem *eop_sm = fj_usbhost_pio_sm(uh, uh->sm_eop);
++	bool low_speed = fj_usbhost_low_speed_line(uh);
++	u32 rx_jmp_gpio = low_speed ? uh->dm_gpio : uh->dp_gpio;
++	u32 eop_jmp_gpio = low_speed ? uh->dp_gpio : uh->dm_gpio;
++	u32 eop_in_gpio = low_speed ? uh->dm_gpio : uh->dp_gpio;
+ 
+ 	if (!uh->pio_ready)
+ 		return -ENODEV;
+@@ -611,10 +660,13 @@ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+ 
+ 	fj_usbhost_pio_configure_gpio(uh);
+ 
+-	fj_usbhost_pio_set_pin_latch(uh, uh->sm_tx, uh->dp_gpio, true);
+-	fj_usbhost_pio_set_pin_latch(uh, uh->sm_tx, uh->dm_gpio, false);
++	uh->low_speed = low_speed;
++	fj_usbhost_pio_load_tx_program(uh);
++	fj_usbhost_pio_set_pin_latch(uh, uh->sm_tx, uh->dp_gpio, !low_speed);
++	fj_usbhost_pio_set_pin_latch(uh, uh->sm_tx, uh->dm_gpio, low_speed);
+ 
+-	writel(fj_usbhost_clkdiv(uh, 48000000u), tx_sm + FJ_PIO_SM_CLKDIV);
++	writel(fj_usbhost_clkdiv(uh, low_speed ? 6000000u : 48000000u),
++	       tx_sm + FJ_PIO_SM_CLKDIV);
+ 	writel(FJ_PIO_EXECCTRL_WRAP_TOP(FJ_PIO_TX_WRAP) |
+ 	       FJ_PIO_EXECCTRL_WRAP_BOTTOM(FJ_PIO_TX_WRAP_TARGET),
+ 	       tx_sm + FJ_PIO_SM_EXECCTRL);
+@@ -629,9 +680,9 @@ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+ 	       FJ_PIO_PINCTRL_SET_BASE(pin_base) |
+ 	       FJ_PIO_PINCTRL_OUT_BASE(pin_base), tx_sm + FJ_PIO_SM_PINCTRL);
+-	writel(FJ_PIO_TX_INIT_INSTR, tx_sm + FJ_PIO_SM_INSTR);
++	writel(fj_usbhost_pio_tx_init_instr(uh), tx_sm + FJ_PIO_SM_INSTR);
+ 
+ 	writel(0x00010000u, rx_sm + FJ_PIO_SM_CLKDIV);
+-	writel(FJ_PIO_EXECCTRL_JMP_PIN(uh->dp_gpio) |
++	writel(FJ_PIO_EXECCTRL_JMP_PIN(rx_jmp_gpio) |
+ 	       FJ_PIO_EXECCTRL_WRAP_TOP(FJ_PIO_RX_WRAP) |
+ 	       FJ_PIO_EXECCTRL_WRAP_BOTTOM(FJ_PIO_RX_WRAP_TARGET),
+ 	       rx_sm + FJ_PIO_SM_EXECCTRL);
+@@ -648,9 +699,10 @@ static int fj_usbhost_pio_configure_sms(struct fruitjam_usbhost *uh)
+-	writel(fj_usbhost_clkdiv(uh, 96000000u), eop_sm + FJ_PIO_SM_CLKDIV);
+-	writel(FJ_PIO_EXECCTRL_JMP_PIN(uh->dm_gpio) |
++	writel(fj_usbhost_clkdiv(uh, low_speed ? 12000000u : 96000000u),
++	       eop_sm + FJ_PIO_SM_CLKDIV);
++	writel(FJ_PIO_EXECCTRL_JMP_PIN(eop_jmp_gpio) |
+ 	       FJ_PIO_EXECCTRL_WRAP_TOP(FJ_PIO_EOP_WRAP) |
+ 	       FJ_PIO_EXECCTRL_WRAP_BOTTOM(FJ_PIO_EOP_WRAP_TARGET),
+ 	       eop_sm + FJ_PIO_SM_EXECCTRL);
+-	writel(FJ_PIO_PINCTRL_IN_BASE(uh->dp_gpio), eop_sm + FJ_PIO_SM_PINCTRL);
++	writel(FJ_PIO_PINCTRL_IN_BASE(eop_in_gpio), eop_sm + FJ_PIO_SM_PINCTRL);
+ 	writel(FJ_PIO_EOP_INIT_INSTR, eop_sm + FJ_PIO_SM_INSTR);
+ 
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_tx);
+@@ -2606,6 +2658,9 @@ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh)
+ 	msleep(FJ_USBHOST_ACTIVE_RESET_MS);
+ 	fj_usbhost_bus_reset_override(uh, false);
+ 	udelay(100);
++	ret = fj_usbhost_pio_configure_sms(uh);
++	if (ret)
++		return ret;
+ 	uh->last_reset_ms = FJ_USBHOST_ACTIVE_RESET_MS;
+ 	return fj_usbhost_pio_sof_burst(uh, FJ_USBHOST_SOF_BURST_FRAMES);
+ }
+-- 
+2.39.5

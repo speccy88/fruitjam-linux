@@ -27,6 +27,7 @@ mosquitto_sub_src="$repo/package/fruitjam-utils/src/mosquitto_sub.c"
 uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
 uptime_src="$repo/package/fruitjam-utils/src/fruitjam-uptime.c"
+du_src="$repo/package/fruitjam-utils/src/fruitjam-du.c"
 ps_src="$repo/package/fruitjam-utils/src/fruitjam-ps.c"
 pgrep_src="$repo/package/fruitjam-utils/src/fruitjam-pgrep.c"
 cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
@@ -737,6 +738,40 @@ echo "ok fruitjam-mem text"
 echo "ok fruitjam-mem json"
 echo "ok fruitjam-uptime text"
 echo "ok fruitjam-uptime json"
+
+echo "== disk usage helper host behavior =="
+du_root="$tmp/du"
+mkdir -p "$du_root/sub"
+printf 'hello\n' > "$du_root/a.txt"
+printf 'berry\n' > "$du_root/sub/b.be"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-o "$tmp/fruitjam-du" "$du_src"
+"$tmp/fruitjam-du" -s "$du_root" > "$tmp/fruitjam-du-summary.txt"
+"$tmp/fruitjam-du" -a "$du_root" > "$tmp/fruitjam-du-all.txt"
+"$tmp/fruitjam-du" -b json "$du_root" > "$tmp/fruitjam-du.json"
+python3 - "$tmp/fruitjam-du-summary.txt" "$tmp/fruitjam-du-all.txt" "$tmp/fruitjam-du.json" "$du_root" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+summary = Path(sys.argv[1]).read_text()
+all_entries = Path(sys.argv[2]).read_text()
+data = json.loads(Path(sys.argv[3]).read_text())
+root = sys.argv[4]
+if root not in summary:
+    raise SystemExit("fruitjam-du summary missing root path")
+if f"{root}/a.txt" not in all_entries or f"{root}/sub/b.be" not in all_entries:
+    raise SystemExit("fruitjam-du -a missing file entries")
+paths = {entry.get("path"): entry for entry in data.get("entries", [])}
+if root not in paths:
+    raise SystemExit("fruitjam-du json missing root entry")
+if paths[root].get("bytes", 0) <= 0:
+    raise SystemExit("fruitjam-du json root size not positive")
+if data.get("unit") != "bytes":
+    raise SystemExit("fruitjam-du json unit regressed")
+PY
+echo "ok fruitjam-du text"
+echo "ok fruitjam-du json"
 
 echo "== process helper host behavior =="
 proc_root="$tmp/proc"
@@ -1943,6 +1978,8 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$mem_src"
 echo "ok c syntax $mem_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$uptime_src"
 echo "ok c syntax $uptime_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$du_src"
+echo "ok c syntax $du_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$ps_src"
 echo "ok c syntax $ps_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$pgrep_src"

@@ -76,6 +76,8 @@ Validated on the Fruit Jam board:
   applets.
 * `fruitjam-uptime` and `uptime` provide a tiny no-fork uptime/load-average
   view from `/proc`.
+* `fruitjam-du` and `du` provide a tiny recursive disk-usage view for SD, web,
+  and Berry files.
 * `fruitjam-ps` and `ps` provide a tiny no-fork process list from `/proc` for
   interactive inspection without re-enabling the larger BusyBox `ps` applet.
 * `fruitjam-pgrep`, `pgrep`, and `pkill` provide tiny no-fork process lookup

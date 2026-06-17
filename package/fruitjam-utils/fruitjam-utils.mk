@@ -84,6 +84,9 @@ define FRUITJAM_UTILS_BUILD_CMDS
 		-Wall -Wextra -Os -o $(@D)/fruitjam-uptime \
 		$(@D)/fruitjam-uptime.c
 	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
+		-Wall -Wextra -Os -o $(@D)/fruitjam-du \
+		$(@D)/fruitjam-du.c
+	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
 		-Wall -Wextra -Os -o $(@D)/fruitjam-ps \
 		$(@D)/fruitjam-ps.c
 	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
@@ -119,6 +122,7 @@ define FRUITJAM_UTILS_BUILD_CMDS
 			$(@D)/fruitjam-uart-login \
 			$(@D)/fruitjam-mem \
 			$(@D)/fruitjam-uptime \
+			$(@D)/fruitjam-du \
 			$(@D)/fruitjam-ps \
 			$(@D)/fruitjam-pgrep \
 			$(@D)/fruitjam-hidkeys \
@@ -160,6 +164,8 @@ define FRUITJAM_UTILS_INSTALL_TARGET_CMDS
 	ln -sf fruitjam-mem $(TARGET_DIR)/usr/bin/free
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-uptime $(TARGET_DIR)/usr/bin/fruitjam-uptime
 	ln -sf fruitjam-uptime $(TARGET_DIR)/usr/bin/uptime
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-du $(TARGET_DIR)/usr/bin/fruitjam-du
+	ln -sf fruitjam-du $(TARGET_DIR)/usr/bin/du
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-ps $(TARGET_DIR)/usr/bin/fruitjam-ps
 	ln -sf fruitjam-ps $(TARGET_DIR)/usr/bin/ps
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-pgrep $(TARGET_DIR)/usr/bin/fruitjam-pgrep

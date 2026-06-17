@@ -886,6 +886,8 @@ def tool_inventory_command() -> str:
         "free",
         "fruitjam-uptime",
         "uptime",
+        "fruitjam-du",
+        "du",
         "fruitjam-ps",
         "ps",
         "fruitjam-pgrep",

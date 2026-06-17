@@ -533,6 +533,25 @@ def status_for_report(report_hex):
         + f"last_rx_hex f04b{report_hex}abcd\n".encode()
     )
 
+def status_for_pid(pid_hex):
+    return (
+        b"power 1\n"
+        b"dp 1\n"
+        b"dm 0\n"
+        b"pio_ready 1\n"
+        b"pio_configured 1\n"
+        b"packets 1\n"
+        b"tx_errors 0\n"
+        b"last_tx_result 0\n"
+        b"last_tx_len 5\n"
+        b"rx_attempts 1\n"
+        b"rx_errors 0\n"
+        b"last_rx_result 0\n"
+        b"last_rx_len 2\n"
+        + f"last_rx_pid 0x{pid_hex}\n".encode()
+        + f"last_rx_hex f0{pid_hex}\n".encode()
+    )
+
 status = status_for_report("0000040000000000")
 
 def report_for_key(key):
@@ -634,6 +653,54 @@ def run_shell():
         raise SystemExit(f"kbd-shell failed rc={proc.returncode} out={out!r} err={err!r} bridge={seen!r}")
     return out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), bytes(seen)
 
+def run_find():
+    master, slave = pty.openpty()
+    attrs = termios.tcgetattr(slave)
+    attrs[3] &= ~(termios.ECHO | termios.ICANON)
+    attrs[0] &= ~(termios.ICRNL | termios.IXON)
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    slave_name = os.ttyname(slave)
+    exe = os.path.join(tmp, "fruitjam-usbhost-kbd-find")
+    subprocess.run([
+        "cc", "-Wall", "-Wextra", "-Wno-deprecated-declarations", "-Os",
+        f'-DBRIDGE_DEV="{slave_name}"',
+        "-o", exe, src,
+    ], check=True)
+    flags = fcntl.fcntl(master, fcntl.F_GETFL)
+    fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    proc = subprocess.Popen(
+        [exe, "kbd-find"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    seen = bytearray()
+    answered_ep1 = False
+    answered_ep2 = False
+    deadline = time.time() + 5
+    while proc.poll() is None and time.time() < deadline:
+        try:
+            chunk = os.read(master, 256)
+            if chunk:
+                seen.extend(chunk)
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+        if b"kbd-poll 1 1" in seen and not answered_ep1:
+            os.write(master, status_for_pid("1e"))
+            answered_ep1 = True
+        if b"kbd-poll 1 2" in seen and not answered_ep2:
+            os.write(master, status_for_report("0000050000000000"))
+            answered_ep2 = True
+        time.sleep(0.01)
+    out, err = proc.communicate(timeout=2)
+    os.close(slave)
+    os.close(master)
+    if proc.returncode:
+        raise SystemExit(f"kbd-find failed rc={proc.returncode} out={out!r} err={err!r} bridge={seen!r}")
+    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), bytes(seen)
+
 events, events_err, events_bridge = run_live("kbd-events")
 text, text_err, text_bridge = run_live("kbd-text")
 if "press key=a char=a code=0x04 modifiers=0x00" not in events:
@@ -647,8 +714,14 @@ if "USB keyboard shell; type exit to leave" not in shell or "echo ok" not in she
     raise SystemExit(f"fruitjam-usbhost kbd-shell did not run typed command: {shell!r} {shell_err!r}")
 if b"kbd-init 1 1 0" not in shell_bridge or b"kbd-poll 1 1" not in shell_bridge:
     raise SystemExit("fruitjam-usbhost kbd-shell did not use parameterized keyboard commands")
+found, found_err, found_bridge = run_find()
+if "usbhost keyboard target addr=1 config=1 iface=0 ep=2 source=report" not in found:
+    raise SystemExit(f"fruitjam-usbhost kbd-find did not select report endpoint: {found!r} {found_err!r}")
+if b"kbd-poll 1 1" not in found_bridge or b"kbd-poll 1 2" not in found_bridge:
+    raise SystemExit("fruitjam-usbhost kbd-find did not scan endpoints")
 print("ok fruitjam-usbhost live keyboard text/events")
 print("ok fruitjam-usbhost keyboard shell")
+print("ok fruitjam-usbhost keyboard auto-find")
 PY
 python3 - "$tmp/fruitjam-usbhost.txt" "$tmp/fruitjam-usbhost.json" "$tmp/fruitjam-usbhost-wait.txt" "$tmp/fruitjam-usbhost-monitor.txt" "$tmp/fruitjam-usbhost-reset.txt" "$gpio_root" "$tmp/fruitjam-usbhost-decode-direct.txt" "$tmp/fruitjam-usbhost-decode-bridge.txt" "$tmp/fruitjam-usbhost-decode-hid.txt" "$tmp/fruitjam-usbhost-hid-packet.txt" "$tmp/fruitjam-usbhost-hid-raw.txt" "$tmp/fruitjam-usbhost-hid-descriptor.txt" <<'PY'
 import json
@@ -1317,9 +1390,14 @@ if "kbd-text [seconds [addr config iface ep]]" not in helper or "kbd-events [sec
 for needle in (
     "kbd-init [addr config iface]",
     "kbd-poll [addr ep]",
+    "kbd-find",
+    "kbd-auto-text [seconds]",
+    "kbd-auto-shell [seconds]",
     "kbd-shell [seconds [addr config iface ep]]",
     "keyboard_init_command",
     "keyboard_poll_command",
+    "keyboard_find_target",
+    "KBD_SCAN_EP_MAX",
     "keyboard_shell",
 ):
     if needle not in helper:

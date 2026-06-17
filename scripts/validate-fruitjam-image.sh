@@ -110,10 +110,13 @@ with tarfile.open(rootfs) as tf:
 
     usbhost = read_bytes(tf, "./usr/bin/fruitjam-usbhost")
     for needle in (
+        b"kbd-find",
+        b"kbd-auto-shell",
         b"kbd-shell",
         b"kbd-init %u %u %u",
         b"kbd-poll %u %u",
         b"USB keyboard shell",
+        b"usbhost keyboard target",
     ):
         if needle not in usbhost:
             raise SystemExit(f"fruitjam-usbhost missing marker {needle!r}")

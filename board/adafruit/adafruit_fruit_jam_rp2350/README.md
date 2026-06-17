@@ -195,15 +195,16 @@ make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
 bridge so hardware validation can proceed over UART and USB CDC.
 `/dev/fruitjam-usbhost` owns the USB host power switch plus GPIO1/GPIO2
 line-state and reset timing in the kernel. `fruitjam-usbhost status`, `json`,
-`wait`, `monitor`, `reset`, `decode`, `hid`, `kbd-text`, `kbd-events`, and
-`kbd-shell` use that bridge when present and
+`wait`, `monitor`, `reset`, `decode`, `hid`, `kbd-find`, `kbd-text`,
+`kbd-events`, and `kbd-shell`/`kbd-auto-shell` use that bridge when present and
 fall back to sysfs GPIO on older images. The bridge stages the 32-word PIO2 full-speed host
 program so USB packet work has a dedicated block that does not collide with PIO0
 NeoPixels or PIO1 audio. PIO token/data transactions and boot-keyboard report
 polling now have a narrow live text/events/shell path for boot-protocol
 keyboards. The default target is address 1, configuration 1, interface 0, and
 endpoint 1; `fruitjam-usbhost` can pass explicit address/config/interface/endpoint
-values for keyboards that do not match that simplest layout.
+values, or run the bounded `kbd-find`/`kbd-auto-*` scan, for keyboards that do
+not match that simplest layout.
 `fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events. It
 also accepts DATA0/DATA1 `last_rx_hex` packets from `fruitjam-usbhost` when the
 payload is an 8-byte keyboard report, so bridge captures can feed the same
@@ -409,10 +410,12 @@ test
 * HSTX DVI has a tiny `/dev/fruitjam-dvi` RGB332 frame helper for bounded
   dashboard/text/test frames. Full fbdev/console support is not implemented.
 * USB host 5 V power, D+/D- reset/line-state ownership, PIO packet I/O,
-  parameterized boot-keyboard init/poll, text/events polling, and a tiny
-  USB-keyboard-driven shell now live behind the `/dev/fruitjam-usbhost` kernel
-  bridge. Hub, composite device, and general Linux input support are not
-  implemented.
+  parameterized boot-keyboard init/poll, bounded keyboard target auto-scan,
+  text/events polling, and a tiny USB-keyboard-driven shell now live behind the
+  `/dev/fruitjam-usbhost` kernel bridge. Hub, mass-storage, and general Linux
+  input support are not implemented; composite keyboards may work only when the
+  boot-keyboard interface and interrupt endpoint are within the small scan
+  window.
 * Buttons, GPIO29, microSD block access, button SQLite logging, GPIO20/GPIO21
   I2C, AirLift userspace socket access, first-step TLV320 RTTTL audio, and the
   narrow USB boot-keyboard probe work, but WiFi/AirLift Linux netdev support,

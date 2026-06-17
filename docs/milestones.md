@@ -248,17 +248,20 @@ work.
   and exposes experimental `kbd-init`/`kbd-poll` commands for boot-protocol
   keyboards. The default remains address 1, configuration 1, interface 0, and
   endpoint 1, but userspace can pass explicit address/config/interface/endpoint
-  values for less-simple keyboard layouts.
+  values for less-simple keyboard layouts. `fruitjam-usbhost kbd-find` adds a
+  bounded scan over the first two configurations, first four interfaces, and
+  first four endpoints; `kbd-auto-text`, `kbd-auto-events`, and `kbd-auto-shell`
+  use that scan before starting the live keyboard loop.
 * `fruitjam-usbhost kbd-text` and `kbd-events` suppress held-key repeats and
   translate stable boot reports into text or press/release events.
   `fruitjam-usbhost kbd-shell` uses the same polling path to drive a tiny
   command loop from a USB keyboard, which satisfies the first useful
   "typed characters appear in a Linux shell" milestone without adding a full
   Linux input stack.
-* Keep the next step hardware-side and minimal: smoke `kbd-shell`,
-  `kbd-text`, and `kbd-events` with the keyboard currently plugged into the
-  Fruit Jam, then decide whether to keep this as an explicit helper or
-  integrate a broader console path.
+* Keep the next step hardware-side and minimal: smoke `kbd-find`,
+  `kbd-auto-shell`, `kbd-text`, and `kbd-events` with the keyboard currently
+  plugged into the Fruit Jam, then decide whether to keep this as an explicit
+  helper or integrate a broader console path.
 * Do not include mouse, storage, arbitrary hub hotplug, or composite-device support in the first keyboard milestone.
 
 ## Milestone G: AirLift networking

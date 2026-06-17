@@ -43,10 +43,14 @@
 #define HID_KEY_SLOTS 6
 #define HID_MOD_LSHIFT 0x02u
 #define HID_MOD_RSHIFT 0x20u
+#define USB_PID_NAK 0x5au
 #define KBD_ADDR_DEFAULT 1u
 #define KBD_CONFIG_DEFAULT 1u
 #define KBD_IFACE_DEFAULT 0u
 #define KBD_EP_DEFAULT 1u
+#define KBD_SCAN_CONFIG_MAX 2u
+#define KBD_SCAN_IFACE_MAX 3u
+#define KBD_SCAN_EP_MAX 4u
 #define KBD_SHELL_LINE_SIZE 256
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -99,7 +103,7 @@ static void print_human(const struct usbhost_status *st);
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init [addr config iface]|kbd-poll [addr ep]|kbd-init-poll [addr config iface ep]|kbd-text [seconds [addr config iface ep]]|kbd-events [seconds [addr config iface ep]]|kbd-monitor [seconds [addr config iface ep]]|kbd-shell [seconds [addr config iface ep]]|wait [seconds]|monitor [seconds]}\n");
+		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init [addr config iface]|kbd-poll [addr ep]|kbd-init-poll [addr config iface ep]|kbd-find|kbd-text [seconds [addr config iface ep]]|kbd-events [seconds [addr config iface ep]]|kbd-monitor [seconds [addr config iface ep]]|kbd-shell [seconds [addr config iface ep]]|kbd-auto-text [seconds]|kbd-auto-events [seconds]|kbd-auto-monitor [seconds]|kbd-auto-shell [seconds]|wait [seconds]|monitor [seconds]}\n");
 }
 
 static int write_file(const char *path, const char *text)
@@ -933,14 +937,15 @@ static bool keyboard_poll_error_is_transient(int saved_errno,
 	if (saved_errno == EAGAIN || saved_errno == ETIMEDOUT ||
 	    saved_errno == EINTR)
 		return true;
-	if (st->last_rx_pid == 0x5a)
+	if (st->last_rx_pid == USB_PID_NAK)
 		return true;
 	if (st->last_rx_result == -EAGAIN || st->last_rx_result == -ETIMEDOUT)
 		return true;
 	return false;
 }
 
-static int keyboard_init_target(const struct keyboard_target *target)
+static int keyboard_init_target_common(const struct keyboard_target *target,
+				       bool quiet)
 {
 	struct usbhost_status st;
 	char command[48];
@@ -952,24 +957,35 @@ static int keyboard_init_target(const struct keyboard_target *target)
 	}
 	if (bridge_write_command(command) < 0) {
 		saved_errno = errno;
-		fprintf(stderr, "fruitjam-usbhost: keyboard init failed: %s\n",
-			strerror(saved_errno));
-		read_status(&st);
-		print_human(&st);
+		if (!quiet) {
+			fprintf(stderr, "fruitjam-usbhost: keyboard init failed: %s\n",
+				strerror(saved_errno));
+			read_status(&st);
+			print_human(&st);
+		}
 		return -1;
 	}
 	return 0;
 }
 
-static int keyboard_poll_report(const struct keyboard_target *target,
-				unsigned char report[HID_REPORT_LEN],
-				bool *has_report)
+static int keyboard_init_target(const struct keyboard_target *target)
+{
+	return keyboard_init_target_common(target, false);
+}
+
+static int keyboard_poll_report_common(const struct keyboard_target *target,
+				       unsigned char report[HID_REPORT_LEN],
+				       bool *has_report,
+				       struct usbhost_status *status,
+				       bool quiet)
 {
 	struct usbhost_status st;
 	char command[48];
 	int saved_errno;
 
 	*has_report = false;
+	if (status)
+		memset(status, 0, sizeof(*status));
 	if (keyboard_poll_command(target, command, sizeof(command)) < 0) {
 		errno = EINVAL;
 		return -1;
@@ -977,18 +993,100 @@ static int keyboard_poll_report(const struct keyboard_target *target,
 	if (bridge_write_command(command) < 0) {
 		saved_errno = errno;
 		read_status(&st);
+		if (status)
+			*status = st;
 		if (keyboard_poll_error_is_transient(saved_errno, &st))
 			return 0;
-		fprintf(stderr, "fruitjam-usbhost: keyboard poll failed: %s\n",
-			strerror(saved_errno));
-		print_human(&st);
+		if (!quiet) {
+			fprintf(stderr, "fruitjam-usbhost: keyboard poll failed: %s\n",
+				strerror(saved_errno));
+			print_human(&st);
+		}
 		return -1;
 	}
 
 	read_status(&st);
+	if (status)
+		*status = st;
 	if (hid_report_from_hex(st.last_rx_hex, report) == 0)
 		*has_report = true;
 	return 0;
+}
+
+static int keyboard_poll_report(const struct keyboard_target *target,
+				unsigned char report[HID_REPORT_LEN],
+				bool *has_report)
+{
+	return keyboard_poll_report_common(target, report, has_report, NULL,
+					   false);
+}
+
+static void print_keyboard_target(FILE *out, const char *prefix,
+				  const struct keyboard_target *target,
+				  const char *source)
+{
+	fprintf(out, "%s addr=%u config=%u iface=%u ep=%u source=%s\n",
+		prefix, target->addr, target->config, target->iface,
+		target->ep, source);
+}
+
+static int keyboard_find_target(struct keyboard_target *target, FILE *out)
+{
+	struct keyboard_target idle_target;
+	bool have_idle = false;
+	unsigned int config;
+	unsigned int iface;
+	unsigned int ep;
+
+	for (config = 1; config <= KBD_SCAN_CONFIG_MAX; config++) {
+		for (iface = 0; iface <= KBD_SCAN_IFACE_MAX; iface++) {
+			struct keyboard_target candidate;
+
+			keyboard_target_default(&candidate);
+			candidate.config = config;
+			candidate.iface = iface;
+			if (keyboard_init_target_common(&candidate, true) < 0)
+				continue;
+
+			for (ep = 1; ep <= KBD_SCAN_EP_MAX; ep++) {
+				struct usbhost_status st;
+				unsigned char report[HID_REPORT_LEN];
+				bool has_report = false;
+
+				candidate.ep = ep;
+				if (keyboard_poll_report_common(&candidate, report,
+								&has_report,
+								&st, true) < 0)
+					continue;
+				if (has_report) {
+					*target = candidate;
+					if (out)
+						print_keyboard_target(out,
+								      "usbhost keyboard target",
+								      target,
+								      "report");
+					return 0;
+				}
+				if (!have_idle && st.last_rx_pid == USB_PID_NAK) {
+					idle_target = candidate;
+					have_idle = true;
+				}
+			}
+		}
+	}
+
+	if (have_idle) {
+		*target = idle_target;
+		if (out)
+			print_keyboard_target(out, "usbhost keyboard target",
+					      target, "nak");
+		return 0;
+	}
+
+	fprintf(stderr, "fruitjam-usbhost: no boot-keyboard target found "
+		"(scanned configs 1-%u, interfaces 0-%u, endpoints 1-%u)\n",
+		KBD_SCAN_CONFIG_MAX, KBD_SCAN_IFACE_MAX, KBD_SCAN_EP_MAX);
+	return -1;
 }
 
 static int keyboard_poll_once(const struct keyboard_target *target,
@@ -1709,6 +1807,9 @@ int main(int argc, char **argv)
 		return bridge_action(command,
 				     "PIO boot-keyboard init and interrupt IN poll");
 	}
+	if (!strcmp(cmd, "kbd-find")) {
+		return keyboard_find_target(&target, stdout) < 0 ? 1 : 0;
+	}
 	if (!strcmp(cmd, "kbd-text")) {
 		if (parse_seconds(argc > 2 ? argv[2] : NULL,
 				  DEFAULT_KBD_SECONDS, &seconds) < 0) {
@@ -1745,6 +1846,39 @@ int main(int argc, char **argv)
 			usage(stderr);
 			return 1;
 		}
+		return keyboard_shell(&target, seconds);
+	}
+	if (!strcmp(cmd, "kbd-auto-text")) {
+		if (parse_seconds(argc > 2 ? argv[2] : NULL,
+				  DEFAULT_KBD_SECONDS, &seconds) < 0 ||
+		    argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		if (keyboard_find_target(&target, stderr) < 0)
+			return 1;
+		return keyboard_live(&target, seconds, false);
+	}
+	if (!strcmp(cmd, "kbd-auto-events") ||
+	    !strcmp(cmd, "kbd-auto-monitor")) {
+		if (parse_seconds(argc > 2 ? argv[2] : NULL,
+				  DEFAULT_KBD_SECONDS, &seconds) < 0 ||
+		    argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		if (keyboard_find_target(&target, stderr) < 0)
+			return 1;
+		return keyboard_live(&target, seconds, true);
+	}
+	if (!strcmp(cmd, "kbd-auto-shell")) {
+		if (parse_seconds(argc > 2 ? argv[2] : NULL, 0, &seconds) < 0 ||
+		    argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		if (keyboard_find_target(&target, stderr) < 0)
+			return 1;
 		return keyboard_shell(&target, seconds);
 	}
 	if (!strcmp(cmd, "status")) {

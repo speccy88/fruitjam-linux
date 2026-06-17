@@ -674,6 +674,75 @@ fruitjam.audio_clock = def(action)
     end
 end
 
+fruitjam.audio_backend_args = def(backend)
+    if backend == "beep"
+        return " --beep"
+    end
+    if backend == "i2s"
+        return " --i2s"
+    end
+    return ""
+end
+
+fruitjam.audio_loud_args = def(loud)
+    if loud
+        return " --loud"
+    end
+    return ""
+end
+
+fruitjam.audio_tone_command = def(hz, ms, loud, backend)
+    var duration = ms
+    if duration == nil || duration == ""
+        duration = 1200
+    end
+    return "fruitjam-rtttl" + fruitjam.audio_backend_args(backend) +
+           fruitjam.audio_loud_args(loud) + " --tone " +
+           fruitjam.shell_quote(hz) + " " + fruitjam.shell_quote(duration)
+end
+
+fruitjam.rtttl_command = def(song, loud, backend)
+    var cmd = "fruitjam-rtttl" + fruitjam.audio_backend_args(backend) +
+              fruitjam.audio_loud_args(loud)
+    if song != nil && song != ""
+        cmd = cmd + " " + fruitjam.shell_quote(song)
+    end
+    return cmd
+end
+
+fruitjam.wav_analyze_command = def(path)
+    return "fruitjam-wavplay --analyze " + fruitjam.shell_quote(path)
+end
+
+fruitjam.wav_play_command = def(path, backend, loud)
+    return "fruitjam-wavplay" + fruitjam.audio_backend_args(backend) +
+           fruitjam.audio_loud_args(loud) + " " + fruitjam.shell_quote(path)
+end
+
+fruitjam.audio_tone = def(hz, ms, loud, backend)
+    var cmd = fruitjam.audio_tone_command(hz, ms, loud, backend)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.rtttl = def(song, loud, backend)
+    var cmd = fruitjam.rtttl_command(song, loud, backend)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.wav_analyze = def(path)
+    var cmd = fruitjam.wav_analyze_command(path)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.wav_play = def(path, backend, loud)
+    var cmd = fruitjam.wav_play_command(path, backend, loud)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
 fruitjam.dvi_command_allowed = def(command)
     for allowed : fruitjam.dvi_commands
         if command == allowed

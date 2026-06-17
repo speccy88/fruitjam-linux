@@ -165,6 +165,7 @@ static const char *const berry_scripts[] = {
 	"11-i2c.be",
 	"12-usbhost-keyboard.be",
 	"13-airlift.be",
+	"14-audio-wav.be",
 	"neopixels.be",
 	"neopixel-colors.be",
 	"neopixel-rainbow-10s.be",

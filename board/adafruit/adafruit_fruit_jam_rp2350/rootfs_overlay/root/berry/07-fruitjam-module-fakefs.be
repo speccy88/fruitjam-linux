@@ -109,6 +109,16 @@ assert(fruitjam.airlift_join_command("ssid name", "pass word") ==
        "airliftctl join 'ssid name' 'pass word'")
 print("fake airlift helpers: ok")
 
+assert(fruitjam.audio_tone_command(880, 250, true, "beep") ==
+       "fruitjam-rtttl --beep --loud --tone '880' '250'")
+assert(fruitjam.rtttl_command("scale", false, "i2s") ==
+       "fruitjam-rtttl --i2s 'scale'")
+assert(fruitjam.wav_analyze_command("/mnt/sd/wavs/test.wav") ==
+       "fruitjam-wavplay --analyze '/mnt/sd/wavs/test.wav'")
+assert(fruitjam.wav_play_command("/mnt/sd/wavs/test.wav", "beep", true) ==
+       "fruitjam-wavplay --beep --loud '/mnt/sd/wavs/test.wav'")
+print("fake audio command helpers: ok")
+
 assert(fruitjam.audio_clock("start")["ok"])
 assert(fruitjam.read_text(fruitjam.paths["audio"]) == "start")
 assert(fruitjam.audio_clock("stop")["ok"])

@@ -47,7 +47,8 @@ Validated on the Fruit Jam board:
 * `/root/berry/fruitjam.be` provides an importable Berry hardware helper module
   for GPIO/buttons, ADC, I2C scan/ping, USB-host status, USB HID report decode,
   USB keyboard probe commands, AirLift diagnostics/TCP commands, MQTT command
-  helpers, device presence, audio clock, DVI command writes, and NeoPixels.
+  helpers, device presence, audio clock, RTTTL/WAV command helpers, DVI command
+  writes, and NeoPixels.
 * `/root/berry/neopixels.be` runs with `berry-run /root/berry/neopixels.be` and lights the
   five onboard NeoPixels.
 * BusyBox `vi` is enabled as `/bin/vi`.
@@ -407,6 +408,7 @@ berry-run /root/berry/10-mqtt-subscribe.be
 berry-run /root/berry/11-i2c.be
 berry-run /root/berry/12-usbhost-keyboard.be
 berry-run /root/berry/13-airlift.be
+berry-run /root/berry/14-audio-wav.be
 berry-run /root/berry/neopixels.be
 ```
 

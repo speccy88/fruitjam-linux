@@ -736,7 +736,10 @@ static void action_usbhost(void)
 			json_error("cannot disable USB host power");
 			return;
 		}
-	} else if (!strcmp(cmd, "in-token") || !strcmp(cmd, "get-device-8")) {
+	} else if (!strcmp(cmd, "in-token") ||
+		   !strcmp(cmd, "get-device-8") ||
+		   !strcmp(cmd, "get-device-8-combo-skipack") ||
+		   !strcmp(cmd, "reset-get-device-8-combo-skipack")) {
 		if (access(USBHOST_DEV, W_OK) != 0) {
 			json_error("USB host PIO probe requires kernel bridge");
 			return;

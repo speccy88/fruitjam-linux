@@ -173,7 +173,16 @@ if not dvi_allowed_match:
     raise SystemExit("CGI missing DVI allowed command table")
 cgi_dvi_cmds = set(re.findall(r'"([^"]+)"', dvi_allowed_match.group("body")))
 cgi_dvi_cmds.update({"dashboard", "text"})
-cgi_usbhost_cmds = {"status", "on", "off", "reset", "in-token", "get-device-8"}
+cgi_usbhost_cmds = {
+    "status",
+    "on",
+    "off",
+    "reset",
+    "in-token",
+    "get-device-8",
+    "get-device-8-combo-skipack",
+    "reset-get-device-8-combo-skipack",
+}
 required = {
     "status",
     "neopixels",
@@ -207,7 +216,16 @@ if bad_usbhost:
 for required_dvi in ("dashboard", "text"):
     if required_dvi not in web_dvi_cmds:
         raise SystemExit(f"web page missing DVI command: {required_dvi}")
-for required_usbhost in ("status", "on", "off", "reset", "in-token", "get-device-8"):
+for required_usbhost in (
+    "status",
+    "on",
+    "off",
+    "reset",
+    "in-token",
+    "get-device-8",
+    "get-device-8-combo-skipack",
+    "reset-get-device-8-combo-skipack",
+):
     if required_usbhost not in web_usbhost_cmds:
         raise SystemExit(f"web page missing USB-host command: {required_usbhost}")
 print(
@@ -874,7 +892,14 @@ if "in-token-gated" not in helper or "get-device-8-gated" not in helper:
 if "pio_configured" not in helper or "last_tx_result" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not surface PIO TX counters")
 for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirLift")):
-    for needle in ("in-token", "get-device-8", "last_rx_result", "last_rx_hex"):
+    for needle in (
+        "in-token",
+        "get-device-8",
+        "get-device-8-combo-skipack",
+        "reset-get-device-8-combo-skipack",
+        "last_rx_result",
+        "last_rx_hex",
+    ):
         if needle not in source:
             raise SystemExit(f"{name} does not surface USB host RX probe field {needle}")
 print("ok usbhost kernel bridge source")

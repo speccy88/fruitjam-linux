@@ -371,6 +371,64 @@ printf '\n' | "$tmp/fruitjam-uart-login" > "$tmp/uart-login-enter.out" 2>&1
 echo "ok uart login eof wait"
 echo "ok uart login enter exec"
 
+echo "== telnet shell host line editing =="
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-o "$tmp/fruitjam-shell" "$repo/package/fruitjam-utils/src/fruitjam-shell.c"
+python3 - "$tmp/fruitjam-shell" <<'PY'
+import errno
+import fcntl
+import os
+import pty
+import subprocess
+import sys
+import time
+
+exe = sys.argv[1]
+master, slave = pty.openpty()
+proc = subprocess.Popen([exe], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+flags = fcntl.fcntl(master, fcntl.F_GETFL)
+fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+out = bytearray()
+
+def read_for(seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            chunk = os.read(master, 4096)
+            if chunk:
+                out.extend(chunk)
+                end = time.time() + 0.15
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+            break
+        time.sleep(0.02)
+
+read_for(0.5)
+os.write(master, b"ec\tTAB_OK\r")
+read_for(0.5)
+os.write(master, b"echo HIST_OK\r")
+read_for(0.5)
+os.write(master, b"\x1b[A\r")
+read_for(0.5)
+os.write(master, b"history\r")
+read_for(0.5)
+os.write(master, b"exit\r")
+read_for(0.5)
+proc.wait(timeout=2)
+text = out.decode("utf-8", "replace")
+if "echo TAB_OK" not in text or "TAB_OK" not in text:
+    raise SystemExit("fruitjam-shell tab completion failed")
+if text.count("HIST_OK") < 2:
+    raise SystemExit("fruitjam-shell history recall failed")
+if "history" not in text or "echo HIST_OK" not in text:
+    raise SystemExit("fruitjam-shell history builtin failed")
+print("ok fruitjam-shell line editing")
+PY
+
 echo "== memory helper host behavior =="
 proc_root="$tmp/proc"
 mkdir -p "$proc_root"
@@ -441,6 +499,87 @@ if "$tmp/fruitjam-usbhost" hid f04b12010002000000403412 > "$tmp/fruitjam-usbhost
 	echo "fruitjam-usbhost hid accepted a descriptor packet as keyboard input" >&2
 	exit 1
 fi
+python3 - "$usbhost_src" "$tmp" <<'PY'
+import errno
+import fcntl
+import os
+import pty
+import subprocess
+import sys
+import termios
+import time
+
+src, tmp = sys.argv[1], sys.argv[2]
+status = (
+    b"power 1\n"
+    b"dp 1\n"
+    b"dm 0\n"
+    b"pio_ready 1\n"
+    b"pio_configured 1\n"
+    b"packets 1\n"
+    b"tx_errors 0\n"
+    b"last_tx_result 0\n"
+    b"last_tx_len 5\n"
+    b"rx_attempts 1\n"
+    b"rx_errors 0\n"
+    b"last_rx_result 0\n"
+    b"last_rx_len 12\n"
+    b"last_rx_pid 0x4b\n"
+    b"last_rx_hex f04b0000040000000000abcd\n"
+)
+
+def run_live(mode):
+    master, slave = pty.openpty()
+    attrs = termios.tcgetattr(slave)
+    attrs[3] &= ~(termios.ECHO | termios.ICANON)
+    attrs[0] &= ~(termios.ICRNL | termios.IXON)
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    slave_name = os.ttyname(slave)
+    exe = os.path.join(tmp, f"fruitjam-usbhost-{mode}")
+    subprocess.run([
+        "cc", "-Wall", "-Wextra", "-Wno-deprecated-declarations", "-Os",
+        f'-DBRIDGE_DEV="{slave_name}"',
+        "-o", exe, src,
+    ], check=True)
+    flags = fcntl.fcntl(master, fcntl.F_GETFL)
+    fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    proc = subprocess.Popen(
+        [exe, mode, "0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    seen = bytearray()
+    answered = False
+    deadline = time.time() + 3
+    while proc.poll() is None and time.time() < deadline:
+        try:
+            chunk = os.read(master, 128)
+            if chunk:
+                seen.extend(chunk)
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+        if not answered and b"kbd-poll" in seen:
+            os.write(master, status)
+            answered = True
+        time.sleep(0.01)
+    out, err = proc.communicate(timeout=2)
+    os.close(slave)
+    os.close(master)
+    if proc.returncode:
+        raise SystemExit(f"{mode} failed rc={proc.returncode} out={out!r} err={err!r} bridge={seen!r}")
+    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+events, events_err = run_live("kbd-events")
+text, text_err = run_live("kbd-text")
+if "press key=a char=a code=0x04 modifiers=0x00" not in events:
+    raise SystemExit(f"fruitjam-usbhost kbd-events did not emit key press: {events!r} {events_err!r}")
+if text != "a\n":
+    raise SystemExit(f"fruitjam-usbhost kbd-text did not emit text: {text!r} {text_err!r}")
+print("ok fruitjam-usbhost live keyboard text/events")
+PY
 python3 - "$tmp/fruitjam-usbhost.txt" "$tmp/fruitjam-usbhost.json" "$tmp/fruitjam-usbhost-wait.txt" "$tmp/fruitjam-usbhost-monitor.txt" "$tmp/fruitjam-usbhost-reset.txt" "$gpio_root" "$tmp/fruitjam-usbhost-decode-direct.txt" "$tmp/fruitjam-usbhost-decode-bridge.txt" "$tmp/fruitjam-usbhost-decode-hid.txt" "$tmp/fruitjam-usbhost-hid-packet.txt" "$tmp/fruitjam-usbhost-hid-raw.txt" "$tmp/fruitjam-usbhost-hid-descriptor.txt" <<'PY'
 import json
 import sys
@@ -957,6 +1096,8 @@ if "decode [RX-HEX]" not in helper or "descriptor device-prefix" not in helper:
     raise SystemExit("fruitjam-usbhost helper missing RX descriptor decoder")
 if "hid [RX-HEX|REPORT-HEX]" not in helper or "decode_hid_hex" not in helper or "boot-keyboard modifiers" not in helper:
     raise SystemExit("fruitjam-usbhost helper missing HID packet decoder")
+if "kbd-text [seconds]" not in helper or "kbd-events [seconds]" not in helper or "keyboard_live" not in helper:
+    raise SystemExit("fruitjam-usbhost helper missing live keyboard text/events")
 for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirLift")):
     for needle in (
         "in-token",

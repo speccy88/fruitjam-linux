@@ -65,7 +65,8 @@ Included:
 * BusyBox httpd and tftpd, plus tiny `nc`, `wget`, `fruitjam-ftpd`,
   `fruitjam-telnetd`, and `fruitjam-services`.
 * Serial consoles use standalone `/usr/bin/hush`; telnet sessions use
-  `/usr/bin/fruitjam-shell` to reduce no-MMU contiguous allocation pressure.
+  `/usr/bin/fruitjam-shell` with small history and command completion to reduce
+  no-MMU contiguous allocation pressure.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners by
   reading `/proc` directly instead of spawning larger `ps`/`netstat` applets.
 * Kernel config trimmed to keep USB CDC gadget support while removing Linux USB
@@ -246,9 +247,12 @@ work.
 * The bridge now stages the 32-word host PIO program, reports `pio_ready`,
   ACKs received DATA packets in the RX-EOP path, sends low-speed keepalives,
   and exposes experimental `kbd-init`/`kbd-poll` commands for one direct
-  boot-protocol keyboard at address 1 endpoint 1.
-* Keep the next step Linux-side and minimal: hardware-smoke `kbd-init-poll`,
-  then translate stable boot reports into shell/input events.
+  boot-protocol keyboard at address 1 endpoint 1. `fruitjam-usbhost kbd-text`
+  and `kbd-events` build on that path by suppressing held-key repeats and
+  translating stable boot reports into text or press/release events.
+* Keep the next step hardware-side and minimal: smoke `kbd-text`/`kbd-events`
+  with the keyboard currently plugged into the Fruit Jam, then decide whether
+  to wire that stream into a console shell or keep it as an explicit helper.
 * Do not include mouse, storage, arbitrary hub hotplug, or composite-device support in the first keyboard milestone.
 
 ## Milestone G: AirLift networking

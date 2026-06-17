@@ -63,7 +63,8 @@ Validated on the Fruit Jam board:
 * USB CDC login shells use standalone `/usr/bin/hush`; the hardware UART uses
   `fruitjam-uart-login` to wait for Enter before execing `hush`, avoiding a
   no-MMU respawn loop when nothing is attached. Telnet sessions use the smaller
-  `/usr/bin/fruitjam-shell` command loop to preserve no-MMU allocation headroom.
+  `/usr/bin/fruitjam-shell` command loop with small history and tab completion
+  to preserve no-MMU allocation headroom.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps` or `netstat`, and CGI still runs after status/telnet
   checks.
@@ -193,11 +194,12 @@ make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
 bridge so hardware validation can proceed over UART and USB CDC.
 `/dev/fruitjam-usbhost` owns the USB host power switch plus GPIO1/GPIO2
 line-state and reset timing in the kernel. `fruitjam-usbhost status`, `json`,
-`wait`, `monitor`, `reset`, `decode`, and `hid` use that bridge when present and
+`wait`, `monitor`, `reset`, `decode`, `hid`, `kbd-text`, and `kbd-events` use that bridge when present and
 fall back to sysfs GPIO on older images. The bridge stages the 32-word PIO2 full-speed host
 program so USB packet work has a dedicated block that does not collide with PIO0
 NeoPixels or PIO1 audio. PIO token/data transactions and boot-keyboard report
-polling are still being developed.
+polling now have a narrow live text/events path for one direct boot-protocol
+keyboard.
 `fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events. It
 also accepts DATA0/DATA1 `last_rx_hex` packets from `fruitjam-usbhost` when the
 payload is an 8-byte keyboard report, so bridge captures can feed the same

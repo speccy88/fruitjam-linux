@@ -8,17 +8,27 @@
  */
 
 #include <errno.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
+#include <termios.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define LINE_SIZE 256
+#define HISTORY_DEPTH 4
 
 static const char *path_dirs[] = {
 	"/bin", "/usr/bin", "/sbin", "/usr/sbin"
+};
+
+static const char *builtins[] = {
+	"cd", "echo", "exit", "help", "history", "status", "?"
 };
 
 static void prompt(void)
@@ -59,21 +69,243 @@ static int split_args(char *line, char **argv, int max_args)
 	return argc;
 }
 
-static int read_interactive_line(char *line, size_t line_size)
+static void redraw_line(const char *line)
+{
+	fputs("\r\033[K", stdout);
+	prompt();
+	fputs(line, stdout);
+	fflush(stdout);
+}
+
+static int append_text(char *line, size_t *len, size_t line_size,
+		       const char *text)
+{
+	while (*text && *len + 1 < line_size) {
+		line[(*len)++] = *text++;
+		putchar(line[*len - 1]);
+	}
+	line[*len] = '\0';
+	fflush(stdout);
+	return *text == '\0';
+}
+
+static void update_common_prefix(char *common, const char *name)
+{
+	size_t i = 0;
+
+	while (common[i] && name[i] && common[i] == name[i])
+		i++;
+	common[i] = '\0';
+}
+
+static void note_completion_match(const char *name, const char *prefix,
+				  char *common, size_t common_size,
+				  int *matches)
+{
+	size_t prefix_len = strlen(prefix);
+
+	if (strncmp(name, prefix, prefix_len))
+		return;
+	if (*matches > 0 && !strcmp(common, name))
+		return;
+	if (*matches == 0) {
+		snprintf(common, common_size, "%s", name);
+	} else {
+		update_common_prefix(common, name);
+	}
+	(*matches)++;
+}
+
+static int complete_command(char *line, size_t *len, size_t line_size)
+{
+	char prefix[64];
+	char common[64];
+	size_t i;
+	int matches = 0;
+
+	for (i = 0; i < *len; i++) {
+		if (line[i] == ' ' || line[i] == '\t') {
+			putchar('\a');
+			fflush(stdout);
+			return 0;
+		}
+	}
+	if (*len >= sizeof(prefix)) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	memcpy(prefix, line, *len);
+	prefix[*len] = '\0';
+	common[0] = '\0';
+
+	for (i = 0; i < ARRAY_SIZE(builtins); i++)
+		note_completion_match(builtins[i], prefix, common,
+				      sizeof(common), &matches);
+	for (i = 0; i < ARRAY_SIZE(path_dirs); i++) {
+		DIR *dir = opendir(path_dirs[i]);
+		struct dirent *de;
+
+		if (!dir)
+			continue;
+		while ((de = readdir(dir)))
+			note_completion_match(de->d_name, prefix, common,
+					      sizeof(common), &matches);
+		closedir(dir);
+	}
+
+	if (matches == 0) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	if (strlen(common) > *len)
+		append_text(line, len, line_size, common + *len);
+	if (matches == 1 && *len + 1 < line_size)
+		append_text(line, len, line_size, " ");
+	else if (matches > 1 && strlen(common) == *len)
+		putchar('\a');
+	fflush(stdout);
+	return 1;
+}
+
+static void add_history(char history[HISTORY_DEPTH][LINE_SIZE],
+			int *history_count, const char *cmd)
+{
+	if (!*cmd)
+		return;
+	if (*history_count > 0 &&
+	    !strcmp(history[*history_count - 1], cmd))
+		return;
+	if (*history_count == HISTORY_DEPTH) {
+		memmove(history[0], history[1],
+			(HISTORY_DEPTH - 1) * LINE_SIZE);
+		(*history_count)--;
+	}
+	snprintf(history[*history_count], LINE_SIZE, "%s", cmd);
+	(*history_count)++;
+}
+
+static int read_byte_timeout(unsigned char *c, int timeout_ms)
+{
+	struct timeval tv;
+	fd_set rfds;
+	int ret;
+
+	FD_ZERO(&rfds);
+	FD_SET(STDIN_FILENO, &rfds);
+	tv.tv_sec = timeout_ms / 1000;
+	tv.tv_usec = (timeout_ms % 1000) * 1000;
+	ret = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+	if (ret <= 0)
+		return 0;
+	return read(STDIN_FILENO, c, 1) == 1;
+}
+
+static int read_plain_line(char *line, size_t line_size)
 {
 	if (line_size == 0)
 		return 0;
-
-	/*
-	 * Keep the remote shell line-oriented. Echoing and flushing every byte is
-	 * very slow through the AirLift bridge and wastes scarce no-MMU memory on
-	 * in-flight socket traffic.
-	 */
 	if (!fgets(line, line_size, stdin)) {
 		line[0] = '\0';
 		return 0;
 	}
 	return 1;
+}
+
+static int read_interactive_line(char *line, size_t line_size,
+				 char history[HISTORY_DEPTH][LINE_SIZE],
+				 int history_count)
+{
+	struct termios oldt, raw;
+	size_t len = 0;
+	int history_pos = history_count;
+
+	if (tcgetattr(STDIN_FILENO, &oldt) < 0)
+		return read_plain_line(line, line_size);
+
+	raw = oldt;
+	raw.c_lflag &= ~(ICANON | ECHO);
+	raw.c_iflag &= ~(ICRNL | IXON);
+	raw.c_cc[VMIN] = 1;
+	raw.c_cc[VTIME] = 0;
+	if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0)
+		return read_plain_line(line, line_size);
+
+	line[0] = '\0';
+	for (;;) {
+		unsigned char c;
+
+		if (read(STDIN_FILENO, &c, 1) != 1) {
+			tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+			line[0] = '\0';
+			return 0;
+		}
+		if (c == '\r' || c == '\n') {
+			putchar('\n');
+			line[len] = '\0';
+			tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+			return 1;
+		}
+		if (c == 4 && len == 0) {
+			tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+			line[0] = '\0';
+			return 0;
+		}
+		if (c == 3) {
+			fputs("^C\n", stdout);
+			line[0] = '\0';
+			tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+			return 1;
+		}
+		if ((c == 8 || c == 127) && len > 0) {
+			len--;
+			line[len] = '\0';
+			fputs("\b \b", stdout);
+			fflush(stdout);
+			history_pos = history_count;
+			continue;
+		}
+		if (c == '\t') {
+			complete_command(line, &len, line_size);
+			history_pos = history_count;
+			continue;
+		}
+		if (c == 27) {
+			unsigned char b, d;
+
+			if (!read_byte_timeout(&b, 80) || b != '[' ||
+			    !read_byte_timeout(&d, 80))
+				continue;
+			if (d == 'A' && history_count > 0) {
+				if (history_pos > 0)
+					history_pos--;
+				snprintf(line, line_size, "%s",
+					 history[history_pos]);
+				len = strlen(line);
+				redraw_line(line);
+			} else if (d == 'B' && history_count > 0) {
+				if (history_pos < history_count - 1) {
+					history_pos++;
+					snprintf(line, line_size, "%s",
+						 history[history_pos]);
+				} else {
+					history_pos = history_count;
+					line[0] = '\0';
+				}
+				len = strlen(line);
+				redraw_line(line);
+			}
+			continue;
+		}
+		if (isprint(c) && len + 1 < line_size) {
+			line[len++] = c;
+			line[len] = '\0';
+			putchar(c);
+			fflush(stdout);
+			history_pos = history_count;
+		}
+	}
 }
 
 static void exec_child(char **argv)
@@ -125,7 +357,9 @@ static int run_command(char **argv)
 
 int main(void)
 {
-	char line[256];
+	char history[HISTORY_DEPTH][LINE_SIZE];
+	int history_count = 0;
+	char line[LINE_SIZE];
 	int last_status = 0;
 
 	puts("Fruit Jam telnet shell");
@@ -135,11 +369,13 @@ int main(void)
 		int argc;
 
 		prompt();
-		if (!read_interactive_line(line, sizeof(line)))
+		if (!read_interactive_line(line, sizeof(line), history,
+					   history_count))
 			break;
 		cmd = trim(line);
 		if (!*cmd)
 			continue;
+		add_history(history, &history_count, cmd);
 
 		argc = split_args(cmd, argv, ARRAY_SIZE(argv));
 		if (argc == 0)
@@ -169,8 +405,17 @@ int main(void)
 			continue;
 		}
 		if (!strcmp(argv[0], "?") || !strcmp(argv[0], "help")) {
-			puts("builtins: cd echo exit help status");
+			puts("builtins: cd echo exit help history status");
 			puts("simple commands are searched in /bin /usr/bin /sbin /usr/sbin");
+			puts("line editing: up/down history, tab command completion");
+			last_status = 0;
+			continue;
+		}
+		if (!strcmp(argv[0], "history")) {
+			int i;
+
+			for (i = 0; i < history_count; i++)
+				printf("%d %s\n", i + 1, history[i]);
 			last_status = 0;
 			continue;
 		}

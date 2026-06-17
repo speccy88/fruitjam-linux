@@ -27,7 +27,9 @@
 #define GPIO_DM 2u
 #define GPIO_POWER 11u
 #define POLL_US 100000
+#define KBD_POLL_US 10000u
 #define MAX_SECONDS 600u
+#define DEFAULT_KBD_SECONDS 30u
 #define DEFAULT_RESET_MS 50u
 #define MAX_RESET_MS 1000u
 #define POST_RESET_US 100000u
@@ -66,12 +68,19 @@ static const char *sysfs_stack_text =
 static const char *kernel_stack_text =
 	"kernel bridge line-state; PIO USB host/HID report polling not implemented yet";
 static const char *kernel_pio_stack_text =
-	"kernel bridge line-state; PIO2 host program staged; experimental boot-keyboard init/poll available";
+	"kernel bridge line-state; PIO2 host program staged; boot-keyboard init/poll/text/event path available";
+
+struct hid_live_state {
+	unsigned char prev[HID_KEY_SLOTS];
+};
+
+static void read_status(struct usbhost_status *st);
+static void print_human(const struct usbhost_status *st);
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init|kbd-poll|kbd-init-poll|wait [seconds]|monitor [seconds]}\n");
+		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init|kbd-poll|kbd-init-poll|kbd-text [seconds]|kbd-events [seconds]|kbd-monitor [seconds]|wait [seconds]|monitor [seconds]}\n");
 }
 
 static int write_file(const char *path, const char *text)
@@ -445,6 +454,108 @@ static bool print_hid_keyboard_hint(const unsigned char *data, size_t len,
 	return true;
 }
 
+static bool hid_key_in_prev(const struct hid_live_state *state,
+			    unsigned char key)
+{
+	size_t i;
+
+	for (i = 0; i < HID_KEY_SLOTS; i++) {
+		if (state->prev[i] == key)
+			return true;
+	}
+	return false;
+}
+
+static bool hid_key_in_report(const unsigned char report[HID_REPORT_LEN],
+			      unsigned char key)
+{
+	size_t i;
+
+	for (i = 2; i < HID_REPORT_LEN; i++) {
+		if (report[i] == key)
+			return true;
+	}
+	return false;
+}
+
+static void hid_live_copy_prev(struct hid_live_state *state,
+			       const unsigned char report[HID_REPORT_LEN])
+{
+	size_t i;
+
+	for (i = 0; i < HID_KEY_SLOTS; i++)
+		state->prev[i] = report[i + 2];
+}
+
+static void print_hid_event(const char *kind, unsigned char key, int ch,
+			    unsigned char mod)
+{
+	if (ch >= 32 && ch <= 126)
+		printf("%s key=%s char=%c code=0x%02x modifiers=0x%02x\n",
+		       kind, hid_key_name(key), ch, key, mod);
+	else if (ch == '\n')
+		printf("%s key=%s char=enter code=0x%02x modifiers=0x%02x\n",
+		       kind, hid_key_name(key), key, mod);
+	else if (ch == '\t')
+		printf("%s key=%s char=tab code=0x%02x modifiers=0x%02x\n",
+		       kind, hid_key_name(key), key, mod);
+	else if (ch == '\177')
+		printf("%s key=%s char=backspace code=0x%02x modifiers=0x%02x\n",
+		       kind, hid_key_name(key), key, mod);
+	else if (ch == '\033')
+		printf("%s key=%s char=esc code=0x%02x modifiers=0x%02x\n",
+		       kind, hid_key_name(key), key, mod);
+	else
+		printf("%s key=%s code=0x%02x modifiers=0x%02x\n",
+		       kind, hid_key_name(key), key, mod);
+}
+
+static void emit_hid_text_char(int ch)
+{
+	if (ch == '\177') {
+		fputs("\b \b", stdout);
+		return;
+	}
+	if (ch == '\033')
+		return;
+	if (ch == '\n' || ch == '\t' || (ch >= 32 && ch <= 126))
+		putchar(ch);
+}
+
+static void process_hid_live_report(struct hid_live_state *state,
+				    const unsigned char report[HID_REPORT_LEN],
+				    bool events)
+{
+	bool shift = report[0] & (HID_MOD_LSHIFT | HID_MOD_RSHIFT);
+	size_t i;
+
+	for (i = 0; i < HID_KEY_SLOTS; i++) {
+		unsigned char key = state->prev[i];
+
+		if (key >= 4 && !hid_key_in_report(report, key) && events)
+			printf("release key=%s code=0x%02x\n",
+			       hid_key_name(key), key);
+	}
+
+	for (i = 2; i < HID_REPORT_LEN; i++) {
+		unsigned char key = report[i];
+		int ch;
+
+		if (key < 4 || hid_key_in_prev(state, key))
+			continue;
+
+		ch = hid_key_ascii(key, shift);
+		if (events)
+			print_hid_event("press", key, ch, report[0]);
+		else
+			emit_hid_text_char(ch);
+	}
+
+	hid_live_copy_prev(state, report);
+	if (!events)
+		fflush(stdout);
+}
+
 static unsigned int le16(const unsigned char *p)
 {
 	return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
@@ -569,6 +680,41 @@ static int decode_hid_hex(const char *hex)
 		puts("usbhost hid not-boot-keyboard-report");
 		return 2;
 	}
+	return 0;
+}
+
+static int hid_report_from_hex(const char *hex,
+			       unsigned char report[HID_REPORT_LEN])
+{
+	unsigned char bytes[RX_BYTES_MAX];
+	const unsigned char *src = bytes;
+	size_t len = 0;
+	size_t report_len = 0;
+	size_t pid_index;
+	unsigned char pid;
+
+	if (!hex || !*hex)
+		return -1;
+	if (parse_hex_bytes(hex, bytes, sizeof(bytes), &len) < 0 || !len)
+		return -1;
+
+	pid_index = (len >= 2 && usb_pid_valid(bytes[1])) ? 1 : 0;
+	pid = bytes[pid_index];
+	if (usb_pid_valid(pid) && usb_pid_is_data(pid)) {
+		size_t payload_with_crc = len - pid_index - 1;
+
+		if (payload_with_crc < 2)
+			return -1;
+		src = &bytes[pid_index + 1];
+		report_len = payload_with_crc - 2;
+	} else {
+		src = bytes;
+		report_len = len;
+	}
+
+	if (report_len != HID_REPORT_LEN || src[1] != 0)
+		return -1;
+	memcpy(report, src, HID_REPORT_LEN);
 	return 0;
 }
 
@@ -711,6 +857,42 @@ static int bridge_write_command(const char *command)
 	ret = write(fd, command, len);
 	close(fd);
 	return ret == (ssize_t)len ? 0 : -1;
+}
+
+static bool keyboard_poll_error_is_transient(int saved_errno,
+					     const struct usbhost_status *st)
+{
+	if (saved_errno == EAGAIN || saved_errno == ETIMEDOUT ||
+	    saved_errno == EINTR)
+		return true;
+	if (st->last_rx_pid == 0x5a)
+		return true;
+	if (st->last_rx_result == -EAGAIN || st->last_rx_result == -ETIMEDOUT)
+		return true;
+	return false;
+}
+
+static int keyboard_poll_once(struct hid_live_state *state, bool events)
+{
+	struct usbhost_status st;
+	unsigned char report[HID_REPORT_LEN];
+	int saved_errno;
+
+	if (bridge_write_command("kbd-poll") < 0) {
+		saved_errno = errno;
+		read_status(&st);
+		if (keyboard_poll_error_is_transient(saved_errno, &st))
+			return 0;
+		fprintf(stderr, "fruitjam-usbhost: keyboard poll failed: %s\n",
+			strerror(saved_errno));
+		print_human(&st);
+		return -1;
+	}
+
+	read_status(&st);
+	if (hid_report_from_hex(st.last_rx_hex, report) == 0)
+		process_hid_live_report(state, report, events);
+	return 0;
 }
 
 static void read_status(struct usbhost_status *st)
@@ -922,6 +1104,53 @@ static int monitor_device(unsigned int seconds)
 	return 0;
 }
 
+static int keyboard_live(unsigned int seconds, bool events)
+{
+	struct hid_live_state state;
+	struct usbhost_status st;
+	unsigned int loops;
+	unsigned int i;
+	int saved_errno;
+
+	if (access(BRIDGE_DEV, W_OK) != 0) {
+		fprintf(stderr, "fruitjam-usbhost: keyboard polling requires %s\n",
+			BRIDGE_DEV);
+		return 1;
+	}
+
+	if (bridge_write_command("kbd-init") < 0) {
+		saved_errno = errno;
+		fprintf(stderr, "fruitjam-usbhost: keyboard init failed: %s\n",
+			strerror(saved_errno));
+		read_status(&st);
+		print_human(&st);
+		return 1;
+	}
+
+	memset(&state, 0, sizeof(state));
+	loops = seconds ? (seconds * 1000000u) / KBD_POLL_US : 1;
+	if (!loops)
+		loops = 1;
+
+	if (seconds)
+		fprintf(stderr, "usbhost keyboard %s for %us\n",
+			events ? "events" : "text", seconds);
+	else
+		fprintf(stderr, "usbhost keyboard %s single poll\n",
+			events ? "events" : "text");
+
+	for (i = 0; i < loops; i++) {
+		if (keyboard_poll_once(&state, events) < 0)
+			return 1;
+		if (i + 1 < loops)
+			usleep(KBD_POLL_US);
+	}
+
+	if (!events)
+		putchar('\n');
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	const char *cmd = argc > 1 ? argv[1] : "status";
@@ -1078,6 +1307,22 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "kbd-init-poll"))
 		return bridge_action("kbd-init-poll",
 				     "PIO boot-keyboard init and interrupt IN poll");
+	if (!strcmp(cmd, "kbd-text")) {
+		if (parse_seconds(argc > 2 ? argv[2] : NULL,
+				  DEFAULT_KBD_SECONDS, &seconds) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return keyboard_live(seconds, false);
+	}
+	if (!strcmp(cmd, "kbd-events") || !strcmp(cmd, "kbd-monitor")) {
+		if (parse_seconds(argc > 2 ? argv[2] : NULL,
+				  DEFAULT_KBD_SECONDS, &seconds) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return keyboard_live(seconds, true);
+	}
 	if (!strcmp(cmd, "status")) {
 		read_status(&st);
 		print_human(&st);

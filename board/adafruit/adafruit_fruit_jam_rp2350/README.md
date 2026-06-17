@@ -367,10 +367,11 @@ This is a userspace coprocessor socket helper. It proves that the AirLift can jo
 WiFi, open outbound TCP connections, and host a small inbound HTTP/telnet/FTP
 surface, but it does not create a Linux `wlan0` interface. HTTP `/` serves user
 pages from `/mnt/sd/www`, while `/playground` serves the built-in hardware
-playground. BusyBox `wget` and normal Linux sockets still use loopback until a
-kernel netdev driver or a fuller userspace bridge exists. The Linux image does
-not flash the ESP32-C6 firmware; the tested board already had the Adafruit Fruit
-Jam NINA `3.3.0` firmware.
+playground with bounded USB keyboard smoke buttons for `kbd-find`,
+`kbd-auto-text`, `kbd-auto-events`, and `kbd-auto-shell`. BusyBox `wget` and
+normal Linux sockets still use loopback until a kernel netdev driver or a fuller
+userspace bridge exists. The Linux image does not flash the ESP32-C6 firmware;
+the tested board already had the Adafruit Fruit Jam NINA `3.3.0` firmware.
 
 ## microSD
 

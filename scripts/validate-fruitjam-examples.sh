@@ -196,6 +196,10 @@ cgi_usbhost_cmds = {
     "get-device-8",
     "get-device-8-combo-skipack",
     "reset-get-device-8-combo-skipack",
+    "kbd-find",
+    "kbd-auto-text",
+    "kbd-auto-events",
+    "kbd-auto-shell",
 }
 required = {
     "status",
@@ -239,6 +243,10 @@ for required_usbhost in (
     "get-device-8",
     "get-device-8-combo-skipack",
     "reset-get-device-8-combo-skipack",
+    "kbd-find",
+    "kbd-auto-text",
+    "kbd-auto-events",
+    "kbd-auto-shell",
 ):
     if required_usbhost not in web_usbhost_cmds:
         raise SystemExit(f"web page missing USB-host command: {required_usbhost}")

@@ -44,6 +44,7 @@
 #define AIRLIFT_GPIO_DEV_DEFAULT "/dev/airlift-gpio"
 #define AIRLIFT_SPI_DEV_DEFAULT "/dev/spidev0.0"
 #define USBHOST_DEV "/dev/fruitjam-usbhost"
+#define USBHOST_BIN "/usr/bin/fruitjam-usbhost"
 #define AIRLIFT_HEARTBEAT_PATH "/run/fruitjam-airlift-inbound.heartbeat"
 #define AIRLIFT_HEARTBEAT_INTERVAL_MS 5000L
 #define AIRLIFT_SPI_HZ 8000000u
@@ -51,6 +52,7 @@
 #define AIRLIFT_READY_GPIO 3u
 #define USBHOST_RESET_MS 50u
 #define USBHOST_POST_RESET_US 100000u
+#define USBHOST_KBD_WEB_SECONDS "3"
 #define AIRLIFT_IRQ_GPIO 23u
 #define AIRLIFT_MISO_GPIO 28u
 #define AIRLIFT_SCK_GPIO 30u
@@ -3533,9 +3535,13 @@ static void http_status_text_string(const char *text, const char *key,
 
 static void http_api_usbhost_body(const char *query, char *body, size_t body_len)
 {
-	char cmd[16];
+	char cmd[48];
 	char bridge_status[1024] = "";
 	char last_rx_hex[65] = "";
+	char helper_output[512] = "";
+	int helper_ran = 0;
+	int helper_ret = 0;
+	unsigned int helper_seconds = 0;
 	int bridge_ok = 0;
 	int pio_ready = 0;
 	int pio_configured = 0;
@@ -3593,9 +3599,26 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 			http_json_error_body(body, body_len, "cannot reset USB host bus");
 			return;
 		}
+	} else if (!strcmp(cmd, "kbd-find")) {
+		char *const argv[] = { USBHOST_BIN, "kbd-find", NULL };
+
+		helper_ret = http_run_capture_timeout(argv, helper_output,
+						      sizeof(helper_output), 9000);
+		helper_ran = 1;
+	} else if (!strcmp(cmd, "kbd-auto-text") ||
+		   !strcmp(cmd, "kbd-auto-events") ||
+		   !strcmp(cmd, "kbd-auto-shell")) {
+		char *const argv[] = {
+			USBHOST_BIN, cmd, USBHOST_KBD_WEB_SECONDS, NULL
+		};
+
+		helper_ret = http_run_capture_timeout(argv, helper_output,
+						      sizeof(helper_output), 15000);
+		helper_ran = 1;
+		helper_seconds = 3;
 	} else if (strcmp(cmd, "status")) {
 		http_json_error_body(body, body_len, "bad USB host command");
-			return;
+		return;
 	}
 
 	if (access(USBHOST_DEV, R_OK) == 0 &&
@@ -3626,7 +3649,8 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 	http_buf_init(&b, body, body_len);
 	http_buf_printf(&b,
 			"{\"ok\":%s,\"source\":\"airlift-direct-gpio\",\"cmd\":",
-			power >= 0 ? "true" : "false");
+			helper_ran ? (helper_ret == 0 ? "true" : "false") :
+			(power >= 0 ? "true" : "false"));
 	http_buf_json_string(&b, cmd);
 	http_buf_printf(&b, ",\"power\":%d,\"dp\":%d,\"dm\":%d,\"stack\":",
 			power, dp, dm);
@@ -3658,6 +3682,13 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 			rx_attempts > 0 && last_rx_result == 0 ? "true" : "false");
 	if (!strcmp(cmd, "reset"))
 		http_buf_printf(&b, ",\"reset_ms\":%u", USBHOST_RESET_MS);
+	if (helper_ran) {
+		http_buf_printf(&b, ",\"exit\":%d", helper_ret);
+		if (helper_seconds)
+			http_buf_printf(&b, ",\"seconds\":%u", helper_seconds);
+		http_buf_puts(&b, ",\"output\":");
+		http_buf_json_string(&b, helper_output);
+	}
 	http_buf_puts(&b, ",\"device\":");
 	http_buf_json_string(&b, http_usb_device_state(power, dp, dm));
 	http_buf_puts(&b, "}");

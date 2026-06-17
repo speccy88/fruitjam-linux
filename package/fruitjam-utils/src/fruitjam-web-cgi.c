@@ -51,8 +51,10 @@
 #define WAV_BIN "/usr/bin/fruitjam-wavplay"
 #define WAV_DIR "/mnt/sd/wavs"
 #define USBHOST_DEV "/dev/fruitjam-usbhost"
+#define USBHOST_BIN "/usr/bin/fruitjam-usbhost"
 #define USBHOST_RESET_MS 50u
 #define USBHOST_POST_RESET_US 100000u
+#define USBHOST_KBD_WEB_SECONDS "3"
 #define BERRY_SCRIPT_MAX 63
 #define BERRY_REF_MAX (sizeof(BERRY_USER_PREFIX) + BERRY_SCRIPT_MAX)
 #define BERRY_USER_LIST_MAX 32
@@ -723,6 +725,10 @@ static void action_usbhost(void)
 	const char *cmd = param("cmd");
 	char bridge_status[1024] = "";
 	char last_rx_hex[65] = "";
+	char helper_output[512] = "";
+	int helper_ran = 0;
+	int helper_ret = 0;
+	unsigned int helper_seconds = 0;
 	int bridge_ok = 0;
 	int pio_ready = 0;
 	int pio_configured = 0;
@@ -778,9 +784,26 @@ static void action_usbhost(void)
 			json_error("cannot reset USB host bus");
 			return;
 		}
+	} else if (!strcmp(cmd, "kbd-find")) {
+		char *const argv[] = { USBHOST_BIN, "kbd-find", NULL };
+
+		helper_ret = run_capture_timeout(argv, helper_output,
+						 sizeof(helper_output), 9000);
+		helper_ran = 1;
+	} else if (!strcmp(cmd, "kbd-auto-text") ||
+		   !strcmp(cmd, "kbd-auto-events") ||
+		   !strcmp(cmd, "kbd-auto-shell")) {
+		char *const argv[] = {
+			USBHOST_BIN, (char *)cmd, USBHOST_KBD_WEB_SECONDS, NULL
+		};
+
+		helper_ret = run_capture_timeout(argv, helper_output,
+						 sizeof(helper_output), 15000);
+		helper_ran = 1;
+		helper_seconds = 3;
 	} else if (strcmp(cmd, "status")) {
 		json_error("bad USB host command");
-			return;
+		return;
 	}
 
 	if (access(USBHOST_DEV, R_OK) == 0 &&
@@ -808,7 +831,8 @@ static void action_usbhost(void)
 		dm = gpio_value(2);
 	}
 	printf("{\"ok\":%s,\"source\":\"direct-cgi-gpio\",\"cmd\":",
-	       power >= 0 ? "true" : "false");
+	       helper_ran ? (helper_ret == 0 ? "true" : "false") :
+	       (power >= 0 ? "true" : "false"));
 	json_string(cmd);
 	printf(",\"power\":%d,\"dp\":%d,\"dm\":%d,\"stack\":",
 	       power, dp, dm);
@@ -829,6 +853,13 @@ static void action_usbhost(void)
 	       rx_attempts > 0 && last_rx_result == 0 ? "true" : "false");
 	if (!strcmp(cmd, "reset"))
 		printf(",\"reset_ms\":%u", USBHOST_RESET_MS);
+	if (helper_ran) {
+		printf(",\"exit\":%d", helper_ret);
+		if (helper_seconds)
+			printf(",\"seconds\":%u", helper_seconds);
+		printf(",\"output\":");
+		json_string(helper_output);
+	}
 	printf(",\"device\":");
 	json_string(usb_device_state(power, dp, dm));
 	puts("}");

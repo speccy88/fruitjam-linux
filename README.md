@@ -201,7 +201,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | ADC / analog header | GPIO40-GPIO47 ADC | Supported | `fruitjam-adc` reads ADC channels and internal temperature through sysfs. | Calibration/scale polish. |
 | TLV320DAC3100 audio | I2C `0x18`, GPIO24 DIN, GPIO25 MCLK, GPIO26 BCLK, GPIO27 WS | Partial | `/dev/fruitjam-audio` generates PIO clocks; `fruitjam-rtttl` configures the codec and microphone-verified RTTTL output works. | Full streamed PCM/I2S playback is not implemented. |
 | ESP32-C6 AirLift | SPI GPIO28/30/31/46, READY GPIO3, IRQ GPIO23, reset GPIO22 | Partial | NINA firmware `3.3.0`; `airliftctl` can probe, scan, join WiFi, TCP GET, MQTT publish, and serve inbound HTTP/telnet/FTP. | Not a Linux `wlan0` interface yet; normal `wget` still only uses Linux sockets. |
-| HTTP user pages and playground | AirLift TCP/80; optional loopback HTTP | Supported | `/` serves `/mnt/sd/www/index.html`; `/playground` serves the built-in hardware UI; `/cgi-bin/fruitjam.cgi` reports status and controls NeoPixels, RTTTL, WAVs, I2C, ADC, DVI, USB-host status, buttons, built-in Berry examples, and user Berry files from `/mnt/sd/berry`. Hardware actions use direct C/tiny-helper paths. | Use `http://<board-ip>/playground` after AirLift joins WiFi, or `fruitjam-services core` for loopback tests. |
+| HTTP user pages and playground | AirLift TCP/80; optional loopback HTTP | Supported | `/` serves `/mnt/sd/www/index.html`; `/playground` serves the built-in hardware UI; `/cgi-bin/fruitjam.cgi` reports status and controls NeoPixels, RTTTL, WAVs, I2C, ADC, DVI, USB-host status plus bounded keyboard probes, buttons, built-in Berry examples, and user Berry files from `/mnt/sd/berry`. Hardware actions use direct C/tiny-helper paths. | Use `http://<board-ip>/playground` after AirLift joins WiFi, or `fruitjam-services core` for loopback tests. |
 | Telnet service | AirLift TCP/23; optional loopback TCP/23 | Supported | AirLift inbound shell and tiny `fruitjam-telnetd`/`fruitjam-shell`; telnet smoke tests pass. | Only one AirLift telnet session at a time. |
 | FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | Passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. | Upload completion can be slow over the current NINA raw socket path; active FTP remains a future objective. |
 | TFTP service | Optional loopback UDP/69 | Supported | BusyBox `tftpd` serves the TFTP area README when `fruitjam-services core` is started. | Not part of the default external AirLift service set. |
@@ -224,7 +224,7 @@ process size and memory fragmentation matter.
 | `fruitjam-shell` | Tiny command shell used by telnet sessions, with recent command history and command-name tab completion. |
 | `fruitjam-ftpd` | Tiny FTP server rooted at `/mnt/sd`, so `/wavs` is visible to FTP clients. |
 | BusyBox `httpd` | Local web server and CGI runner under `/www`. |
-| `/cgi-bin/fruitjam.cgi` | JSON hardware playground API using direct C/tiny-helper hardware actions, plus an explicit Berry runner. |
+| `/cgi-bin/fruitjam.cgi` | JSON hardware playground API using direct C/tiny-helper hardware actions, bounded USB keyboard probes, plus an explicit Berry runner. |
 | BusyBox `tftpd` | TFTP server rooted at `/tmp/tftp`. |
 | `wget` | Tiny HTTP-only client for normal Linux IPv4 sockets. |
 | `telnet` | Tiny telnet client. |

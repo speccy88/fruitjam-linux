@@ -346,6 +346,10 @@
           <button data-usbhost="get-device-8" type="button">Get Desc 8</button>
           <button data-usbhost="get-device-8-combo-skipack" type="button">Combo Skip ACK</button>
           <button data-usbhost="reset-get-device-8-combo-skipack" type="button">Reset Combo</button>
+          <button data-usbhost="kbd-find" type="button">Find Keyboard</button>
+          <button data-usbhost="kbd-auto-text" type="button">Key Text</button>
+          <button data-usbhost="kbd-auto-events" type="button">Key Events</button>
+          <button data-usbhost="kbd-auto-shell" type="button">Key Shell</button>
           <button data-usbhost="on" class="good" type="button">Power On</button>
           <button data-usbhost="off" class="pink" type="button">Power Off</button>
         </div>
@@ -821,7 +825,8 @@
     async function usbhost(cmd) {
       $$("[data-usbhost]").forEach((button) => button.disabled = true);
       try {
-        const data = await get({ action: "usbhost", cmd }, 10000);
+        const timeout = cmd.startsWith("kbd-") ? 20000 : 10000;
+        const data = await get({ action: "usbhost", cmd }, timeout);
         $("#usbhostOut").textContent = formatUsbhost(data);
         log("usbhost " + cmd + " " + (data.ok ? "ok" : "failed"));
         await refresh();

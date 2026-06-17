@@ -87,6 +87,13 @@ assert(adc[1]["millivolts"] == "1650\n")
 assert(adc[2]["label"] == "temperature")
 print("fake adc: ok")
 
+var i2c_scan = fruitjam.i2c_scan_command(nil)
+var i2c_ping = fruitjam.i2c_ping_command(0x18, nil)
+assert(string.find(i2c_scan, "fruitjam-i2c scan") == 0)
+assert(string.find(i2c_ping, "fruitjam-i2c ping '0x18'") == 0)
+assert(string.find(i2c_ping, "'/dev/i2c-0'") >= 0)
+print("fake i2c helpers: ok")
+
 assert(fruitjam.audio_clock("start")["ok"])
 assert(fruitjam.read_text(fruitjam.paths["audio"]) == "start")
 assert(fruitjam.audio_clock("stop")["ok"])

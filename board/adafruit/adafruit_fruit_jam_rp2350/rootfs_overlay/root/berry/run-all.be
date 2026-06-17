@@ -11,6 +11,7 @@ var examples = [
     BERRY_DIR + "/08-usbhost-hid-decode.be",
     BERRY_DIR + "/09-mqtt-publish.be",
     BERRY_DIR + "/10-mqtt-subscribe.be",
+    BERRY_DIR + "/11-i2c.be",
     BERRY_DIR + "/neopixels.be",
     BERRY_DIR + "/neopixel-colors.be"
 ]

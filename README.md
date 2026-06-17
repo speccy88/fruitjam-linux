@@ -192,7 +192,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | UART console header | GPIO8 TX, GPIO9 RX | Supported | Hardware UART shell/log path at 115200 8N1. | Keep as fallback when USB or graphics work changes. |
 | ROM BOOTSEL from Linux | RP2350 reboot command | Supported | `fruitjamctl bootsel` re-enters BOOTSEL and `picotool info -a` sees the ROM. | None. |
 | BusyBox userspace | `/bin`, `/usr/bin` | Supported | BusyBox tools plus `vi`, `hush`, web/network helpers, `free`/`fruitjam-mem`, and Fruit Jam tools. | Keep applets constrained for no-MMU allocation behavior. |
-| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, USB-host status through the kernel bridge when present, USB HID report decode, MQTT command helpers, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
+| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, I2C scan/ping, USB-host status through the kernel bridge when present, USB HID report decode, MQTT command helpers, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
 | Onboard NeoPixels | GPIO32, five LEDs | Supported | PIO-backed `/dev/neopixels`; Berry and CGI can update pixels. | None for basic color writes. |
 | Buttons | GPIO0, GPIO4, GPIO5 | Supported | Sysfs GPIO input, `fruitjam-buttons`, button log, CGI status, synthetic test events. | Physical edge logging should get longer soak testing. |
 | Red LED / IR pin | GPIO29 | Partial | LED control through sysfs/`fruitjamctl`; active-low output works. | IR receiver decoding is not implemented. |
@@ -497,6 +497,7 @@ UART, or telnet. They cover the features that have been brought up so far.
     ```sh
     fruitjam-i2c scan
     fruitjam-i2c ping 0x18
+    berry-run /root/berry/11-i2c.be
     ```
 
     The TLV320DAC3100 control interface should acknowledge at `0x18`.

@@ -29,6 +29,7 @@ required = [
     "./root/berry/00-hello.be",
     "./root/berry/09-mqtt-publish.be",
     "./root/berry/10-mqtt-subscribe.be",
+    "./root/berry/11-i2c.be",
     "./root/berry/run-all.be",
     "./root/berry/neopixel-rainbow-10s.be",
     "./root/rtttl/01-scale.rtttl",
@@ -91,7 +92,7 @@ with tarfile.open(rootfs) as tf:
     run_all = read_text(tf, "./root/berry/run-all.be")
     if 'var BERRY_DIR = "/root/berry"' not in run_all:
         raise SystemExit("run-all.be does not use /root/berry BERRY_DIR")
-    for needle in ("09-mqtt-publish.be", "10-mqtt-subscribe.be"):
+    for needle in ("09-mqtt-publish.be", "10-mqtt-subscribe.be", "11-i2c.be"):
         if needle not in run_all:
             raise SystemExit(f"run-all.be missing {needle}")
 
@@ -106,6 +107,8 @@ with tarfile.open(rootfs) as tf:
         "mqtt_sub_command",
         "mqtt_publish_script",
         "mqtt_subscribe_script",
+        "i2c_scan_command",
+        "i2c_ping_command",
     ):
         if needle not in fruitjam_be:
             raise SystemExit(f"fruitjam.be missing {needle!r}")
@@ -117,6 +120,10 @@ with tarfile.open(rootfs) as tf:
         for needle in needles:
             if needle not in example:
                 raise SystemExit(f"{name} missing {needle!r}")
+    i2c_example = read_text(tf, "./root/berry/11-i2c.be")
+    for needle in ("i2c_scan_command", "i2c_ping_command", "0x18"):
+        if needle not in i2c_example:
+            raise SystemExit(f"11-i2c.be missing {needle!r}")
 
     sh_run_all = read_text(tf, "./root/sh/run-all.sh")
     if "15-wav-analyze.sh" not in sh_run_all:

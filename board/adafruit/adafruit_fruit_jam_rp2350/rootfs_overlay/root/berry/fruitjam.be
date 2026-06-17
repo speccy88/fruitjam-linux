@@ -44,6 +44,8 @@ fruitjam.dvi_commands = [
     "pattern"
 ]
 
+fruitjam.i2c_default_device = "/dev/i2c-0"
+
 fruitjam.hex_values = {
     "0": 0,
     "1": 1,
@@ -693,6 +695,42 @@ fruitjam.mqtt_subscribe_script = def(path)
         "fi\n"
     fruitjam.write_text(path, script)
     return {"ok": true, "path": path}
+end
+
+fruitjam.i2c_addr_text = def(addr)
+    if type(addr) == "string"
+        return addr
+    end
+    return "0x" + fruitjam.hex2(addr)
+end
+
+fruitjam.i2c_scan_command = def(dev)
+    var bus = dev
+    if bus == nil || bus == ""
+        bus = fruitjam.i2c_default_device
+    end
+    return "fruitjam-i2c scan " + fruitjam.shell_quote(bus)
+end
+
+fruitjam.i2c_ping_command = def(addr, dev)
+    var bus = dev
+    if bus == nil || bus == ""
+        bus = fruitjam.i2c_default_device
+    end
+    return "fruitjam-i2c ping " + fruitjam.shell_quote(fruitjam.i2c_addr_text(addr)) +
+           " " + fruitjam.shell_quote(bus)
+end
+
+fruitjam.i2c_scan = def(dev)
+    var cmd = fruitjam.i2c_scan_command(dev)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.i2c_ping = def(addr, dev)
+    var cmd = fruitjam.i2c_ping_command(addr, dev)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
 end
 
 fruitjam.neopixel_write = def(commands)

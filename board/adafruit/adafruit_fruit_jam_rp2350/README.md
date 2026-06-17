@@ -399,6 +399,7 @@ berry
 berry-run /root/berry/06-fruitjam-module.be
 berry-run /root/berry/09-mqtt-publish.be
 berry-run /root/berry/10-mqtt-subscribe.be
+berry-run /root/berry/11-i2c.be
 berry-run /root/berry/neopixels.be
 ```
 

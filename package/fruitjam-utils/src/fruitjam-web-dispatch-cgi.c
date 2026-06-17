@@ -50,6 +50,7 @@ static const char *const berry_scripts[] = {
 	"08-usbhost-hid-decode.be",
 	"09-mqtt-publish.be",
 	"10-mqtt-subscribe.be",
+	"11-i2c.be",
 	"neopixels.be",
 	"neopixel-colors.be",
 	"neopixel-rainbow-10s.be",

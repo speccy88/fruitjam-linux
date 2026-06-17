@@ -60,6 +60,7 @@ kernel_usbhost_stream_wait_patch="$repo/board/raspberrypi/raspberrypi-pico2/patc
 kernel_usbhost_live_drain_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0055-misc-add-fruitjam-usbhost-live-rx-drain-probe.patch"
 kernel_usbhost_low_speed_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0056-misc-make-fruitjam-usbhost-low-speed-aware.patch"
 kernel_usbhost_tx_eop_gated_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0057-misc-preserve-fruitjam-usbhost-tx-eop-for-gated-rx.patch"
+kernel_usbhost_combo_skipack_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0058-misc-add-fruitjam-usbhost-combo-skipack-probe.patch"
 kernel_config_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/adafruit_fruit_jam_rp2350.config"
 dts_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/dts/sifive/adafruit_fruit_jam_rp2350.dts"
 inittab_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/etc/inittab"
@@ -480,7 +481,7 @@ echo "ok fruitjam-hidkeys text"
 echo "ok fruitjam-hidkeys events"
 
 echo "== usbhost kernel bridge source guards =="
-	python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" <<'PY'
+	python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" <<'PY'
 import sys
 from pathlib import Path
 
@@ -520,12 +521,13 @@ stream_wait_patch = Path(sys.argv[35]).read_text()
 live_drain_patch = Path(sys.argv[36]).read_text()
 low_speed_patch = Path(sys.argv[37]).read_text()
 tx_eop_gated_patch = Path(sys.argv[38]).read_text()
-config = Path(sys.argv[39]).read_text()
-dts = Path(sys.argv[40]).read_text()
-helper = Path(sys.argv[41]).read_text()
-cgi = Path(sys.argv[42]).read_text()
-airlift = Path(sys.argv[43]).read_text()
-clocks = Path(sys.argv[44]).read_text()
+combo_skipack_patch = Path(sys.argv[39]).read_text()
+config = Path(sys.argv[40]).read_text()
+dts = Path(sys.argv[41]).read_text()
+helper = Path(sys.argv[42]).read_text()
+cgi = Path(sys.argv[43]).read_text()
+airlift = Path(sys.argv[44]).read_text()
+clocks = Path(sys.argv[45]).read_text()
 if "CONFIG_FRUITJAM_USBHOST_BRIDGE" not in patch or "fruitjam_usbhost.c" not in patch:
     raise SystemExit("kernel patch missing Fruit Jam USB host bridge driver")
 if "/dev/fruitjam-usbhost" not in patch or "pio-packet-io-pending" not in patch:
@@ -769,6 +771,14 @@ for needle in (
     if needle not in combo_patch:
         raise SystemExit(f"kernel USB host combined SETUP patch missing {needle}")
 for needle in (
+    "fj_usbhost_pio_get_device8_combo_skipack",
+    "get-device-8-combo-skipack",
+    "reset-get-device-8-combo-skipack",
+    "combo-skipack setup-rx-len=%u setup-rx-pid=0x%02x",
+):
+    if needle not in combo_skipack_patch:
+        raise SystemExit(f"kernel USB host combined skip-ACK patch missing {needle}")
+for needle in (
     "fj_usbhost_pio_get_device8_fast",
     "get-device-8-fast",
     "reset-get-device-8-fast",
@@ -849,6 +859,8 @@ if "reset-get-device-8" not in helper or "reset-get-device-8-gated" not in helpe
     raise SystemExit("fruitjam-usbhost helper does not expose reset/SOF GET_DESCRIPTOR diagnostics")
 if "get-device-8-combo" not in helper or "reset-get-device-8-combo" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not expose combined SETUP diagnostics")
+if "get-device-8-combo-skipack" not in helper or "reset-get-device-8-combo-skipack" not in helper:
+    raise SystemExit("fruitjam-usbhost helper does not expose combined SETUP skip-ACK diagnostics")
 if "get-device-8-fast" not in helper or "reset-get-device-8-fast" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not expose fast SETUP diagnostics")
 if "get-device-8-tight" not in helper or "reset-get-device-8-tight" not in helper:

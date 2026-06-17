@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux Maintainers <noreply@example.invalid>
+Date: Wed, 17 Jun 2026 01:35:00 +0000
+Subject: [PATCH] misc: add Fruit Jam usbhost combo skip-ACK probe
+
+The combined SETUP-token/DATA0 diagnostic proves that Linux can keep the
+two host packets adjacent enough to put traffic on the bus, but the RX side
+captures host-side bytes while the device's ACK would occur inside the tight
+turnaround window.  Add a follow-up probe that skips the ACK decision after
+the combined SETUP stage and immediately sends the control IN token.
+
+If the device accepted the setup transaction, the IN stage should return the
+first descriptor packet.  If it still times out, the next bug is earlier than
+the ACK receive window: packet polarity, reset/speed setup, or token/data
+acceptance.
+---
+ drivers/misc/fruitjam_usbhost.c | 69 ++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -2297,6 +2297,64 @@ static int fj_usbhost_pio_get_device8_combo(struct fruitjam_usbhost *uh)
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_get_device8_combo_skipack(struct fruitjam_usbhost *uh)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	u32 setup_rx_len = 0;
++	u32 setup_rx_pid = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	/*
++	 * Keep the SETUP token and DATA0 packet adjacent, but do not make the
++	 * probe's success depend on observing the ACK.  On Linux that handshake
++	 * turnaround is too small for a CPU-side decision path; the following IN
++	 * stage tells us whether the device accepted the setup anyway.
++	 */
++	fj_usbhost_pio_prepare_receive(uh);
++	fj_usbhost_pio_clear_rx_irq(uh);
++	ret = fj_usbhost_pio_send_setup_data0_combo(uh, get_device8_setup,
++						    sizeof(get_device8_setup),
++						    &encoded_len,
++						    &setup_rx_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	setup_rx_pid = setup_rx_len >= 2 ? uh->last_rx_bytes[1] : 0;
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "combo-skipack setup-rx-len=%u setup-rx-pid=0x%02x",
++		  setup_rx_len, setup_rx_pid);
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	if (!ret)
++		scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++			  "combo-skipack descriptor-rx-len=%u pid=0x%02x",
++			  uh->last_rx_len, uh->last_rx_pid);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_in_token_gated(struct fruitjam_usbhost *uh)
+ {
+ 	u8 encoded_len = 0;
+@@ -2694,6 +2749,13 @@ static int fj_usbhost_pio_get_device8_active_combo(struct fruitjam_usbhost *uh)
+ 	return ret ? ret : fj_usbhost_pio_get_device8_combo(uh);
+ }
+ 
++static int fj_usbhost_pio_get_device8_active_combo_skipack(struct fruitjam_usbhost *uh)
++{
++	int ret = fj_usbhost_pio_reset_active(uh);
++
++	return ret ? ret : fj_usbhost_pio_get_device8_combo_skipack(uh);
++}
++
+ static int fj_usbhost_pio_get_device8_active_fast(struct fruitjam_usbhost *uh)
+ {
+ 	int ret = fj_usbhost_pio_reset_active(uh);
+@@ -3002,6 +3064,8 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_gated_cpu(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-combo")) {
+ 		ret = fj_usbhost_pio_get_device8_combo(uh);
++	} else if (!strcmp(cmd, "get-device-8-combo-skipack")) {
++		ret = fj_usbhost_pio_get_device8_combo_skipack(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_fast(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-tight")) {
+@@ -3020,6 +3084,8 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_active_gated(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-combo")) {
+ 		ret = fj_usbhost_pio_get_device8_active_combo(uh);
++	} else if (!strcmp(cmd, "reset-get-device-8-combo-skipack")) {
++		ret = fj_usbhost_pio_get_device8_active_combo_skipack(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_active_fast(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-tight")) {
+-- 
+2.39.5

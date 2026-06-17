@@ -138,7 +138,9 @@ Validated on hardware:
 * AirLift inbound telnet accepts a remote shell and echoed `TELNET_OK`.
 * Default AirLift startup is wrapped by `fruitjam-services airlift-monitor`,
   which reruns the inbound server if it exits after leaving ESP32-C6 TCP sockets
-  open. Check `/tmp/airlift-start.log` for probe/join and restart messages.
+  open, removes stale monitor PID files, and treats a missing inbound heartbeat
+  for 60 seconds as a restart condition. Check `/tmp/airlift-start.log` for
+  probe/join and restart messages.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps`/`netstat`, avoiding the no-MMU fragmentation regression
   that previously broke CGI after status checks.
@@ -352,7 +354,8 @@ UART, or telnet. They cover the features that have been brought up so far.
 
    Expected services include the AirLift inbound worker and
    `fruitjam-buttons daemon`. External HTTP, telnet, and FTP are served by the
-   AirLift worker after WiFi joins.
+   AirLift worker after WiFi joins. The AirLift heartbeat line should stay below
+   its 60-second stale restart window while the inbound worker is healthy.
 
 2. Start the optional loopback service set for target-side HTTP/TFTP/FTP tests:
 

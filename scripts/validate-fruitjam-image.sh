@@ -235,6 +235,12 @@ with tarfile.open(rootfs) as tf:
         if needle not in fruitjam_pgrep:
             raise SystemExit(f"fruitjam-pgrep missing marker {needle!r}")
 
+    fruitjam_services = read_bytes(tf, "./usr/bin/fruitjam-services")
+    for needle in (b"removing stale AirLift monitor pid", b"stale-after=%us",
+                   b"AirLift inbound heartbeat stale; restarting"):
+        if needle not in fruitjam_services:
+            raise SystemExit(f"fruitjam-services missing marker {needle!r}")
+
     airliftctl = read_bytes(tf, "./usr/bin/airliftctl")
     for needle in (b"mqtt-sub", b"mqtt-pub", b"USERNAME PASSWORD"):
         if needle not in airliftctl:

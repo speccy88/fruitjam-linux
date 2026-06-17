@@ -1947,6 +1947,15 @@ if "spawn_wait_airlift_serve(serve)" not in services:
     raise SystemExit("fruitjam-services AirLift monitor does not use heartbeat-aware wait")
 if "pid_is_alive" not in services or "request_service_stop" not in services:
     raise SystemExit("fruitjam-services AirLift monitor missing stale pid/stop handling")
+for needle, label in [
+    ("airlift_heartbeat_stale_sec = 60", "short AirLift stale heartbeat window"),
+    ("pid_cmdline_has", "AirLift monitor pid cmdline verification"),
+    ("pid_is_airlift_monitor", "AirLift monitor pidfile ownership check"),
+    ("paren[2] == 'Z'", "zombie pid rejection"),
+    ("removing stale AirLift monitor pid", "stale monitor pid cleanup log"),
+]:
+    if needle not in services:
+        raise SystemExit(f"fruitjam-services missing {label}")
 if "unlink(airlift_monitor_pid)" not in services:
     raise SystemExit("fruitjam-services AirLift monitor does not clean its pidfile")
 if '"/usr/sbin/httpd"' in services:

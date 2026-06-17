@@ -95,7 +95,9 @@ Validated on the Fruit Jam board:
   `TELNET_OK`; loopback telnet works after `fruitjam-services core`.
 * Default AirLift startup is supervised by `fruitjam-services airlift-monitor`.
   If the inbound server exits after opening ESP32-C6 TCP listeners, the monitor
-  reruns setup and starts it again; `/tmp/airlift-start.log` records the loop.
+  reruns setup and starts it again. Stale monitor PID files are ignored, and a
+  missing inbound heartbeat for 60 seconds triggers a restart; `/tmp/airlift-start.log`
+  records the loop.
 * microSD enumerates as `/dev/mmcblk0` and `/dev/mmcblk0p1`; `/mnt/sd` mounts
   as VFAT, accepts writes, unmounts, remounts, and preserves the test file.
 * `airliftctl` talks to the onboard ESP32-C6 AirLift over RP2350 PL022/spidev

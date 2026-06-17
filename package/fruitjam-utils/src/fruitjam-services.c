@@ -33,7 +33,7 @@ static const char *sd_index_path = "/mnt/sd/www/index.html";
 static const char *tftp_root = "/tmp/tftp";
 static const char *airlift_monitor_pid = "/run/fruitjam-airlift-monitor.pid";
 static const char *airlift_heartbeat_path = "/run/fruitjam-airlift-inbound.heartbeat";
-static const unsigned int airlift_heartbeat_stale_sec = 180;
+static const unsigned int airlift_heartbeat_stale_sec = 60;
 static const char *const wifi_conf_paths[] = {
 	"/mnt/sd/fruitjam/wifi.conf",
 	"/etc/fruitjam-wifi.conf",
@@ -618,11 +618,64 @@ static int read_pid_file(const char *path, pid_t *pid)
 
 static int pid_is_alive(pid_t pid)
 {
+	char path[48];
+	char line[192];
+	FILE *fp;
+	char *paren;
+
 	if (pid <= 1)
 		return 0;
-	if (kill(pid, 0) == 0 || errno == EPERM)
+	if (kill(pid, 0) < 0 && errno != EPERM)
+		return 0;
+
+	snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+	fp = fopen(path, "r");
+	if (!fp)
 		return 1;
-	return 0;
+	if (!fgets(line, sizeof(line), fp)) {
+		fclose(fp);
+		return 1;
+	}
+	fclose(fp);
+	paren = strrchr(line, ')');
+	if (paren && paren[1] == ' ' && paren[2] == 'Z')
+		return 0;
+	return 1;
+}
+
+static int pid_cmdline_has(pid_t pid, const char *needle)
+{
+	char path[48];
+	char buf[160];
+	ssize_t got;
+	int fd;
+	ssize_t i;
+	size_t needle_len = strlen(needle);
+
+	if (!needle_len)
+		return 0;
+	snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	got = read(fd, buf, sizeof(buf));
+	close(fd);
+	if (got <= 0)
+		return 0;
+	for (i = 0; i < got; i++) {
+		if (buf[i] == '\0')
+			buf[i] = ' ';
+	}
+	if ((size_t)got < sizeof(buf))
+		buf[got] = '\0';
+	else
+		buf[sizeof(buf) - 1] = '\0';
+	return strstr(buf, needle) != NULL;
+}
+
+static int pid_is_airlift_monitor(pid_t pid)
+{
+	return pid_is_alive(pid) && pid_cmdline_has(pid, "airlift-monitor");
 }
 
 static int wait_airlift_serve(pid_t pid, time_t started_at)
@@ -784,8 +837,11 @@ static int start_airlift_background(void)
 	if (access("/usr/bin/airliftctl", X_OK) < 0)
 		return 0;
 	if (read_pid_file(airlift_monitor_pid, &pid) == 0) {
-		if (pid_is_alive(pid))
+		if (pid_is_airlift_monitor(pid))
 			return 0;
+		fprintf(stderr,
+			"fruitjam-services: removing stale AirLift monitor pid %ld\n",
+			(long)pid);
 		unlink(airlift_monitor_pid);
 	}
 	return spawn_bg_log(argv, "/tmp/airlift-start.log");
@@ -911,11 +967,13 @@ static int stop_services(void)
 {
 	pid_t pid;
 
-	if (read_pid_file(airlift_monitor_pid, &pid) == 0 && pid_is_alive(pid))
+	if (read_pid_file(airlift_monitor_pid, &pid) == 0 &&
+	    pid_is_airlift_monitor(pid))
 		kill(pid, SIGTERM);
 	signal_services(SIGTERM);
 	usleep(700000);
-	if (read_pid_file(airlift_monitor_pid, &pid) == 0 && pid_is_alive(pid))
+	if (read_pid_file(airlift_monitor_pid, &pid) == 0 &&
+	    pid_is_airlift_monitor(pid))
 		kill(pid, SIGKILL);
 	signal_services(SIGKILL);
 	unlink(airlift_monitor_pid);
@@ -986,7 +1044,7 @@ static void print_matching_processes(void)
 		pid_t pid;
 
 		if (read_pid_file(airlift_monitor_pid, &pid) == 0 &&
-		    pid_is_alive(pid))
+		    pid_is_airlift_monitor(pid))
 			printf("  %ld fruitjam-services airlift-monitor\n",
 			       (long)pid);
 	}

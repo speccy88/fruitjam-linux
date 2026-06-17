@@ -95,6 +95,17 @@ with tarfile.open(rootfs) as tf:
         if needle not in run_all:
             raise SystemExit(f"run-all.be missing {needle}")
 
+    fruitjam_be = read_text(tf, "./root/berry/fruitjam.be")
+    for needle in (
+        '"/dev/fruitjam-usbhost"',
+        "usbhost_status_from_bridge",
+        '"pio_ready"',
+        '"last_rx_hex"',
+        '"probe_summary"',
+    ):
+        if needle not in fruitjam_be:
+            raise SystemExit(f"fruitjam.be missing {needle!r}")
+
     sh_run_all = read_text(tf, "./root/sh/run-all.sh")
     if "15-wav-analyze.sh" not in sh_run_all:
         raise SystemExit("shell run-all does not include WAV analyzer")

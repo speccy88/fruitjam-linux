@@ -1,6 +1,7 @@
 var fruitjam = module("fruitjam")
 
 import time
+import string
 
 fruitjam.paths = {
     "neopixels": "/dev/neopixels",
@@ -9,6 +10,7 @@ fruitjam.paths = {
     "i2c": "/dev/i2c-0",
     "spi": "/dev/spidev0.0",
     "gpio": "/sys/class/gpio",
+    "usbhost": "/dev/fruitjam-usbhost",
     "adc": "/sys/bus/platform/devices/400a0000.adc"
 }
 
@@ -146,13 +148,35 @@ fruitjam.write_text = def(path, text)
     f.close()
 end
 
+fruitjam.int_or = def(value, fallback)
+    try
+        return int(value)
+    except .. as e, m
+        return fallback
+    end
+end
+
+fruitjam.key_value_lines = def(text)
+    var out = {}
+    for line : string.split(text, "\n")
+        if line != ""
+            var sep = string.find(line, " ")
+            if sep > 0
+                out[line[0..sep - 1]] = line[sep + 1..size(line)]
+            end
+        end
+    end
+    return out
+end
+
 fruitjam.device_status = def()
     return {
         "neopixels": fruitjam.exists(fruitjam.paths["neopixels"]),
         "audio": fruitjam.exists(fruitjam.paths["audio"]),
         "dvi": fruitjam.exists(fruitjam.paths["dvi"]),
         "i2c": fruitjam.exists(fruitjam.paths["i2c"]),
-        "spi": fruitjam.exists(fruitjam.paths["spi"])
+        "spi": fruitjam.exists(fruitjam.paths["spi"]),
+        "usbhost": fruitjam.exists(fruitjam.paths["usbhost"])
     }
 end
 
@@ -251,7 +275,42 @@ fruitjam.usbhost_device = def(power, dp, dm)
     return "invalid-both-lines-high"
 end
 
-fruitjam.usbhost_status = def()
+fruitjam.usbhost_status_from_bridge = def(text)
+    var kv = fruitjam.key_value_lines(text)
+    var power = fruitjam.int_or(kv.find("power", "-1"), -1)
+    var dp = fruitjam.int_or(kv.find("dp", "-1"), -1)
+    var dm = fruitjam.int_or(kv.find("dm", "-1"), -1)
+    var device = kv.find("device", fruitjam.usbhost_device(power, dp, dm))
+    return {
+        "power": power,
+        "dp": dp,
+        "dm": dm,
+        "device": device,
+        "present": fruitjam.int_or(kv.find("present", "0"), 0) != 0,
+        "hid": fruitjam.int_or(kv.find("hid", "0"), 0) != 0,
+        "driver": kv.find("driver", "kernel-line-state"),
+        "bridge": kv.find("bridge", ""),
+        "pio": fruitjam.int_or(kv.find("pio", "-1"), -1),
+        "pio_ready": fruitjam.int_or(kv.find("pio_ready", "0"), 0) != 0,
+        "pio_configured": fruitjam.int_or(kv.find("pio_configured", "0"), 0) != 0,
+        "pio_program": kv.find("pio_program", ""),
+        "packets": fruitjam.int_or(kv.find("packets", "0"), 0),
+        "tx_errors": fruitjam.int_or(kv.find("tx_errors", "0"), 0),
+        "last_tx_result": fruitjam.int_or(kv.find("last_tx_result", "0"), 0),
+        "last_tx_len": fruitjam.int_or(kv.find("last_tx_len", "0"), 0),
+        "rx_attempts": fruitjam.int_or(kv.find("rx_attempts", "0"), 0),
+        "rx_errors": fruitjam.int_or(kv.find("rx_errors", "0"), 0),
+        "last_rx_result": fruitjam.int_or(kv.find("last_rx_result", "0"), 0),
+        "last_rx_len": fruitjam.int_or(kv.find("last_rx_len", "0"), 0),
+        "last_rx_pid": fruitjam.int_or(kv.find("last_rx_pid", "0"), 0),
+        "last_rx_hex": kv.find("last_rx_hex", ""),
+        "probe_summary": kv.find("probe_summary", ""),
+        "first_milestone": kv.find("first_milestone", "boot-protocol-keyboard"),
+        "next": "pio-packet-io"
+    }
+end
+
+fruitjam.usbhost_status_from_gpio = def()
     var power = fruitjam.gpio_read(fruitjam.usbhost_gpios["power"], nil)
     var dp = fruitjam.gpio_read(fruitjam.usbhost_gpios["dp"], "in")
     var dm = fruitjam.gpio_read(fruitjam.usbhost_gpios["dm"], "in")
@@ -266,6 +325,17 @@ fruitjam.usbhost_status = def()
         "next": "pio-packet-io",
         "first_milestone": "boot-protocol-keyboard"
     }
+end
+
+fruitjam.usbhost_status = def()
+    if fruitjam.exists(fruitjam.paths["usbhost"])
+        try
+            return fruitjam.usbhost_status_from_bridge(
+                fruitjam.read_text(fruitjam.paths["usbhost"]))
+        except .. as e, m
+        end
+    end
+    return fruitjam.usbhost_status_from_gpio()
 end
 
 fruitjam.hex2 = def(value)

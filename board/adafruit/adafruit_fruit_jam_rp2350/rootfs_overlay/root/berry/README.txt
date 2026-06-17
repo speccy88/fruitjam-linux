@@ -40,7 +40,8 @@ Files:
   10-mqtt-subscribe.be      Writes /tmp/fruitjam-mqtt-sub.sh for MQTT subscribe tests.
   fruitjam.be              Importable helpers for GPIO, buttons, ADC, USB-host status,
                             HID decode, audio clock, DVI command writes, device presence,
-                            and NeoPixels.
+                            and NeoPixels. USB-host status prefers the kernel bridge
+                            and falls back to GPIO line-state reads.
   fruitjam_lib.be          Small importable Berry module used by the language tour.
   neopixels.be             Five-pixel static smoke pattern.
   neopixel-colors.be       RGB color cycle inspired by the Fruit Jam NeoPixel examples.

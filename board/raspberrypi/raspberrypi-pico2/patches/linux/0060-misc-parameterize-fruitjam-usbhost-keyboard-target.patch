@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 12:00:00 +0000
+Subject: [PATCH] misc: parameterize Fruit Jam usbhost keyboard target
+
+The first live boot-keyboard probe intentionally hardcoded address 1,
+configuration 1, interface 0, and endpoint 1. Keep those defaults, but let
+the misc-device command interface accept explicit target values:
+
+  kbd-init ADDR CONFIG IFACE
+  kbd-poll ADDR EP
+  kbd-init-poll ADDR CONFIG IFACE EP
+
+This keeps the bridge first-milestone sized while allowing userspace to drive
+keyboards that expose the boot interface or interrupt endpoint somewhere other
+than the simplest direct-device layout.
+---
+ drivers/misc/fruitjam_usbhost.c | 114 +++++++++++++++++++++++++++++++--------
+ 1 file changed, 92 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -56,6 +56,7 @@
+ #define FJ_USBHOST_SOF_BURST_FRAMES	20u
+ #define FJ_USBHOST_ACTIVE_RESET_MS	50u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
++#define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_EP	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_IFACE	0u
+ 
+@@ -2523,7 +2524,8 @@ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 	return ret;
+ }
+ 
+-static int fj_usbhost_pio_keyboard_init(struct fruitjam_usbhost *uh)
++static int fj_usbhost_pio_keyboard_init(struct fruitjam_usbhost *uh, u8 addr,
++					u8 config, u8 iface)
+ {
+ 	int ret;
+ 
+@@ -2532,30 +2534,29 @@ static int fj_usbhost_pio_keyboard_init(struct fruitjam_usbhost *uh)
+ 		return ret;
+ 
+ 	ret = fj_usbhost_pio_control_no_data(
+-		uh, 0, 0x00, 0x05, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0,
++		uh, 0, 0x00, 0x05, addr, 0,
+ 		"set-address");
+ 	if (ret)
+ 		return ret;
+ 	msleep(10);
+ 
+ 	ret = fj_usbhost_pio_control_no_data(
+-		uh, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0x00, 0x09, 1, 0,
++		uh, addr, 0x00, 0x09, config, 0,
+ 		"set-config");
+ 	if (ret)
+ 		return ret;
+ 
+ 	ret = fj_usbhost_pio_control_no_data(
+-		uh, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0x21, 0x0b, 0,
+-		FJ_USBHOST_BOOT_KEYBOARD_IFACE, "set-boot-protocol");
++		uh, addr, 0x21, 0x0b, 0, iface, "set-boot-protocol");
+ 	if (ret)
+ 		return ret;
+ 
+ 	return fj_usbhost_pio_control_no_data(
+-		uh, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0x21, 0x0a, 0,
+-		FJ_USBHOST_BOOT_KEYBOARD_IFACE, "set-idle");
++		uh, addr, 0x21, 0x0a, 0, iface, "set-idle");
+ }
+ 
+-static int fj_usbhost_pio_keyboard_poll(struct fruitjam_usbhost *uh)
++static int fj_usbhost_pio_keyboard_poll(struct fruitjam_usbhost *uh, u8 addr,
++					u8 ep)
+ {
+ 	u8 encoded_len = 0;
+ 	int ret;
+@@ -2566,9 +2567,7 @@ static int fj_usbhost_pio_keyboard_poll(struct fruitjam_usbhost *uh)
+ 
+ 	fj_usbhost_pio_prepare_receive_after_tx(uh);
+ 	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN,
+-					FJ_USBHOST_BOOT_KEYBOARD_ADDR,
+-					FJ_USBHOST_BOOT_KEYBOARD_EP,
+-					&encoded_len);
++					addr, ep, &encoded_len);
+ 	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+ 	if (ret)
+ 		return ret;
+@@ -2577,17 +2576,17 @@ static int fj_usbhost_pio_keyboard_poll(struct fruitjam_usbhost *uh)
+ 		scnprintf(uh->last_probe_summary,
+ 			  sizeof(uh->last_probe_summary),
+ 			  "kbd-poll addr=%u ep=%u len=%u pid=0x%02x",
+-			  FJ_USBHOST_BOOT_KEYBOARD_ADDR,
+-			  FJ_USBHOST_BOOT_KEYBOARD_EP,
+-			  uh->last_rx_len, uh->last_rx_pid);
++			  addr, ep, uh->last_rx_len, uh->last_rx_pid);
+ 	return ret;
+ }
+ 
+-static int fj_usbhost_pio_keyboard_init_poll(struct fruitjam_usbhost *uh)
++static int fj_usbhost_pio_keyboard_init_poll(struct fruitjam_usbhost *uh,
++					    u8 addr, u8 config, u8 iface,
++					    u8 ep)
+ {
+-	int ret = fj_usbhost_pio_keyboard_init(uh);
++	int ret = fj_usbhost_pio_keyboard_init(uh, addr, config, iface);
+ 
+-	return ret ? ret : fj_usbhost_pio_keyboard_poll(uh);
++	return ret ? ret : fj_usbhost_pio_keyboard_poll(uh, addr, ep);
+ }
+ 
+ static int fj_usbhost_pio_in_token_gated(struct fruitjam_usbhost *uh)
+@@ -3241,6 +3240,75 @@ static int fj_usbhost_parse_reset_ms(char *text, u32 *reset_ms)
+ 
+ 	*reset_ms = value;
+ 	return 0;
++}
++
++static int fj_usbhost_parse_u8_token(char **text, u8 min, u8 max, u8 *value)
++{
++	char *arg = strsep(text, " \t");
++	unsigned long parsed;
++	int ret;
++
++	while (arg && !*arg)
++		arg = strsep(text, " \t");
++	if (!arg)
++		return -EINVAL;
++	ret = kstrtoul(arg, 10, &parsed);
++	if (ret)
++		return ret;
++	if (parsed < min || parsed > max)
++		return -EINVAL;
++	*value = parsed;
++	return 0;
++}
++
++static int fj_usbhost_parse_kbd_init(char *text, u8 *addr, u8 *config,
++				     u8 *iface)
++{
++	char *arg = strim(text);
++
++	*addr = FJ_USBHOST_BOOT_KEYBOARD_ADDR;
++	*config = FJ_USBHOST_BOOT_KEYBOARD_CONFIG;
++	*iface = FJ_USBHOST_BOOT_KEYBOARD_IFACE;
++	if (!*arg)
++		return 0;
++	if (fj_usbhost_parse_u8_token(&arg, 1, 127, addr) ||
++	    fj_usbhost_parse_u8_token(&arg, 1, 255, config) ||
++	    fj_usbhost_parse_u8_token(&arg, 0, 255, iface))
++		return -EINVAL;
++	return arg && *strim(arg) ? -EINVAL : 0;
++}
++
++static int fj_usbhost_parse_kbd_poll(char *text, u8 *addr, u8 *ep)
++{
++	char *arg = strim(text);
++
++	*addr = FJ_USBHOST_BOOT_KEYBOARD_ADDR;
++	*ep = FJ_USBHOST_BOOT_KEYBOARD_EP;
++	if (!*arg)
++		return 0;
++	if (fj_usbhost_parse_u8_token(&arg, 1, 127, addr) ||
++	    fj_usbhost_parse_u8_token(&arg, 1, 15, ep))
++		return -EINVAL;
++	return arg && *strim(arg) ? -EINVAL : 0;
++}
++
++static int fj_usbhost_parse_kbd_init_poll(char *text, u8 *addr, u8 *config,
++					  u8 *iface, u8 *ep)
++{
++	char *arg = strim(text);
++
++	*addr = FJ_USBHOST_BOOT_KEYBOARD_ADDR;
++	*config = FJ_USBHOST_BOOT_KEYBOARD_CONFIG;
++	*iface = FJ_USBHOST_BOOT_KEYBOARD_IFACE;
++	*ep = FJ_USBHOST_BOOT_KEYBOARD_EP;
++	if (!*arg)
++		return 0;
++	if (fj_usbhost_parse_u8_token(&arg, 1, 127, addr) ||
++	    fj_usbhost_parse_u8_token(&arg, 1, 255, config) ||
++	    fj_usbhost_parse_u8_token(&arg, 0, 255, iface) ||
++	    fj_usbhost_parse_u8_token(&arg, 1, 15, ep))
++		return -EINVAL;
++	return arg && *strim(arg) ? -EINVAL : 0;
+ }
+ 
+ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+@@ -3251,6 +3319,10 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 	char tmp[FJ_USBHOST_COMMAND_MAX];
+ 	char *cmd;
+ 	u32 reset_ms;
++	u8 kbd_addr;
++	u8 kbd_config;
++	u8 kbd_iface;
++	u8 kbd_ep;
+ 	int ret = 0;
+ 
+ 	if (!count)
+@@ -3335,12 +3407,28 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_active_burst(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-stream")) {
+ 		ret = fj_usbhost_pio_get_device8_active_stream(uh);
+-	} else if (!strcmp(cmd, "kbd-init")) {
+-		ret = fj_usbhost_pio_keyboard_init(uh);
+-	} else if (!strcmp(cmd, "kbd-poll")) {
+-		ret = fj_usbhost_pio_keyboard_poll(uh);
+-	} else if (!strcmp(cmd, "kbd-init-poll")) {
+-		ret = fj_usbhost_pio_keyboard_init_poll(uh);
++	} else if (!strncmp(cmd, "kbd-init", 8) &&
++		   (cmd[8] == '\0' || cmd[8] == ' ' || cmd[8] == '\t')) {
++		ret = fj_usbhost_parse_kbd_init(cmd + 8, &kbd_addr,
++						&kbd_config, &kbd_iface);
++		if (!ret)
++			ret = fj_usbhost_pio_keyboard_init(uh, kbd_addr,
++							   kbd_config,
++							   kbd_iface);
++	} else if (!strncmp(cmd, "kbd-poll", 8) &&
++		   (cmd[8] == '\0' || cmd[8] == ' ' || cmd[8] == '\t')) {
++		ret = fj_usbhost_parse_kbd_poll(cmd + 8, &kbd_addr, &kbd_ep);
++		if (!ret)
++			ret = fj_usbhost_pio_keyboard_poll(uh, kbd_addr,
++							   kbd_ep);
++	} else if (!strncmp(cmd, "kbd-init-poll", 13) &&
++		   (cmd[13] == '\0' || cmd[13] == ' ' || cmd[13] == '\t')) {
++		ret = fj_usbhost_parse_kbd_init_poll(cmd + 13, &kbd_addr,
++						     &kbd_config, &kbd_iface,
++						     &kbd_ep);
++		if (!ret)
++			ret = fj_usbhost_pio_keyboard_init_poll(
++				uh, kbd_addr, kbd_config, kbd_iface, kbd_ep);
+ 	} else if (!strcmp(cmd, "status")) {
+ 		/* read-only command for shell scripts that write then read */
+ 	} else {
+-- 
+2.39.5

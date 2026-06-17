@@ -778,6 +778,8 @@ def tool_inventory_command() -> str:
         "fruitjam-services",
         "fruitjam-buttons",
         "berry-run",
+        "mosquitto_pub",
+        "mosquitto_sub",
         "wget",
         "telnet",
         "nc",

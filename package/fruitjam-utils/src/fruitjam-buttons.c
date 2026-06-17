@@ -34,6 +34,8 @@ struct config {
 	char mqtt_port[8];
 	char mqtt_topic[96];
 	char mqtt_client_id[64];
+	char mqtt_user[64];
+	char mqtt_password[96];
 	char mqtt_transport[16];
 	unsigned int poll_ms;
 };
@@ -61,6 +63,8 @@ static void config_defaults(struct config *cfg)
 	strcpy(cfg->mqtt_port, "1883");
 	strcpy(cfg->mqtt_topic, "fruitjam/buttons");
 	strcpy(cfg->mqtt_client_id, "fruitjam-rp2350");
+	cfg->mqtt_user[0] = '\0';
+	cfg->mqtt_password[0] = '\0';
 	strcpy(cfg->mqtt_transport, "socket");
 	cfg->poll_ms = 50;
 }
@@ -116,6 +120,10 @@ static void load_config_file(struct config *cfg, const char *path)
 			copy_value(cfg->mqtt_topic, sizeof(cfg->mqtt_topic), value);
 		else if (!strcmp(key, "MQTT_CLIENT_ID"))
 			copy_value(cfg->mqtt_client_id, sizeof(cfg->mqtt_client_id), value);
+		else if (!strcmp(key, "MQTT_USER"))
+			copy_value(cfg->mqtt_user, sizeof(cfg->mqtt_user), value);
+		else if (!strcmp(key, "MQTT_PASSWORD"))
+			copy_value(cfg->mqtt_password, sizeof(cfg->mqtt_password), value);
 		else if (!strcmp(key, "MQTT_TRANSPORT"))
 			copy_value(cfg->mqtt_transport, sizeof(cfg->mqtt_transport), value);
 		else if (!strcmp(key, "POLL_MS"))
@@ -323,12 +331,35 @@ static void publish_button_event(const struct config *cfg, const struct button *
 		"-m", message,
 		NULL
 	};
+	char *const socket_auth_argv[] = {
+		"/usr/bin/mosquitto_pub",
+		"-h", (char *)cfg->mqtt_host,
+		"-p", (char *)cfg->mqtt_port,
+		"-i", (char *)cfg->mqtt_client_id,
+		"-u", (char *)cfg->mqtt_user,
+		"-P", (char *)cfg->mqtt_password,
+		"-t", topic,
+		"-m", message,
+		NULL
+	};
 	char *const airlift_argv[] = {
 		"/usr/bin/mosquitto_pub",
 		"--airlift",
 		"-h", (char *)cfg->mqtt_host,
 		"-p", (char *)cfg->mqtt_port,
 		"-i", (char *)cfg->mqtt_client_id,
+		"-t", topic,
+		"-m", message,
+		NULL
+	};
+	char *const airlift_auth_argv[] = {
+		"/usr/bin/mosquitto_pub",
+		"--airlift",
+		"-h", (char *)cfg->mqtt_host,
+		"-p", (char *)cfg->mqtt_port,
+		"-i", (char *)cfg->mqtt_client_id,
+		"-u", (char *)cfg->mqtt_user,
+		"-P", (char *)cfg->mqtt_password,
 		"-t", topic,
 		"-m", message,
 		NULL
@@ -340,9 +371,9 @@ static void publish_button_event(const struct config *cfg, const struct button *
 	snprintf(message, sizeof(message), "%s gpio%u %s %ld",
 		 button->name, button->gpio, action, (long)ts);
 	if (!strcmp(cfg->mqtt_transport, "airlift"))
-		spawn_wait(airlift_argv);
+		spawn_wait(cfg->mqtt_user[0] ? airlift_auth_argv : airlift_argv);
 	else
-		spawn_wait(socket_argv);
+		spawn_wait(cfg->mqtt_user[0] ? socket_auth_argv : socket_argv);
 }
 
 static void handle_button_event(const struct config *cfg, const struct button *button,

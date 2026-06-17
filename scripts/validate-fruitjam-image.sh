@@ -27,16 +27,21 @@ uf2 = Path(sys.argv[2])
 required = [
     "./bin/rm",
     "./root/berry/00-hello.be",
+    "./root/berry/09-mqtt-publish.be",
+    "./root/berry/10-mqtt-subscribe.be",
     "./root/berry/run-all.be",
     "./root/berry/neopixel-rainbow-10s.be",
     "./root/rtttl/01-scale.rtttl",
     "./root/sh/15-wav-analyze.sh",
     "./usr/bin/berry",
     "./usr/bin/berry-run",
+    "./usr/bin/airliftctl",
     "./usr/bin/fruitjam-berry-json",
     "./usr/bin/fruitjam-dvi",
     "./usr/bin/fruitjam-rtttl",
     "./usr/bin/fruitjam-wavplay",
+    "./usr/bin/mosquitto_pub",
+    "./usr/bin/mosquitto_sub",
     "./usr/bin/wget",
     "./usr/sbin/fruitjam-telnetd",
     "./www/cgi-bin/env.cgi",
@@ -85,6 +90,9 @@ with tarfile.open(rootfs) as tf:
     run_all = read_text(tf, "./root/berry/run-all.be")
     if 'var BERRY_DIR = "/root/berry"' not in run_all:
         raise SystemExit("run-all.be does not use /root/berry BERRY_DIR")
+    for needle in ("09-mqtt-publish.be", "10-mqtt-subscribe.be"):
+        if needle not in run_all:
+            raise SystemExit(f"run-all.be missing {needle}")
 
     sh_run_all = read_text(tf, "./root/sh/run-all.sh")
     if "15-wav-analyze.sh" not in sh_run_all:
@@ -99,6 +107,26 @@ with tarfile.open(rootfs) as tf:
     for needle in (b"direct-cgi", b"berry-list", b"wav-list", b"usbhost"):
         if needle not in web_cgi:
             raise SystemExit(f"fruitjam.cgi missing marker {needle!r}")
+
+    usbhost = read_bytes(tf, "./usr/bin/fruitjam-usbhost")
+    for needle in (
+        b"kbd-shell",
+        b"kbd-init %u %u %u",
+        b"kbd-poll %u %u",
+        b"USB keyboard shell",
+    ):
+        if needle not in usbhost:
+            raise SystemExit(f"fruitjam-usbhost missing marker {needle!r}")
+
+    mqtt_sub = read_bytes(tf, "./usr/bin/mosquitto_sub")
+    for needle in (b"mosquitto_sub", b"--airlift", b"-C count", b"-W seconds"):
+        if needle not in mqtt_sub:
+            raise SystemExit(f"mosquitto_sub missing marker {needle!r}")
+
+    airliftctl = read_bytes(tf, "./usr/bin/airliftctl")
+    for needle in (b"mqtt-sub", b"mqtt-pub", b"USERNAME PASSWORD"):
+        if needle not in airliftctl:
+            raise SystemExit(f"airliftctl missing marker {needle!r}")
 
     telnetd = read_bytes(tf, "./usr/sbin/fruitjam-telnetd")
     if len(telnetd) < 4096 or not telnetd.startswith(b"bFLT"):

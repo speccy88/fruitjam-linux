@@ -15,6 +15,7 @@
 #include <linux/reboot.h>
 #include <linux/spi/spidev.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -157,6 +158,8 @@ static const char *const berry_scripts[] = {
 	"05-usbhost-status.be",
 	"06-fruitjam-module.be",
 	"08-usbhost-hid-decode.be",
+	"09-mqtt-publish.be",
+	"10-mqtt-subscribe.be",
 	"neopixels.be",
 	"neopixel-colors.be",
 	"neopixel-rainbow-10s.be",
@@ -284,8 +287,10 @@ static void usage(FILE *out)
 		"                        listen through AirLift and bridge to a shell\n"
 		"  serve-inbound         listen through AirLift on telnet/HTTP/FTP ports\n"
 		"  tcp-get HOST [PATH]   fetch an HTTP path through the NINA TCP socket API\n"
-		"  mqtt-pub HOST PORT TOPIC MESSAGE [CLIENTID]\n"
+		"  mqtt-pub HOST PORT TOPIC MESSAGE [CLIENTID [USERNAME PASSWORD]]\n"
 		"                        publish one MQTT 3.1.1 QoS 0 message over AirLift\n"
+		"  mqtt-sub HOST PORT TOPIC [CLIENTID USERNAME PASSWORD SECONDS COUNT VERBOSE]\n"
+		"                        subscribe to MQTT 3.1.1 QoS 0 messages over AirLift\n"
 		"\n"
 		"AirLift SPI access is serialized with " AIRLIFT_LOCK_PATH ".\n");
 }
@@ -5307,43 +5312,116 @@ fail:
 	return -1;
 }
 
-static int mqtt_send_connect(struct airlift *air, uint8_t sock,
-			     const char *client_id)
+static int mqtt_read_byte_timeout(struct airlift *air, uint8_t sock,
+				  uint8_t *byte, long timeout_ms)
 {
-	uint8_t pkt[256];
-	uint8_t resp[4];
+	long deadline = now_ms() + timeout_ms;
+
+	while (!stop_requested && now_ms() < deadline) {
+		uint16_t avail = 0;
+		uint16_t len = 1;
+
+		if (tcp_avail(air, sock, &avail) < 0)
+			return -1;
+		if (!avail) {
+			usleep(50000);
+			continue;
+		}
+		if (tcp_read_buf(air, sock, byte, &len) < 0 || len != 1)
+			return -1;
+		return 0;
+	}
+	return 1;
+}
+
+static int mqtt_read_packet_timeout(struct airlift *air, uint8_t sock,
+				    uint8_t *header, uint8_t *payload,
+				    size_t cap, size_t *payload_len,
+				    long timeout_ms)
+{
+	size_t multiplier = 1;
+	size_t value = 0;
+	int i;
+	int ret;
+
+	ret = mqtt_read_byte_timeout(air, sock, header, timeout_ms);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 4; i++) {
+		uint8_t encoded = 0;
+
+		if (mqtt_read_byte_timeout(air, sock, &encoded, 1000) != 0)
+			return -1;
+		value += (encoded & 127u) * multiplier;
+		if (!(encoded & 128u))
+			break;
+		multiplier *= 128;
+	}
+	if (i == 4 || value > cap)
+		return -1;
+	for (i = 0; i < (int)value; i++) {
+		if (mqtt_read_byte_timeout(air, sock, payload + i, 1000) != 0)
+			return -1;
+	}
+	*payload_len = value;
+	return 0;
+}
+
+static int mqtt_send_connect(struct airlift *air, uint8_t sock,
+			     const char *client_id, const char *username,
+			     const char *password)
+{
+	uint8_t pkt[512];
+	uint8_t body[512];
+	uint8_t resp[64];
+	uint8_t header = 0;
 	size_t pos = 0;
-	size_t rem_pos;
-	size_t payload_start;
-	size_t rem_len;
+	size_t body_pos = 0;
+	size_t resp_len = 0;
+	uint8_t flags = 2;
+
+	if (username && *username)
+		flags |= 0x80;
+	if (password && *password)
+		flags |= 0x40;
+
+	if (mqtt_put_string(body, sizeof(body), &body_pos, "MQTT") < 0)
+		return -1;
+	body[body_pos++] = 4;
+	body[body_pos++] = flags;
+	body[body_pos++] = 0;
+	body[body_pos++] = 60;
+	if (mqtt_put_string(body, sizeof(body), &body_pos, client_id) < 0)
+		return -1;
+	if (username && *username &&
+	    mqtt_put_string(body, sizeof(body), &body_pos, username) < 0)
+		return -1;
+	if (password && *password &&
+	    mqtt_put_string(body, sizeof(body), &body_pos, password) < 0)
+		return -1;
 
 	pkt[pos++] = 0x10;
-	rem_pos = pos++;
-	if (mqtt_put_string(pkt, sizeof(pkt), &pos, "MQTT") < 0)
+	if (mqtt_put_remaining_length(pkt, sizeof(pkt), &pos, body_pos) < 0 ||
+	    pos + body_pos > sizeof(pkt))
 		return -1;
-	pkt[pos++] = 4;
-	pkt[pos++] = 2;
-	pkt[pos++] = 0;
-	pkt[pos++] = 60;
-	payload_start = pos;
-	if (mqtt_put_string(pkt, sizeof(pkt), &pos, client_id) < 0)
-		return -1;
-	rem_len = pos - payload_start + 10;
-	if (rem_len > 127)
-		return -1;
-	pkt[rem_pos] = (uint8_t)rem_len;
+	memcpy(pkt + pos, body, body_pos);
+	pos += body_pos;
 
 	if (tcp_send(air, sock, pkt, (uint16_t)pos) < 0)
 		return -1;
 	if (tcp_check_sent(air, sock) < 0)
 		return -1;
-	if (tcp_read_exact(air, sock, resp, sizeof(resp), 8000) < 0) {
+	if (mqtt_read_packet_timeout(air, sock, &header, resp, sizeof(resp),
+				     &resp_len, 8000) != 0) {
 		fprintf(stderr, "airliftctl: MQTT CONNACK timeout\n");
 		return -1;
 	}
-	if (resp[0] != 0x20 || resp[1] != 0x02 || resp[2] != 0x00 || resp[3] != 0x00) {
-		fprintf(stderr, "airliftctl: MQTT connect refused (%02x %02x %02x %02x)\n",
-			resp[0], resp[1], resp[2], resp[3]);
+	if (header != 0x20 || resp_len != 2 || resp[0] != 0x00 ||
+	    resp[1] != 0x00) {
+		fprintf(stderr, "airliftctl: MQTT connect refused header=0x%02x len=%u rc=0x%02x\n",
+			header, (unsigned int)resp_len,
+			resp_len > 1 ? resp[1] : 0xff);
 		return -1;
 	}
 	return 0;
@@ -5380,7 +5458,8 @@ static int mqtt_send_publish(struct airlift *air, uint8_t sock, const char *topi
 
 static int mqtt_publish(struct airlift *air, const char *host, uint16_t port,
 			const char *topic, const char *message,
-			const char *client_id)
+			const char *client_id, const char *username,
+			const char *password)
 {
 	uint8_t sock = NINA_NO_SOCKET;
 	uint8_t disconnect[] = { 0xe0, 0x00 };
@@ -5396,7 +5475,7 @@ static int mqtt_publish(struct airlift *air, const char *host, uint16_t port,
 		goto out;
 	if (tcp_wait_connected(air, sock) < 0)
 		goto out;
-	if (mqtt_send_connect(air, sock, client_id) < 0)
+	if (mqtt_send_connect(air, sock, client_id, username, password) < 0)
 		goto out;
 	if (mqtt_send_publish(air, sock, topic, message) < 0)
 		goto out;
@@ -5404,6 +5483,150 @@ static int mqtt_publish(struct airlift *air, const char *host, uint16_t port,
 	tcp_check_sent(air, sock);
 	printf("mqtt published %s:%u %s\n", host, port, topic);
 	ret = 0;
+
+out:
+	tcp_stop_client(air, sock);
+	return ret;
+}
+
+static int mqtt_send_subscribe(struct airlift *air, uint8_t sock,
+			       const char *topic)
+{
+	uint8_t pkt[512];
+	uint8_t resp[64];
+	uint8_t header = 0;
+	size_t pos = 0;
+	size_t body_start;
+	size_t body_len;
+	size_t resp_len = 0;
+
+	pkt[pos++] = 0x82;
+	pos += 4;
+	body_start = pos;
+	pkt[pos++] = 0;
+	pkt[pos++] = 1;
+	if (mqtt_put_string(pkt, sizeof(pkt), &pos, topic) < 0)
+		return -1;
+	pkt[pos++] = 0;
+	body_len = pos - body_start;
+	{
+		uint8_t rem[4];
+		size_t rem_pos = 0;
+
+		if (mqtt_put_remaining_length(rem, sizeof(rem), &rem_pos,
+					      body_len) < 0)
+			return -1;
+		memmove(pkt + 1 + rem_pos, pkt + body_start, body_len);
+		memcpy(pkt + 1, rem, rem_pos);
+		pos = 1 + rem_pos + body_len;
+	}
+
+	if (tcp_send(air, sock, pkt, (uint16_t)pos) < 0)
+		return -1;
+	if (tcp_check_sent(air, sock) < 0)
+		return -1;
+	if (mqtt_read_packet_timeout(air, sock, &header, resp, sizeof(resp),
+				     &resp_len, 8000) != 0 ||
+	    header != 0x90 || resp_len < 3 || resp[0] != 0 ||
+	    resp[1] != 1 || resp[2] == 0x80) {
+		fprintf(stderr, "airliftctl: MQTT SUBACK failed\n");
+		return -1;
+	}
+	return 0;
+}
+
+static int mqtt_print_publish(const uint8_t *payload, size_t len, bool verbose)
+{
+	size_t topic_len;
+	size_t pos = 2;
+	size_t payload_len;
+	const uint8_t *message;
+
+	if (len < 2)
+		return -1;
+	topic_len = ((size_t)payload[0] << 8) | payload[1];
+	if (pos + topic_len > len)
+		return -1;
+	if (verbose) {
+		fwrite(payload + pos, 1, topic_len, stdout);
+		putchar(' ');
+	}
+	pos += topic_len;
+	message = payload + pos;
+	payload_len = len - pos;
+	fwrite(message, 1, payload_len, stdout);
+	if (!payload_len || message[payload_len - 1] != '\n')
+		putchar('\n');
+	fflush(stdout);
+	return 0;
+}
+
+static int mqtt_subscribe_loop(struct airlift *air, uint8_t sock,
+			       unsigned int seconds, unsigned int count,
+			       bool verbose)
+{
+	uint8_t payload[1024];
+	long end = seconds ? now_ms() + ((long)seconds * 1000L) : 0;
+	long last_ping = now_ms();
+	unsigned int got = 0;
+
+	while (!stop_requested && (!count || got < count)) {
+		uint8_t header = 0;
+		size_t payload_len = 0;
+		int ret;
+
+		if (seconds && now_ms() >= end)
+			return got ? 0 : -1;
+
+		ret = mqtt_read_packet_timeout(air, sock, &header, payload,
+					       sizeof(payload), &payload_len,
+					       1000);
+		if (ret < 0)
+			return -1;
+		if (ret > 0) {
+			if (now_ms() - last_ping >= 30000L) {
+				static const uint8_t ping[] = { 0xc0, 0x00 };
+
+				if (tcp_send(air, sock, ping, sizeof(ping)) < 0 ||
+				    tcp_check_sent(air, sock) < 0)
+					return -1;
+				last_ping = now_ms();
+			}
+			continue;
+		}
+		if ((header >> 4) == 3 &&
+		    mqtt_print_publish(payload, payload_len, verbose) == 0)
+			got++;
+	}
+	return stop_requested ? -1 : 0;
+}
+
+static int mqtt_subscribe(struct airlift *air, const char *host, uint16_t port,
+			  const char *topic, const char *client_id,
+			  const char *username, const char *password,
+			  unsigned int seconds, unsigned int count, bool verbose)
+{
+	uint8_t sock = NINA_NO_SOCKET;
+	uint8_t disconnect[] = { 0xe0, 0x00 };
+	uint8_t ip[4];
+	int ret = -1;
+
+	if (resolve_host(air, host, ip) < 0)
+		return -1;
+	if (tcp_get_socket(air, &sock) < 0)
+		return -1;
+	if (tcp_start_client_ip(air, ip, port, sock) < 0)
+		goto out;
+	if (tcp_wait_connected(air, sock) < 0)
+		goto out;
+	if (mqtt_send_connect(air, sock, client_id, username, password) < 0)
+		goto out;
+	if (mqtt_send_subscribe(air, sock, topic) < 0)
+		goto out;
+	printf("mqtt subscribed %s:%u %s\n", host, port, topic);
+	ret = mqtt_subscribe_loop(air, sock, seconds, count, verbose);
+	tcp_send(air, sock, disconnect, sizeof(disconnect));
+	tcp_check_sent(air, sock);
 
 out:
 	tcp_stop_client(air, sock);
@@ -5656,6 +5879,8 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[arg], "mqtt-pub")) {
 		uint16_t port;
 		const char *client_id = "fruitjam-rp2350";
+		const char *username = NULL;
+		const char *password = NULL;
 
 		if (arg + 4 >= argc) {
 			usage(stderr);
@@ -5667,9 +5892,62 @@ int main(int argc, char **argv)
 		}
 		if (arg + 5 < argc)
 			client_id = argv[arg + 5];
+		if (arg + 6 < argc)
+			username = argv[arg + 6];
+		if (arg + 7 < argc)
+			password = argv[arg + 7];
+		if (arg + 8 < argc) {
+			usage(stderr);
+			return 2;
+		}
+		if (password && (!username || !*username)) {
+			fprintf(stderr, "airliftctl: MQTT password requires username\n");
+			return 2;
+		}
 		return mqtt_publish(&air, argv[arg + 1], port,
 				    argv[arg + 3], argv[arg + 4],
-				    client_id) < 0 ? 1 : 0;
+				    client_id, username, password) < 0 ? 1 : 0;
+	}
+	if (!strcmp(argv[arg], "mqtt-sub")) {
+		uint16_t port;
+		const char *client_id = "fruitjam-rp2350-sub";
+		const char *username = NULL;
+		const char *password = NULL;
+		unsigned int seconds = 30;
+		unsigned int count = 0;
+		bool verbose = false;
+
+		if (arg + 3 >= argc) {
+			usage(stderr);
+			return 2;
+		}
+		if (parse_port(argv[arg + 2], &port) < 0) {
+			fprintf(stderr, "airliftctl: invalid MQTT port\n");
+			return 2;
+		}
+		if (arg + 4 < argc)
+			client_id = argv[arg + 4];
+		if (arg + 5 < argc && argv[arg + 5][0])
+			username = argv[arg + 5];
+		if (arg + 6 < argc && argv[arg + 6][0])
+			password = argv[arg + 6];
+		if (arg + 7 < argc)
+			seconds = (unsigned int)strtoul(argv[arg + 7], NULL, 10);
+		if (arg + 8 < argc)
+			count = (unsigned int)strtoul(argv[arg + 8], NULL, 10);
+		if (arg + 9 < argc)
+			verbose = atoi(argv[arg + 9]) != 0;
+		if (arg + 10 < argc) {
+			usage(stderr);
+			return 2;
+		}
+		if (password && (!username || !*username)) {
+			fprintf(stderr, "airliftctl: MQTT password requires username\n");
+			return 2;
+		}
+		return mqtt_subscribe(&air, argv[arg + 1], port, argv[arg + 3],
+				      client_id, username, password, seconds,
+				      count, verbose) < 0 ? 1 : 0;
 	}
 
 	usage(stderr);

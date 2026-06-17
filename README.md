@@ -94,9 +94,10 @@ The Fruit Jam target is named `adafruit_fruit_jam_rp2350`. It uses:
 * `fruitjam-buttonlog`, a tiny fixed-schema SQLite 3 file writer. It avoids the
   full SQLite CLI/library because the no-MMU target cannot reliably allocate a
   large SQLite-linked process after services are running.
-* Tiny `mosquitto_pub` compatible MQTT publisher. It uses normal Linux sockets
-  by default, and `--airlift` routes the same publish request through
-  `airliftctl mqtt-pub` over the ESP32-C6 NINA TCP socket API.
+* Tiny `mosquitto_pub` and `mosquitto_sub` compatible MQTT tools. They use
+  normal Linux sockets by default, support username/password authentication for
+  QoS 0 broker smoke tests, and `--airlift` routes the same requests through
+  `airliftctl mqtt-pub`/`mqtt-sub` over the ESP32-C6 NINA TCP socket API.
 * GPIO-backed Linux I2C master on GPIO20/GPIO21, exposed as `/dev/i2c-0`, plus
   the tiny `fruitjam-i2c` scan/ping helper.
 * `/dev/fruitjam-audio` starts/stops PIO1-generated TLV320DAC3100 MCLK, BCLK,
@@ -165,12 +166,15 @@ Validated on hardware:
   and `airliftctl tcp-get example.com /` returned HTTP 200 plus the response
   body. `airliftctl mqtt-pub` published a QoS 0 MQTT message over the same NINA
   TCP path to a local broker, which received `fruitjam/test hello-from-airlift`.
+  `mosquitto_sub` and `airliftctl mqtt-sub` are now present for finite subscribe
+  smoke tests, pending hardware verification on the current board.
 
 AirLift is exposed as a userspace NINA socket helper, not as a Linux `wlan0`
 network interface. The boot service starts `airliftctl serve-inbound` for
 external HTTP, telnet, and FTP when WiFi is available. The tiny target-side
-`wget` still uses normal Linux sockets, while `airliftctl tcp-get` and
-`mosquitto_pub --airlift` use the ESP32-C6 directly.
+`wget` still uses normal Linux sockets, while `airliftctl tcp-get`,
+`mosquitto_pub --airlift`, and `mosquitto_sub --airlift` use the ESP32-C6
+directly.
 
 ### Fruit Jam hardware support matrix
 
@@ -200,7 +204,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | Telnet service | AirLift TCP/23; optional loopback TCP/23 | Supported | AirLift inbound shell and tiny `fruitjam-telnetd`/`fruitjam-shell`; telnet smoke tests pass. | Only one AirLift telnet session at a time. |
 | FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | Passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. | Upload completion can be slow over the current NINA raw socket path; active FTP remains a future objective. |
 | TFTP service | Optional loopback UDP/69 | Supported | BusyBox `tftpd` serves the TFTP area README when `fruitjam-services core` is started. | Not part of the default external AirLift service set. |
-| USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state, bus-reset timing, PIO2 packet I/O, descriptor/HID decode diagnostics, a narrow `kbd-init`/`kbd-poll` boot-keyboard probe path, and `kbd-text`/`kbd-events` polling loops for one direct boot keyboard. This is not a hub/composite/general USB stack. | Hardware-smoke the live boot-keyboard text/events path and widen endpoint/config parsing after it is stable. |
+| USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state, bus-reset timing, PIO2 packet I/O, descriptor/HID decode diagnostics, parameterized `kbd-init`/`kbd-poll` boot-keyboard probes, `kbd-text`/`kbd-events` polling loops, and `kbd-shell` for a tiny USB-keyboard-driven command loop. This is not a hub/composite/general USB stack. | Hardware-smoke the USB keyboard shell path on the current board, then decide whether to keep it as an explicit helper or integrate a broader console path. |
 | USB host 5V switch | GPIO11 | Partial | `fruitjamctl usb-power on/off` controls power enable. | Needs full USB host stack for devices. |
 | DVI / HSTX output | GPIO12-GPIO19, `/dev/fruitjam-dvi` | Partial | Tiny RGB332 HSTX DVI misc driver plus `fruitjam-dvi` text/dashboard/helper command output; hardware commands were verified on the flashed image. | Full fbdev/console is not implemented. |
 | I2S data path | GPIO24 DIN, GPIO25 MCLK | Partial | Tiny generated-tone path exists for RTTTL and simple WAV tone tests. | Add complete streamed PCM driver/path. |
@@ -230,14 +234,15 @@ process size and memory fragmentation matter.
 | `fruitjam-adc` | Read RP2350 ADC inputs and the internal temperature ADC channel. |
 | `fruitjam-dvi` | Render bounded text/dashboard/test frames to `/dev/fruitjam-dvi`. |
 | `fruitjam-wavplay` | Analyze simple WAV files and play tone segments through the TLV320 tone path. |
-| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, `hid`, and experimental `kbd-init`/`kbd-poll` plus `kbd-text`/`kbd-events` boot-keyboard commands. |
+| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, `hid`, parameterized `kbd-init`/`kbd-poll`, `kbd-text`/`kbd-events`, and `kbd-shell` boot-keyboard commands. |
 | `fruitjam-hidkeys` | Decode USB HID boot-keyboard 8-byte reports into text/events, including DATA0/DATA1 `last_rx_hex` packets from the PIO bridge when they contain an 8-byte keyboard report. |
 | `fruitjam-mem`, `free` | Tiny no-fork memory, uptime, load, and commit-pressure summary from `/proc`. |
 | `fruitjam-buttons` | Button daemon for GPIO0/GPIO4/GPIO5 with log, FIFO, SQLite, and MQTT hooks. |
 | `fruitjam-buttonlog` | Dump the fixed-schema button SQLite 3 log. |
 | `fruitjam-rtttl` | Play a small RTTTL tune through the TLV320 PIO I2S tone path. |
-| `airliftctl` | ESP32-C6 NINA firmware, WiFi, TCP, and MQTT diagnostics over SPI. |
-| `mosquitto_pub` | Tiny MQTT publisher; add `--airlift` to publish through the ESP32-C6. |
+| `airliftctl` | ESP32-C6 NINA firmware, WiFi, TCP, and MQTT diagnostics over SPI, including `mqtt-pub` and finite `mqtt-sub`. |
+| `mosquitto_pub` | Tiny MQTT publisher with optional `-u`/`-P`; add `--airlift` to publish through the ESP32-C6. |
+| `mosquitto_sub` | Tiny MQTT subscriber with optional `-u`/`-P`, `-C`, `-W`, and `-v`; add `--airlift` to subscribe through the ESP32-C6. |
 | `berry` | Berry interpreter with `-e`, scripts, and REPL. |
 | `berry-run` | Tiny wrapper that drops page cache before execing Berry for steadier multi-script runs. |
 | `/dev/neopixels` | PIO-backed device for the five onboard NeoPixels. |
@@ -289,7 +294,7 @@ and microphone-verified RTTTL/WAV audio on the flashed image.
 | --- | --- | --- |
 | USB CDC shell | PASS | `fruitjam-cdc-ok` over `/dev/tty.usbmodem1101`. |
 | Kernel boot | PASS | Linux 6.15.0 no-MMU Buildroot console responded. |
-| Tool inventory | PASS | `airliftctl`, `berry`, `fruitjamctl`, `fruitjam-i2c`, `fruitjam-rtttl`, `fruitjam-services`, `fruitjam-buttons`, `fruitjam-usbhost`, `fruitjam-hidkeys`, `fruitjam-mem`, `free`, `wget`, `telnet`, `nc`, `tftp`, and `vi` found in `PATH`. |
+| Tool inventory | PASS | `airliftctl`, `berry`, `fruitjamctl`, `fruitjam-i2c`, `fruitjam-rtttl`, `fruitjam-services`, `fruitjam-buttons`, `fruitjam-usbhost`, `fruitjam-hidkeys`, `mosquitto_pub`, `mosquitto_sub`, `fruitjam-mem`, `free`, `wget`, `telnet`, `nc`, `tftp`, and `vi` found in `PATH`. |
 | Berry expression | PASS | `berry -e 'print("berry-cdc-ok")'` printed `berry-cdc-ok`. |
 | Board status helper | PASS | `fruitjamctl status` reported LED, USB power, peripheral reset, and three buttons. |
 | Button helper | PASS | `fruitjam-buttons status` reported button1/button2/button3 released. |
@@ -554,24 +559,27 @@ UART, or telnet. They cover the features that have been brought up so far.
 
     Do not put real WiFi credentials in commits, image overlays, or public logs.
 
-24. Publish MQTT through AirLift:
+24. Publish and subscribe to MQTT through AirLift:
 
     ```sh
+    mosquitto_sub --airlift -h 192.0.2.10 -p 1883 -t 'fruitjam/#' -C 1 -W 30 -v
     mosquitto_pub --airlift -h 192.0.2.10 -p 1883 -t fruitjam/test -m hello-from-fruitjam
     ```
 
-    Replace the broker address with your own MQTT broker.
+    Replace the broker address with your own MQTT broker. Add `-u USER -P
+    PASSWORD` when your broker requires authentication.
 
 25. Route button events to MQTT through the SD-card config:
 
     ```sh
     mkdir -p /mnt/sd/fruitjam
     printf '%s\n' \
-      MQTT_ENABLE=1 \
       MQTT_TRANSPORT=airlift \
       MQTT_HOST=192.0.2.10 \
       MQTT_PORT=1883 \
-      MQTT_TOPIC_PREFIX=fruitjam/buttons \
+      MQTT_USER= \
+      MQTT_PASSWORD= \
+      MQTT_TOPIC=fruitjam/buttons \
       > /mnt/sd/fruitjam/buttons.conf
     fruitjam-services restart
     echo 'button2 gpio4 test 223' > /run/fruitjam-buttons.fifo

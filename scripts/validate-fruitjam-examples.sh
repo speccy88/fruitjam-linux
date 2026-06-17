@@ -17,9 +17,12 @@ telnetd_src="$repo/package/fruitjam-utils/src/fruitjam-telnetd.c"
 wget_src="$repo/package/fruitjam-utils/src/fruitjam-wget.c"
 httpd_src="$repo/package/fruitjam-utils/src/fruitjam-httpd.c"
 services_src="$repo/package/fruitjam-utils/src/fruitjam-services.c"
+buttons_src="$repo/package/fruitjam-utils/src/fruitjam-buttons.c"
 airlift_src="$repo/package/fruitjam-airlift/src/airliftctl.c"
 usbhost_src="$repo/package/fruitjam-utils/src/fruitjam-usbhost.c"
 hidkeys_src="$repo/package/fruitjam-utils/src/fruitjam-hidkeys.c"
+mosquitto_pub_src="$repo/package/fruitjam-utils/src/mosquitto_pub.c"
+mosquitto_sub_src="$repo/package/fruitjam-utils/src/mosquitto_sub.c"
 uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
 bootloader_clocks_src="$repo/package/pico2-bootloader/bootloader/src/clocks.h"
@@ -62,6 +65,7 @@ kernel_usbhost_live_drain_patch="$repo/board/raspberrypi/raspberrypi-pico2/patch
 kernel_usbhost_low_speed_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0056-misc-make-fruitjam-usbhost-low-speed-aware.patch"
 kernel_usbhost_tx_eop_gated_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0057-misc-preserve-fruitjam-usbhost-tx-eop-for-gated-rx.patch"
 kernel_usbhost_combo_skipack_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0058-misc-add-fruitjam-usbhost-combo-skipack-probe.patch"
+kernel_usbhost_keyboard_target_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0060-misc-parameterize-fruitjam-usbhost-keyboard-target.patch"
 kernel_config_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/adafruit_fruit_jam_rp2350.config"
 dts_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/dts/sifive/adafruit_fruit_jam_rp2350.dts"
 inittab_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/etc/inittab"
@@ -510,23 +514,31 @@ import termios
 import time
 
 src, tmp = sys.argv[1], sys.argv[2]
-status = (
-    b"power 1\n"
-    b"dp 1\n"
-    b"dm 0\n"
-    b"pio_ready 1\n"
-    b"pio_configured 1\n"
-    b"packets 1\n"
-    b"tx_errors 0\n"
-    b"last_tx_result 0\n"
-    b"last_tx_len 5\n"
-    b"rx_attempts 1\n"
-    b"rx_errors 0\n"
-    b"last_rx_result 0\n"
-    b"last_rx_len 12\n"
-    b"last_rx_pid 0x4b\n"
-    b"last_rx_hex f04b0000040000000000abcd\n"
-)
+def status_for_report(report_hex):
+    return (
+        b"power 1\n"
+        b"dp 1\n"
+        b"dm 0\n"
+        b"pio_ready 1\n"
+        b"pio_configured 1\n"
+        b"packets 1\n"
+        b"tx_errors 0\n"
+        b"last_tx_result 0\n"
+        b"last_tx_len 5\n"
+        b"rx_attempts 1\n"
+        b"rx_errors 0\n"
+        b"last_rx_result 0\n"
+        b"last_rx_len 12\n"
+        b"last_rx_pid 0x4b\n"
+        + f"last_rx_hex f04b{report_hex}abcd\n".encode()
+    )
+
+status = status_for_report("0000040000000000")
+
+def report_for_key(key):
+    return f"0000{key:02x}0000000000"
+
+release_report = "0000000000000000"
 
 def run_live(mode):
     master, slave = pty.openpty()
@@ -570,15 +582,73 @@ def run_live(mode):
     os.close(master)
     if proc.returncode:
         raise SystemExit(f"{mode} failed rc={proc.returncode} out={out!r} err={err!r} bridge={seen!r}")
-    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), bytes(seen)
 
-events, events_err = run_live("kbd-events")
-text, text_err = run_live("kbd-text")
+def run_shell():
+    master, slave = pty.openpty()
+    attrs = termios.tcgetattr(slave)
+    attrs[3] &= ~(termios.ECHO | termios.ICANON)
+    attrs[0] &= ~(termios.ICRNL | termios.IXON)
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    slave_name = os.ttyname(slave)
+    exe = os.path.join(tmp, "fruitjam-usbhost-kbd-shell")
+    subprocess.run([
+        "cc", "-Wall", "-Wextra", "-Wno-deprecated-declarations", "-Os",
+        f'-DBRIDGE_DEV="{slave_name}"',
+        "-o", exe, src,
+    ], check=True)
+    flags = fcntl.fcntl(master, fcntl.F_GETFL)
+    fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    proc = subprocess.Popen(
+        [exe, "kbd-shell", "2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    keys = [8, 6, 11, 18, 44, 18, 14, 40, 8, 27, 12, 23, 40]
+    reports = []
+    for key in keys:
+        reports.append(report_for_key(key))
+        reports.append(release_report)
+    seen = bytearray()
+    answered = 0
+    deadline = time.time() + 5
+    while proc.poll() is None and time.time() < deadline:
+        try:
+            chunk = os.read(master, 256)
+            if chunk:
+                seen.extend(chunk)
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+        polls = seen.count(b"kbd-poll")
+        while answered < polls and answered < len(reports):
+            os.write(master, status_for_report(reports[answered]))
+            answered += 1
+        time.sleep(0.01)
+    out, err = proc.communicate(timeout=2)
+    os.close(slave)
+    os.close(master)
+    if proc.returncode:
+        raise SystemExit(f"kbd-shell failed rc={proc.returncode} out={out!r} err={err!r} bridge={seen!r}")
+    return out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), bytes(seen)
+
+events, events_err, events_bridge = run_live("kbd-events")
+text, text_err, text_bridge = run_live("kbd-text")
 if "press key=a char=a code=0x04 modifiers=0x00" not in events:
     raise SystemExit(f"fruitjam-usbhost kbd-events did not emit key press: {events!r} {events_err!r}")
 if text != "a\n":
     raise SystemExit(f"fruitjam-usbhost kbd-text did not emit text: {text!r} {text_err!r}")
+if b"kbd-init 1 1 0" not in events_bridge or b"kbd-poll 1 1" not in text_bridge:
+    raise SystemExit("fruitjam-usbhost did not write parameterized keyboard bridge commands")
+shell, shell_err, shell_bridge = run_shell()
+if "USB keyboard shell; type exit to leave" not in shell or "echo ok" not in shell or "\nok\n" not in shell:
+    raise SystemExit(f"fruitjam-usbhost kbd-shell did not run typed command: {shell!r} {shell_err!r}")
+if b"kbd-init 1 1 0" not in shell_bridge or b"kbd-poll 1 1" not in shell_bridge:
+    raise SystemExit("fruitjam-usbhost kbd-shell did not use parameterized keyboard commands")
 print("ok fruitjam-usbhost live keyboard text/events")
+print("ok fruitjam-usbhost keyboard shell")
 PY
 python3 - "$tmp/fruitjam-usbhost.txt" "$tmp/fruitjam-usbhost.json" "$tmp/fruitjam-usbhost-wait.txt" "$tmp/fruitjam-usbhost-monitor.txt" "$tmp/fruitjam-usbhost-reset.txt" "$gpio_root" "$tmp/fruitjam-usbhost-decode-direct.txt" "$tmp/fruitjam-usbhost-decode-bridge.txt" "$tmp/fruitjam-usbhost-decode-hid.txt" "$tmp/fruitjam-usbhost-hid-packet.txt" "$tmp/fruitjam-usbhost-hid-raw.txt" "$tmp/fruitjam-usbhost-hid-descriptor.txt" <<'PY'
 import json
@@ -698,8 +768,142 @@ echo "ok fruitjam-hidkeys text"
 echo "ok fruitjam-hidkeys events"
 echo "ok fruitjam-hidkeys USB packet decode"
 
+echo "== mqtt pub/sub host behavior =="
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-o "$tmp/mosquitto_pub" "$mosquitto_pub_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-o "$tmp/mosquitto_sub" "$mosquitto_sub_src"
+python3 - "$tmp/mosquitto_pub" "$tmp/mosquitto_sub" <<'PY'
+import socket
+import struct
+import subprocess
+import sys
+import threading
+
+pub_exe, sub_exe = sys.argv[1:3]
+
+def read_exact(conn, n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            raise RuntimeError("short read")
+        data.extend(chunk)
+    return bytes(data)
+
+def read_remaining(conn):
+    multiplier = 1
+    value = 0
+    while True:
+        b = read_exact(conn, 1)[0]
+        value += (b & 127) * multiplier
+        if not b & 128:
+            return value
+        multiplier *= 128
+
+def read_packet(conn):
+    header = read_exact(conn, 1)[0]
+    length = read_remaining(conn)
+    return header, read_exact(conn, length)
+
+def get_string(packet, pos):
+    size = struct.unpack("!H", packet[pos:pos + 2])[0]
+    pos += 2
+    return packet[pos:pos + size].decode(), pos + size
+
+def check_connect(packet):
+    proto, pos = get_string(packet, 0)
+    assert proto == "MQTT"
+    assert packet[pos] == 4
+    flags = packet[pos + 1]
+    pos += 4
+    client, pos = get_string(packet, pos)
+    user = password = None
+    if flags & 0x80:
+        user, pos = get_string(packet, pos)
+    if flags & 0x40:
+        password, pos = get_string(packet, pos)
+    assert client
+    assert user == "user"
+    assert password == "pass"
+
+def serve_once(handler):
+    ready = {}
+    errors = []
+    def run():
+        try:
+            with socket.socket() as srv:
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", 0))
+                srv.listen(1)
+                ready["port"] = srv.getsockname()[1]
+                conn, _ = srv.accept()
+                with conn:
+                    handler(conn)
+        except BaseException as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=run)
+    thread.start()
+    while "port" not in ready and not errors:
+        pass
+    if errors:
+        raise errors[0]
+    return ready["port"], thread, errors
+
+published = {}
+def pub_handler(conn):
+    header, packet = read_packet(conn)
+    assert header == 0x10
+    check_connect(packet)
+    conn.sendall(b"\x20\x02\x00\x00")
+    header, packet = read_packet(conn)
+    assert header == 0x30
+    topic, pos = get_string(packet, 0)
+    published["topic"] = topic
+    published["payload"] = packet[pos:].decode()
+    read_packet(conn)
+
+port, thread, errors = serve_once(pub_handler)
+subprocess.run([
+    pub_exe, "-h", "127.0.0.1", "-p", str(port), "-u", "user", "-P", "pass",
+    "-i", "fruitjam-test-pub", "-t", "charlie/test", "-m", "hello"
+], check=True)
+thread.join(timeout=2)
+if errors:
+    raise errors[0]
+assert published == {"topic": "charlie/test", "payload": "hello"}
+
+def sub_handler(conn):
+    header, packet = read_packet(conn)
+    assert header == 0x10
+    check_connect(packet)
+    conn.sendall(b"\x20\x02\x00\x00")
+    header, packet = read_packet(conn)
+    assert header == 0x82
+    assert packet[:2] == b"\x00\x01"
+    topic, pos = get_string(packet, 2)
+    assert topic == "charlie/#"
+    assert packet[pos] == 0
+    conn.sendall(b"\x90\x03\x00\x01\x00")
+    publish = b"\x00\x0ccharlie/testhello"
+    conn.sendall(b"\x30" + bytes([len(publish)]) + publish)
+
+port, thread, errors = serve_once(sub_handler)
+result = subprocess.run([
+    sub_exe, "-h", "127.0.0.1", "-p", str(port), "-u", "user", "-P", "pass",
+    "-i", "fruitjam-test-sub", "-t", "charlie/#", "-C", "1", "-W", "3", "-v"
+], check=True, text=True, stdout=subprocess.PIPE)
+thread.join(timeout=2)
+if errors:
+    raise errors[0]
+if result.stdout != "charlie/test hello\n":
+    raise SystemExit(f"mosquitto_sub output regressed: {result.stdout!r}")
+print("ok mqtt pub auth")
+print("ok mqtt sub auth")
+PY
+
 echo "== usbhost kernel bridge source guards =="
-	python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" "$web_page_src" <<'PY'
+python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_usbhost_keyboard_target_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" "$web_page_src" <<'PY'
 import sys
 from pathlib import Path
 
@@ -740,13 +944,14 @@ live_drain_patch = Path(sys.argv[36]).read_text()
 low_speed_patch = Path(sys.argv[37]).read_text()
 tx_eop_gated_patch = Path(sys.argv[38]).read_text()
 combo_skipack_patch = Path(sys.argv[39]).read_text()
-config = Path(sys.argv[40]).read_text()
-dts = Path(sys.argv[41]).read_text()
-helper = Path(sys.argv[42]).read_text()
-cgi = Path(sys.argv[43]).read_text()
-airlift = Path(sys.argv[44]).read_text()
-clocks = Path(sys.argv[45]).read_text()
-web = Path(sys.argv[46]).read_text()
+keyboard_target_patch = Path(sys.argv[40]).read_text()
+config = Path(sys.argv[41]).read_text()
+dts = Path(sys.argv[42]).read_text()
+helper = Path(sys.argv[43]).read_text()
+cgi = Path(sys.argv[44]).read_text()
+airlift = Path(sys.argv[45]).read_text()
+clocks = Path(sys.argv[46]).read_text()
+web = Path(sys.argv[47]).read_text()
 if "CONFIG_FRUITJAM_USBHOST_BRIDGE" not in patch or "fruitjam_usbhost.c" not in patch:
     raise SystemExit("kernel patch missing Fruit Jam USB host bridge driver")
 if "/dev/fruitjam-usbhost" not in patch or "pio-packet-io-pending" not in patch:
@@ -998,6 +1203,17 @@ for needle in (
     if needle not in combo_skipack_patch:
         raise SystemExit(f"kernel USB host combined skip-ACK patch missing {needle}")
 for needle in (
+    "kbd-init ADDR CONFIG IFACE",
+    "kbd-poll ADDR EP",
+    "FJ_USBHOST_BOOT_KEYBOARD_CONFIG",
+    "fj_usbhost_parse_kbd_init",
+    "fj_usbhost_parse_kbd_poll",
+    "fj_usbhost_pio_keyboard_poll(uh, kbd_addr",
+    "fj_usbhost_pio_keyboard_init_poll(",
+):
+    if needle not in keyboard_target_patch:
+        raise SystemExit(f"kernel USB host keyboard target patch missing {needle}")
+for needle in (
     "fj_usbhost_pio_get_device8_fast",
     "get-device-8-fast",
     "reset-get-device-8-fast",
@@ -1096,8 +1312,18 @@ if "decode [RX-HEX]" not in helper or "descriptor device-prefix" not in helper:
     raise SystemExit("fruitjam-usbhost helper missing RX descriptor decoder")
 if "hid [RX-HEX|REPORT-HEX]" not in helper or "decode_hid_hex" not in helper or "boot-keyboard modifiers" not in helper:
     raise SystemExit("fruitjam-usbhost helper missing HID packet decoder")
-if "kbd-text [seconds]" not in helper or "kbd-events [seconds]" not in helper or "keyboard_live" not in helper:
+if "kbd-text [seconds [addr config iface ep]]" not in helper or "kbd-events [seconds [addr config iface ep]]" not in helper or "keyboard_live" not in helper:
     raise SystemExit("fruitjam-usbhost helper missing live keyboard text/events")
+for needle in (
+    "kbd-init [addr config iface]",
+    "kbd-poll [addr ep]",
+    "kbd-shell [seconds [addr config iface ep]]",
+    "keyboard_init_command",
+    "keyboard_poll_command",
+    "keyboard_shell",
+):
+    if needle not in helper:
+        raise SystemExit(f"fruitjam-usbhost helper missing keyboard target/shell support: {needle}")
 for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirLift")):
     for needle in (
         "in-token",
@@ -1244,6 +1470,12 @@ if "AIRLIFT_START_LOG" not in airlift or "print_cached_airlift_info" not in airl
     raise SystemExit("airliftctl missing cached read-only AirLift info fallback")
 if "AIRLIFT_HEARTBEAT_PATH" not in airlift or "inbound_heartbeat_poll" not in airlift:
     raise SystemExit("airliftctl missing inbound heartbeat updates")
+if '"mqtt-sub"' not in airlift or "mqtt_subscribe(" not in airlift or "mqtt_send_subscribe" not in airlift:
+    raise SystemExit("airliftctl missing MQTT subscribe path")
+if "#include <stdbool.h>" not in airlift:
+    raise SystemExit("airliftctl must include stdbool.h for MQTT subscribe verbose flag")
+if '"mqtt-pub"' not in airlift or "USERNAME PASSWORD" not in airlift:
+    raise SystemExit("airliftctl MQTT publish auth help regressed")
 for needle, label in [
     ("airlift_heartbeat_path", "AirLift heartbeat path"),
     ("spawn_wait_airlift_serve", "AirLift heartbeat-aware wait"),
@@ -1265,9 +1497,14 @@ print("ok airlift join guard")
 print("ok airlift lock guard")
 print("ok airlift cached info guard")
 print("ok airlift heartbeat guard")
+print("ok airlift mqtt subscribe guard")
 PY
 
 echo "== audio and dvi helper syntax =="
+cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$mosquitto_pub_src"
+echo "ok c syntax $mosquitto_pub_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$mosquitto_sub_src"
+echo "ok c syntax $mosquitto_sub_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$telnetd_src"
 echo "ok c syntax $telnetd_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$wget_src"
@@ -1278,6 +1515,8 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$uart_login_src
 echo "ok c syntax $uart_login_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$mem_src"
 echo "ok c syntax $mem_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$buttons_src"
+echo "ok c syntax $buttons_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$dvi_src"
 echo "ok c syntax $dvi_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$rtttl_src_c"

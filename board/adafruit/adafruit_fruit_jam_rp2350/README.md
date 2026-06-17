@@ -93,11 +93,12 @@ Validated on the Fruit Jam board:
   safely while the long-running inbound service owns the coprocessor; read-only
   `fw`, `mac`, `status`, and `ip` commands fall back to the last values in
   `/tmp/airlift-start.log`.
-* `airliftctl mqtt-pub` and `mosquitto_pub --airlift` provide a userspace AirLift
-  MQTT QoS 0 publish path for button actions when `MQTT_TRANSPORT=airlift` is
-  set in the button config. A local broker received both a direct
-  `fruitjam/test` AirLift publish and a synthetic `fruitjam/buttons/button2`
-  publish from the button FIFO path.
+* `airliftctl mqtt-pub`/`mqtt-sub` and `mosquitto_pub`/`mosquitto_sub --airlift`
+  provide userspace AirLift MQTT QoS 0 publish/subscribe paths with optional
+  username/password authentication. The publish path is used for button actions
+  when `MQTT_TRANSPORT=airlift` is set in the button config. A local broker
+  received both a direct `fruitjam/test` AirLift publish and a synthetic
+  `fruitjam/buttons/button2` publish from the button FIFO path.
 * `/sys/class/misc/fruitjam-audio` registers, `/dev/fruitjam-audio` accepts
   `start` and `stop`, and `fruitjam-i2c ping 0x18` acks. Audible RTTTL output
   and a generated WAV scale were verified with the Mac microphone helper.
@@ -194,12 +195,15 @@ make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
 bridge so hardware validation can proceed over UART and USB CDC.
 `/dev/fruitjam-usbhost` owns the USB host power switch plus GPIO1/GPIO2
 line-state and reset timing in the kernel. `fruitjam-usbhost status`, `json`,
-`wait`, `monitor`, `reset`, `decode`, `hid`, `kbd-text`, and `kbd-events` use that bridge when present and
+`wait`, `monitor`, `reset`, `decode`, `hid`, `kbd-text`, `kbd-events`, and
+`kbd-shell` use that bridge when present and
 fall back to sysfs GPIO on older images. The bridge stages the 32-word PIO2 full-speed host
 program so USB packet work has a dedicated block that does not collide with PIO0
 NeoPixels or PIO1 audio. PIO token/data transactions and boot-keyboard report
-polling now have a narrow live text/events path for one direct boot-protocol
-keyboard.
+polling now have a narrow live text/events/shell path for boot-protocol
+keyboards. The default target is address 1, configuration 1, interface 0, and
+endpoint 1; `fruitjam-usbhost` can pass explicit address/config/interface/endpoint
+values for keyboards that do not match that simplest layout.
 `fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events. It
 also accepts DATA0/DATA1 `last_rx_hex` packets from `fruitjam-usbhost` when the
 payload is an 8-byte keyboard report, so bridge captures can feed the same
@@ -254,11 +258,16 @@ MQTT_HOST=broker.local
 MQTT_PORT=1883
 MQTT_TOPIC=fruitjam/buttons
 MQTT_CLIENT_ID=fruitjam-rp2350
+MQTT_USER=
+MQTT_PASSWORD=
 MQTT_TRANSPORT=airlift
 ```
 
 The daemon calls `mosquitto_pub --airlift`, which execs `airliftctl mqtt-pub`
 and sends one MQTT 3.1.1 QoS 0 publish over the ESP32-C6 NINA TCP socket API.
+For finite subscribe tests, use `mosquitto_sub --airlift -h "$MQTT_HOST" -p
+"$MQTT_PORT" -t 'fruitjam/#' -C 1 -W 30 -v`; add `-u`/`-P` when your broker
+requires authentication.
 
 ## I2C
 
@@ -326,6 +335,7 @@ airliftctl join <ssid> <passphrase>
 airliftctl ip
 airliftctl tcp-get example.com /
 airliftctl mqtt-pub <broker-host> 1883 fruitjam/test hello
+airliftctl mqtt-sub <broker-host> 1883 'fruitjam/#'
 ```
 
 For automatic service startup, store WiFi credentials on the SD card at
@@ -398,10 +408,11 @@ test
 
 * HSTX DVI has a tiny `/dev/fruitjam-dvi` RGB332 frame helper for bounded
   dashboard/text/test frames. Full fbdev/console support is not implemented.
-* USB host 5 V power, D+/D- reset/line-state ownership, PIO packet I/O, and an
-  experimental boot-keyboard init/poll probe now live behind the
-  `/dev/fruitjam-usbhost` kernel bridge. Hub, composite device, and general
-  Linux input support are not implemented.
+* USB host 5 V power, D+/D- reset/line-state ownership, PIO packet I/O,
+  parameterized boot-keyboard init/poll, text/events polling, and a tiny
+  USB-keyboard-driven shell now live behind the `/dev/fruitjam-usbhost` kernel
+  bridge. Hub, composite device, and general Linux input support are not
+  implemented.
 * Buttons, GPIO29, microSD block access, button SQLite logging, GPIO20/GPIO21
   I2C, AirLift userspace socket access, first-step TLV320 RTTTL audio, and the
   narrow USB boot-keyboard probe work, but WiFi/AirLift Linux netdev support,

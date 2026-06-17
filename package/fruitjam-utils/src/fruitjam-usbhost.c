@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef GPIO_ROOT
@@ -41,6 +43,12 @@
 #define HID_KEY_SLOTS 6
 #define HID_MOD_LSHIFT 0x02u
 #define HID_MOD_RSHIFT 0x20u
+#define KBD_ADDR_DEFAULT 1u
+#define KBD_CONFIG_DEFAULT 1u
+#define KBD_IFACE_DEFAULT 0u
+#define KBD_EP_DEFAULT 1u
+#define KBD_SHELL_LINE_SIZE 256
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 struct usbhost_status {
 	int power;
@@ -74,13 +82,24 @@ struct hid_live_state {
 	unsigned char prev[HID_KEY_SLOTS];
 };
 
+struct keyboard_target {
+	unsigned int addr;
+	unsigned int config;
+	unsigned int iface;
+	unsigned int ep;
+};
+
+static const char *path_dirs[] = {
+	"/bin", "/usr/bin", "/sbin", "/usr/sbin"
+};
+
 static void read_status(struct usbhost_status *st);
 static void print_human(const struct usbhost_status *st);
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init|kbd-poll|kbd-init-poll|kbd-text [seconds]|kbd-events [seconds]|kbd-monitor [seconds]|wait [seconds]|monitor [seconds]}\n");
+		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init [addr config iface]|kbd-poll [addr ep]|kbd-init-poll [addr config iface ep]|kbd-text [seconds [addr config iface ep]]|kbd-events [seconds [addr config iface ep]]|kbd-monitor [seconds [addr config iface ep]]|kbd-shell [seconds [addr config iface ep]]|wait [seconds]|monitor [seconds]}\n");
 }
 
 static int write_file(const char *path, const char *text)
@@ -556,6 +575,29 @@ static void process_hid_live_report(struct hid_live_state *state,
 		fflush(stdout);
 }
 
+static size_t collect_hid_text_chars(struct hid_live_state *state,
+				     const unsigned char report[HID_REPORT_LEN],
+				     int *chars, size_t max_chars)
+{
+	bool shift = report[0] & (HID_MOD_LSHIFT | HID_MOD_RSHIFT);
+	size_t count = 0;
+	size_t i;
+
+	for (i = 2; i < HID_REPORT_LEN; i++) {
+		unsigned char key = report[i];
+		int ch;
+
+		if (key < 4 || hid_key_in_prev(state, key))
+			continue;
+		ch = hid_key_ascii(key, shift);
+		if (ch && count < max_chars)
+			chars[count++] = ch;
+	}
+
+	hid_live_copy_prev(state, report);
+	return count;
+}
+
 static unsigned int le16(const unsigned char *p)
 {
 	return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
@@ -859,6 +901,32 @@ static int bridge_write_command(const char *command)
 	return ret == (ssize_t)len ? 0 : -1;
 }
 
+static void keyboard_target_default(struct keyboard_target *target)
+{
+	target->addr = KBD_ADDR_DEFAULT;
+	target->config = KBD_CONFIG_DEFAULT;
+	target->iface = KBD_IFACE_DEFAULT;
+	target->ep = KBD_EP_DEFAULT;
+}
+
+static int keyboard_init_command(const struct keyboard_target *target,
+				 char *buf, size_t len)
+{
+	int ret = snprintf(buf, len, "kbd-init %u %u %u",
+			   target->addr, target->config, target->iface);
+
+	return ret > 0 && (size_t)ret < len ? 0 : -1;
+}
+
+static int keyboard_poll_command(const struct keyboard_target *target,
+				 char *buf, size_t len)
+{
+	int ret = snprintf(buf, len, "kbd-poll %u %u",
+			   target->addr, target->ep);
+
+	return ret > 0 && (size_t)ret < len ? 0 : -1;
+}
+
 static bool keyboard_poll_error_is_transient(int saved_errno,
 					     const struct usbhost_status *st)
 {
@@ -872,13 +940,41 @@ static bool keyboard_poll_error_is_transient(int saved_errno,
 	return false;
 }
 
-static int keyboard_poll_once(struct hid_live_state *state, bool events)
+static int keyboard_init_target(const struct keyboard_target *target)
 {
 	struct usbhost_status st;
-	unsigned char report[HID_REPORT_LEN];
+	char command[48];
 	int saved_errno;
 
-	if (bridge_write_command("kbd-poll") < 0) {
+	if (keyboard_init_command(target, command, sizeof(command)) < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (bridge_write_command(command) < 0) {
+		saved_errno = errno;
+		fprintf(stderr, "fruitjam-usbhost: keyboard init failed: %s\n",
+			strerror(saved_errno));
+		read_status(&st);
+		print_human(&st);
+		return -1;
+	}
+	return 0;
+}
+
+static int keyboard_poll_report(const struct keyboard_target *target,
+				unsigned char report[HID_REPORT_LEN],
+				bool *has_report)
+{
+	struct usbhost_status st;
+	char command[48];
+	int saved_errno;
+
+	*has_report = false;
+	if (keyboard_poll_command(target, command, sizeof(command)) < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (bridge_write_command(command) < 0) {
 		saved_errno = errno;
 		read_status(&st);
 		if (keyboard_poll_error_is_transient(saved_errno, &st))
@@ -891,6 +987,19 @@ static int keyboard_poll_once(struct hid_live_state *state, bool events)
 
 	read_status(&st);
 	if (hid_report_from_hex(st.last_rx_hex, report) == 0)
+		*has_report = true;
+	return 0;
+}
+
+static int keyboard_poll_once(const struct keyboard_target *target,
+			      struct hid_live_state *state, bool events)
+{
+	unsigned char report[HID_REPORT_LEN];
+	bool has_report = false;
+
+	if (keyboard_poll_report(target, report, &has_report) < 0)
+		return -1;
+	if (has_report)
 		process_hid_live_report(state, report, events);
 	return 0;
 }
@@ -1044,6 +1153,61 @@ static int parse_reset_ms(const char *s, unsigned int *ms)
 	return 0;
 }
 
+static int parse_uint_range(const char *s, unsigned int min,
+			    unsigned int max, unsigned int *value)
+{
+	char *end;
+	unsigned long parsed;
+
+	if (!s || !*s)
+		return -1;
+	errno = 0;
+	parsed = strtoul(s, &end, 10);
+	if (errno || *end || parsed < min || parsed > max)
+		return -1;
+	*value = (unsigned int)parsed;
+	return 0;
+}
+
+static int parse_keyboard_init_args(int argc, char **argv, int start,
+				    struct keyboard_target *target)
+{
+	keyboard_target_default(target);
+	if (argc == start)
+		return 0;
+	if (argc - start != 3)
+		return -1;
+	return parse_uint_range(argv[start], 1, 127, &target->addr) ||
+		parse_uint_range(argv[start + 1], 1, 255, &target->config) ||
+		parse_uint_range(argv[start + 2], 0, 255, &target->iface);
+}
+
+static int parse_keyboard_poll_args(int argc, char **argv, int start,
+				    struct keyboard_target *target)
+{
+	keyboard_target_default(target);
+	if (argc == start)
+		return 0;
+	if (argc - start != 2)
+		return -1;
+	return parse_uint_range(argv[start], 1, 127, &target->addr) ||
+		parse_uint_range(argv[start + 1], 1, 15, &target->ep);
+}
+
+static int parse_keyboard_full_args(int argc, char **argv, int start,
+				    struct keyboard_target *target)
+{
+	keyboard_target_default(target);
+	if (argc == start)
+		return 0;
+	if (argc - start != 4)
+		return -1;
+	return parse_uint_range(argv[start], 1, 127, &target->addr) ||
+		parse_uint_range(argv[start + 1], 1, 255, &target->config) ||
+		parse_uint_range(argv[start + 2], 0, 255, &target->iface) ||
+		parse_uint_range(argv[start + 3], 1, 15, &target->ep);
+}
+
 static int bus_reset(unsigned int reset_ms)
 {
 	int ret = 0;
@@ -1104,13 +1268,232 @@ static int monitor_device(unsigned int seconds)
 	return 0;
 }
 
-static int keyboard_live(unsigned int seconds, bool events)
+static char *trim_text(char *s)
+{
+	char *end;
+
+	while (*s == ' ' || *s == '\t')
+		s++;
+	end = s + strlen(s);
+	while (end > s && (end[-1] == '\n' || end[-1] == '\r' ||
+			   end[-1] == ' ' || end[-1] == '\t'))
+		*--end = '\0';
+	return s;
+}
+
+static int split_args(char *line, char **argv, int max_args)
+{
+	int argc = 0;
+
+	while (*line && argc < max_args - 1) {
+		while (*line == ' ' || *line == '\t')
+			line++;
+		if (!*line)
+			break;
+		argv[argc++] = line;
+		while (*line && *line != ' ' && *line != '\t')
+			line++;
+		if (*line)
+			*line++ = '\0';
+	}
+	argv[argc] = NULL;
+	return argc;
+}
+
+static void exec_child(char **argv)
+{
+	char path[96];
+	unsigned int i;
+
+	if (strchr(argv[0], '/')) {
+		execv(argv[0], argv);
+		perror(argv[0]);
+		_exit(127);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(path_dirs); i++) {
+		snprintf(path, sizeof(path), "%s/%s", path_dirs[i], argv[0]);
+		execv(path, argv);
+		if (errno != ENOENT && errno != ENOTDIR) {
+			perror(path);
+			_exit(127);
+		}
+	}
+
+	fprintf(stderr, "%s: not found\n", argv[0]);
+	_exit(127);
+}
+
+static int run_command(char **argv)
+{
+	pid_t pid = vfork();
+	int status;
+
+	if (pid < 0) {
+		perror("vfork");
+		return 1;
+	}
+	if (pid == 0)
+		exec_child(argv);
+
+	if (waitpid(pid, &status, 0) < 0) {
+		perror("waitpid");
+		return 1;
+	}
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	if (WIFSIGNALED(status))
+		return 128 + WTERMSIG(status);
+	return 1;
+}
+
+static void keyboard_shell_prompt(void)
+{
+	fputs("usbkbd$ ", stdout);
+	fflush(stdout);
+}
+
+static int keyboard_shell_run_line(char *line, int last_status)
+{
+	char *cmd = trim_text(line);
+	char *argv[16];
+	int argc;
+
+	if (!*cmd)
+		return last_status;
+	argc = split_args(cmd, argv, ARRAY_SIZE(argv));
+	if (argc == 0)
+		return last_status;
+	if (!strcmp(argv[0], "exit"))
+		return -1;
+	if (!strcmp(argv[0], "echo")) {
+		int i;
+
+		for (i = 1; i < argc; i++) {
+			if (i > 1)
+				putchar(' ');
+			fputs(argv[i], stdout);
+		}
+		putchar('\n');
+		return 0;
+	}
+	if (!strcmp(argv[0], "cd")) {
+		const char *dir = argc > 1 ? argv[1] : "/";
+
+		if (chdir(dir) < 0) {
+			perror(dir);
+			return 1;
+		}
+		return 0;
+	}
+	if (!strcmp(argv[0], "?") || !strcmp(argv[0], "help")) {
+		puts("builtins: cd echo exit help status");
+		puts("simple commands are searched in /bin /usr/bin /sbin /usr/sbin");
+		return 0;
+	}
+	if (!strcmp(argv[0], "status")) {
+		printf("%d\n", last_status);
+		return last_status;
+	}
+	return run_command(argv);
+}
+
+static void keyboard_shell_accept_char(char *line, size_t *len,
+				       int ch, int *last_status, bool *done)
+{
+	if (ch == '\n') {
+		putchar('\n');
+		line[*len] = '\0';
+		*last_status = keyboard_shell_run_line(line, *last_status);
+		if (*last_status < 0) {
+			*done = true;
+			return;
+		}
+		*len = 0;
+		line[0] = '\0';
+		keyboard_shell_prompt();
+		return;
+	}
+	if (ch == '\177') {
+		if (*len > 0) {
+			(*len)--;
+			line[*len] = '\0';
+			fputs("\b \b", stdout);
+			fflush(stdout);
+		}
+		return;
+	}
+	if (ch == '\t') {
+		putchar('\a');
+		fflush(stdout);
+		return;
+	}
+	if (ch >= 32 && ch <= 126 && *len + 1 < KBD_SHELL_LINE_SIZE) {
+		line[(*len)++] = (char)ch;
+		line[*len] = '\0';
+		putchar(ch);
+		fflush(stdout);
+	}
+}
+
+static int keyboard_shell(const struct keyboard_target *target,
+			  unsigned int seconds)
 {
 	struct hid_live_state state;
-	struct usbhost_status st;
+	char line[KBD_SHELL_LINE_SIZE];
+	size_t line_len = 0;
 	unsigned int loops;
 	unsigned int i;
-	int saved_errno;
+	int last_status = 0;
+	bool done = false;
+
+	if (access(BRIDGE_DEV, W_OK) != 0) {
+		fprintf(stderr, "fruitjam-usbhost: keyboard shell requires %s\n",
+			BRIDGE_DEV);
+		return 1;
+	}
+	if (keyboard_init_target(target) < 0)
+		return 1;
+
+	memset(&state, 0, sizeof(state));
+	line[0] = '\0';
+	loops = seconds ? (seconds * 1000000u) / KBD_POLL_US : 0;
+	puts("USB keyboard shell; type exit to leave");
+	keyboard_shell_prompt();
+
+	for (i = 0; !done && (!seconds || i < loops); i++) {
+		unsigned char report[HID_REPORT_LEN];
+		bool has_report = false;
+
+		if (keyboard_poll_report(target, report, &has_report) < 0)
+			return 1;
+		if (has_report) {
+			int chars[HID_KEY_SLOTS];
+			size_t count = collect_hid_text_chars(&state, report,
+							      chars,
+							      ARRAY_SIZE(chars));
+			size_t j;
+
+			for (j = 0; j < count && !done; j++)
+				keyboard_shell_accept_char(line, &line_len,
+							   chars[j],
+							   &last_status,
+							   &done);
+		}
+		if (!done)
+			usleep(KBD_POLL_US);
+	}
+	if (!done)
+		putchar('\n');
+	return last_status < 0 ? 0 : last_status;
+}
+
+static int keyboard_live(const struct keyboard_target *target,
+			 unsigned int seconds, bool events)
+{
+	struct hid_live_state state;
+	unsigned int loops;
+	unsigned int i;
 
 	if (access(BRIDGE_DEV, W_OK) != 0) {
 		fprintf(stderr, "fruitjam-usbhost: keyboard polling requires %s\n",
@@ -1118,14 +1501,8 @@ static int keyboard_live(unsigned int seconds, bool events)
 		return 1;
 	}
 
-	if (bridge_write_command("kbd-init") < 0) {
-		saved_errno = errno;
-		fprintf(stderr, "fruitjam-usbhost: keyboard init failed: %s\n",
-			strerror(saved_errno));
-		read_status(&st);
-		print_human(&st);
+	if (keyboard_init_target(target) < 0)
 		return 1;
-	}
 
 	memset(&state, 0, sizeof(state));
 	loops = seconds ? (seconds * 1000000u) / KBD_POLL_US : 1;
@@ -1140,7 +1517,7 @@ static int keyboard_live(unsigned int seconds, bool events)
 			events ? "events" : "text");
 
 	for (i = 0; i < loops; i++) {
-		if (keyboard_poll_once(&state, events) < 0)
+		if (keyboard_poll_once(target, &state, events) < 0)
 			return 1;
 		if (i + 1 < loops)
 			usleep(KBD_POLL_US);
@@ -1155,8 +1532,10 @@ int main(int argc, char **argv)
 {
 	const char *cmd = argc > 1 ? argv[1] : "status";
 	struct usbhost_status st;
+	struct keyboard_target target;
 	unsigned int seconds;
 	unsigned int reset_ms;
+	char command[64];
 
 	if (!strcmp(cmd, "-h") || !strcmp(cmd, "--help")) {
 		usage(stdout);
@@ -1298,22 +1677,50 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "reset-get-device-8-stream"))
 		return bridge_action("reset-get-device-8-stream",
 				     "PIO reset/SOF streamed SETUP/IN GET_DESCRIPTOR probe");
-	if (!strcmp(cmd, "kbd-init"))
-		return bridge_action("kbd-init",
+	if (!strcmp(cmd, "kbd-init")) {
+		if (parse_keyboard_init_args(argc, argv, 2, &target) < 0 ||
+		    keyboard_init_command(&target, command, sizeof(command)) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return bridge_action(command,
 				     "PIO boot-keyboard address/config/protocol probe");
-	if (!strcmp(cmd, "kbd-poll"))
-		return bridge_action("kbd-poll",
+	}
+	if (!strcmp(cmd, "kbd-poll")) {
+		if (parse_keyboard_poll_args(argc, argv, 2, &target) < 0 ||
+		    keyboard_poll_command(&target, command, sizeof(command)) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return bridge_action(command,
 				     "PIO boot-keyboard interrupt IN poll");
-	if (!strcmp(cmd, "kbd-init-poll"))
-		return bridge_action("kbd-init-poll",
+	}
+	if (!strcmp(cmd, "kbd-init-poll")) {
+		if (parse_keyboard_full_args(argc, argv, 2, &target) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		if (keyboard_init_target(&target) < 0)
+			return 1;
+		if (keyboard_poll_command(&target, command, sizeof(command)) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return bridge_action(command,
 				     "PIO boot-keyboard init and interrupt IN poll");
+	}
 	if (!strcmp(cmd, "kbd-text")) {
 		if (parse_seconds(argc > 2 ? argv[2] : NULL,
 				  DEFAULT_KBD_SECONDS, &seconds) < 0) {
 			usage(stderr);
 			return 1;
 		}
-		return keyboard_live(seconds, false);
+		if (parse_keyboard_full_args(argc, argv, argc > 2 ? 3 : 2,
+					     &target) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return keyboard_live(&target, seconds, false);
 	}
 	if (!strcmp(cmd, "kbd-events") || !strcmp(cmd, "kbd-monitor")) {
 		if (parse_seconds(argc > 2 ? argv[2] : NULL,
@@ -1321,7 +1728,24 @@ int main(int argc, char **argv)
 			usage(stderr);
 			return 1;
 		}
-		return keyboard_live(seconds, true);
+		if (parse_keyboard_full_args(argc, argv, argc > 2 ? 3 : 2,
+					     &target) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return keyboard_live(&target, seconds, true);
+	}
+	if (!strcmp(cmd, "kbd-shell")) {
+		if (parse_seconds(argc > 2 ? argv[2] : NULL, 0, &seconds) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		if (parse_keyboard_full_args(argc, argv, argc > 2 ? 3 : 2,
+					     &target) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return keyboard_shell(&target, seconds);
 	}
 	if (!strcmp(cmd, "status")) {
 		read_status(&st);

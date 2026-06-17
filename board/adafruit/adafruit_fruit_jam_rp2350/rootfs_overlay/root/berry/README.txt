@@ -26,6 +26,8 @@ Files:
                             Host validation fixture for fake GPIO/ADC/audio/DVI/NeoPixel paths.
   08-usbhost-hid-decode.be
                             Berry decode checks for raw and DATA0/DATA1 HID keyboard reports.
+  09-mqtt-publish.be        Writes /tmp/fruitjam-mqtt-pub.sh for MQTT publish tests.
+  10-mqtt-subscribe.be      Writes /tmp/fruitjam-mqtt-sub.sh for MQTT subscribe tests.
   fruitjam.be              Importable helpers for GPIO, buttons, ADC, USB-host status,
                             HID decode, audio clock, DVI command writes, device presence,
                             and NeoPixels.

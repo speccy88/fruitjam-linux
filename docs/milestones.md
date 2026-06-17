@@ -99,10 +99,9 @@ Included:
 * `fruitjam-buttons daemon` watches GPIO0/GPIO4/GPIO5.
 * `/run/fruitjam-buttons.fifo` accepts synthetic test events such as
   `echo test button1 > /run/fruitjam-buttons.fifo`.
-* `mosquitto_pub` compatible helper is installed for MQTT publish attempts when
-  `MQTT_HOST` is configured. Set `MQTT_TRANSPORT=airlift` to route the same
-  button publish command through `mosquitto_pub --airlift` and the ESP32-C6 NINA
-  TCP socket API.
+* `mosquitto_pub` and `mosquitto_sub` compatible helpers are installed for MQTT
+  QoS 0 smoke tests. Set `MQTT_TRANSPORT=airlift` to route button publishes
+  through `mosquitto_pub --airlift` and the ESP32-C6 NINA TCP socket API.
 * `fruitjam-buttonlog` writes a fixed-schema SQLite 3 database at
   `/mnt/sd/fruitjam/buttons.db` and a text mirror at
   `/mnt/sd/fruitjam/buttons.log`.
@@ -246,13 +245,20 @@ work.
   TX/RX/EOP state machines and all 32 instruction words.
 * The bridge now stages the 32-word host PIO program, reports `pio_ready`,
   ACKs received DATA packets in the RX-EOP path, sends low-speed keepalives,
-  and exposes experimental `kbd-init`/`kbd-poll` commands for one direct
-  boot-protocol keyboard at address 1 endpoint 1. `fruitjam-usbhost kbd-text`
-  and `kbd-events` build on that path by suppressing held-key repeats and
-  translating stable boot reports into text or press/release events.
-* Keep the next step hardware-side and minimal: smoke `kbd-text`/`kbd-events`
-  with the keyboard currently plugged into the Fruit Jam, then decide whether
-  to wire that stream into a console shell or keep it as an explicit helper.
+  and exposes experimental `kbd-init`/`kbd-poll` commands for boot-protocol
+  keyboards. The default remains address 1, configuration 1, interface 0, and
+  endpoint 1, but userspace can pass explicit address/config/interface/endpoint
+  values for less-simple keyboard layouts.
+* `fruitjam-usbhost kbd-text` and `kbd-events` suppress held-key repeats and
+  translate stable boot reports into text or press/release events.
+  `fruitjam-usbhost kbd-shell` uses the same polling path to drive a tiny
+  command loop from a USB keyboard, which satisfies the first useful
+  "typed characters appear in a Linux shell" milestone without adding a full
+  Linux input stack.
+* Keep the next step hardware-side and minimal: smoke `kbd-shell`,
+  `kbd-text`, and `kbd-events` with the keyboard currently plugged into the
+  Fruit Jam, then decide whether to keep this as an explicit helper or
+  integrate a broader console path.
 * Do not include mouse, storage, arbitrary hub hotplug, or composite-device support in the first keyboard milestone.
 
 ## Milestone G: AirLift networking
@@ -261,9 +267,9 @@ The onboard ESP32-C6 AirLift runs NINA firmware and communicates with the RP2350
 over RP2350 PL022/spidev hardware SPI. The first Linux milestone is a small
 userspace probe that can reset the C6, read the NINA firmware version, scan APs,
 join a network, report DHCP addressing, open a basic TCP connection, and publish
-a QoS 0 MQTT message through the coprocessor. The current helper also serves a
-small inbound HTTP/telnet/FTP surface directly through AirLift sockets when WiFi
-is configured on the SD card.
+or subscribe to QoS 0 MQTT messages through the coprocessor. The current helper
+also serves a small inbound HTTP/telnet/FTP surface directly through AirLift
+sockets when WiFi is configured on the SD card.
 
 Acceptance test:
 
@@ -273,16 +279,19 @@ Acceptance test:
 4. Run `airliftctl status` and confirm `status 3 connected`.
 5. Run `airliftctl ip` and confirm a DHCP address, netmask, and gateway.
 6. Run `airliftctl tcp-get example.com /` and confirm an HTTP 200 response.
-7. Run `airliftctl mqtt-pub <broker-host> 1883 fruitjam/test hello` and confirm
-   an MQTT broker receives the message.
-8. With `/mnt/sd/fruitjam/wifi.conf` present, boot the image and confirm
+7. Run `airliftctl mqtt-sub <broker-host> 1883 'fruitjam/#'` in one session.
+8. Run `airliftctl mqtt-pub <broker-host> 1883 fruitjam/test hello` and confirm
+   the subscriber receives the message.
+9. With `/mnt/sd/fruitjam/wifi.conf` present, boot the image and confirm
    `airliftctl serve-inbound` exposes `http://<board-ip>/`, telnet on TCP/23,
    and passive FTP on TCP/21 plus a passive data port.
 
 Status: userspace NINA socket milestone achieved on Fruit Jam hardware with the
 installed NINA firmware reporting `3.3.0`. `airliftctl mqtt-pub` was verified
 against a local MQTT broker after joining WiFi, and inbound HTTP/telnet/passive
-FTP were verified from another host.
+FTP were verified from another host. `mqtt-sub` and `mosquitto_sub --airlift`
+are implemented and host-protocol validated; they still need current-board
+broker verification.
 
 The NINA protocol uses big-endian 16-bit SPI framing for buffer lengths and port
 parameters. Do not change this to little-endian; doing so makes TCP connect/send

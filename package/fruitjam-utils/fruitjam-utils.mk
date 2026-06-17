@@ -49,6 +49,8 @@ define FRUITJAM_UTILS_BUILD_CMDS
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
 		-Wall -Wextra -Os -o $(@D)/mosquitto_pub $(@D)/mosquitto_pub.c
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+		-Wall -Wextra -Os -o $(@D)/mosquitto_sub $(@D)/mosquitto_sub.c
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
 		-Wall -Wextra -Os -o $(@D)/fruitjam-buttons \
 		$(@D)/fruitjam-buttons.c
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
@@ -95,6 +97,7 @@ define FRUITJAM_UTILS_BUILD_CMDS
 		$(@D)/fruitjam-usbhost \
 		$(@D)/fruitjam-dvi \
 		$(@D)/mosquitto_pub \
+		$(@D)/mosquitto_sub \
 		$(@D)/fruitjam-buttons \
 		$(@D)/fruitjam-buttonlog \
 		$(@D)/fruitjam-rtttl \
@@ -131,6 +134,7 @@ define FRUITJAM_UTILS_INSTALL_TARGET_CMDS
 		$(INSTALL) -D -m 0755 $(@D)/fruitjam-berry-json $(TARGET_DIR)/usr/bin/fruitjam-berry-json
 		$(INSTALL) -D -m 0755 $(@D)/fruitjam-services $(TARGET_DIR)/usr/bin/fruitjam-services
 	$(INSTALL) -D -m 0755 $(@D)/mosquitto_pub $(TARGET_DIR)/usr/bin/mosquitto_pub
+	$(INSTALL) -D -m 0755 $(@D)/mosquitto_sub $(TARGET_DIR)/usr/bin/mosquitto_sub
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-buttons $(TARGET_DIR)/usr/bin/fruitjam-buttons
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-buttonlog $(TARGET_DIR)/usr/bin/fruitjam-buttonlog
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-rtttl $(TARGET_DIR)/usr/bin/fruitjam-rtttl

@@ -68,6 +68,40 @@ def extract_payload(text: str, begin: str, end: str) -> str:
     return "\n".join(lines).strip()
 
 
+def extract_fruitjam_shell_payload(text: str, begin: str, end: str) -> tuple[str, int | None]:
+    in_payload = False
+    raw_lines: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == begin:
+            in_payload = True
+            raw_lines.clear()
+            continue
+        if in_payload and stripped == end:
+            break
+        if in_payload:
+            raw_lines.append(stripped)
+
+    lines: list[str] = []
+    for line in raw_lines:
+        if not line or line in ("fj$", "/ #"):
+            continue
+        if line.startswith("fj$ "):
+            continue
+        if line.startswith("/ # "):
+            continue
+        lines.append(line)
+
+    rc: int | None = None
+    for i in range(len(lines) - 1, -1, -1):
+        if re.fullmatch(r"\d{1,3}", lines[i]):
+            rc = int(lines[i])
+            del lines[i]
+            break
+    return "\n".join(lines).strip(), rc
+
+
 class SerialShell:
     def __init__(self, port: str, baud: int, open_timeout: float, verbose: bool = False):
         try:
@@ -196,20 +230,20 @@ class TelnetShell:
         ident = f"FJUSB_{self.counter:04d}"
         begin = f"__{ident}_BEGIN__"
         end = f"__{ident}_END__"
-        wrapped = f"echo {begin}; {command}; rc=$?; echo {end}:$rc"
+        wrapped = f"echo {begin}\n{command}\nstatus\necho {end}\nexit"
 
         if self.verbose:
             print(f"$ {command}", file=sys.stderr)
 
         raw = bytearray()
-        marker_re = re.compile((re.escape(end) + r":(\d+)").encode())
+        marker_re = re.compile((r"(?:^|\r?\n)" + re.escape(end) + r"(?:\r?\n|$)").encode())
         match: re.Match[bytes] | None = None
 
         try:
             with socket.create_connection((self.host, self.port), timeout=10) as sock:
                 raw.extend(self._read_available(sock, 0.75))
                 sock.settimeout(0.25)
-                sock.sendall(wrapped.encode("utf-8") + b"\nexit\n")
+                sock.sendall(wrapped.encode("utf-8") + b"\n")
 
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
@@ -234,8 +268,7 @@ class TelnetShell:
             return CommandResult(command, f"telnet error: {exc}", None, False)
 
         text = decode(bytes(raw))
-        rc = int(match.group(1)) if match else None
-        output = extract_payload(text, begin, end)
+        output, rc = extract_fruitjam_shell_payload(text, begin, end)
         if self.verbose:
             print(output.rstrip(), file=sys.stderr)
             print(f"rc={rc} timed_out={match is None}", file=sys.stderr)

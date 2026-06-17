@@ -980,6 +980,11 @@ def run_live(mode):
     return out.decode("utf-8", "replace"), err.decode("utf-8", "replace"), bytes(seen)
 
 def run_shell():
+    path_dir = os.path.join(tmp, "usbkbdtab")
+    os.makedirs(path_dir, exist_ok=True)
+    with open(os.path.join(path_dir, "path-ok.txt"), "w", encoding="utf-8") as f:
+        f.write("USBKBD_PATH_OK\n")
+
     master, slave = pty.openpty()
     attrs = termios.tcgetattr(slave)
     attrs[3] &= ~(termios.ECHO | termios.ICANON)
@@ -995,18 +1000,45 @@ def run_shell():
     flags = fcntl.fcntl(master, fcntl.F_GETFL)
     fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     proc = subprocess.Popen(
-        [exe, "kbd-shell", "2"],
+        [exe, "kbd-shell", "5"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        cwd=tmp,
     )
-    keys = [8, 6, 11, 18, 44, 18, 14, 40, 8, 27, 12, 23, 40]
+    keys = []
+    letters = {chr(ord("a") + i): 4 + i for i in range(26)}
+    digits = {str(i): 29 + i for i in range(1, 10)}
+    digits["0"] = 39
+    punctuation = {" ": 44, "\n": 40, "\t": 43, "/": 56, "-": 45, ".": 55}
+
+    def add_text(text):
+        for ch in text:
+            if ch in letters:
+                keys.append(letters[ch])
+            elif ch in digits:
+                keys.append(digits[ch])
+            elif ch in punctuation:
+                keys.append(punctuation[ch])
+            else:
+                raise SystemExit(f"test cannot type {ch!r}")
+
+    add_text("cat usbkbdtab/path")
+    keys.append(43)
+    keys.append(40)
+    add_text("echo ok\n")
+    add_text("his")
+    keys.append(43)
+    keys.append(40)
+    keys.append(82)
+    keys.append(40)
+    add_text("exit\n")
     reports = []
     for key in keys:
         reports.append(report_for_key(key))
         reports.append(release_report)
     seen = bytearray()
     answered = 0
-    deadline = time.time() + 5
+    deadline = time.time() + 7
     while proc.poll() is None and time.time() < deadline:
         try:
             chunk = os.read(master, 256)
@@ -1088,6 +1120,10 @@ if b"kbd-init 1 1 0" not in events_bridge or b"kbd-poll 1 1" not in text_bridge:
 shell, shell_err, shell_bridge = run_shell()
 if "USB keyboard shell; type exit to leave" not in shell or "echo ok" not in shell or "\nok\n" not in shell:
     raise SystemExit(f"fruitjam-usbhost kbd-shell did not run typed command: {shell!r} {shell_err!r}")
+if "cat usbkbdtab/path-ok.txt" not in shell or "USBKBD_PATH_OK" not in shell:
+    raise SystemExit(f"fruitjam-usbhost kbd-shell path tab completion failed: {shell!r} {shell_err!r}")
+if "1 cat usbkbdtab/path-ok.txt" not in shell or shell.count("3 history") < 2:
+    raise SystemExit(f"fruitjam-usbhost kbd-shell history recall failed: {shell!r} {shell_err!r}")
 if b"kbd-init 1 1 0" not in shell_bridge or b"kbd-poll 1 1" not in shell_bridge:
     raise SystemExit("fruitjam-usbhost kbd-shell did not use parameterized keyboard commands")
 found, found_err, found_bridge = run_find()
@@ -1774,6 +1810,9 @@ for needle in (
     "keyboard_poll_command",
     "keyboard_find_target",
     "KBD_SCAN_EP_MAX",
+    "KBD_HISTORY_DEPTH",
+    "keyboard_complete_line",
+    "keyboard_add_history",
     "keyboard_shell",
 ):
     if needle not in helper:

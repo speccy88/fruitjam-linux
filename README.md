@@ -81,7 +81,8 @@ The Fruit Jam target is named `adafruit_fruit_jam_rp2350`. It uses:
   no-MMU respawn loop when nothing is attached to GPIO8/GPIO9. Telnet uses a
   tiny `fruitjam-telnetd` plus `/usr/bin/fruitjam-shell` so remote login does
   not require a large shell allocation, with a four-entry command history and
-  command/path tab completion for telnet sessions.
+  command/path tab completion for telnet sessions. The experimental USB
+  boot-keyboard shell has matching small history and command/path completion.
 * Berry installed as `/usr/bin/berry`, including `-e`, script execution, and REPL.
 * BusyBox `vi`.
 * PIO-backed `/dev/neopixels` for the five onboard NeoPixels, plus
@@ -236,7 +237,7 @@ process size and memory fragmentation matter.
 | `fruitjam-adc` | Read RP2350 ADC inputs and the internal temperature ADC channel. |
 | `fruitjam-dvi` | Render bounded text/dashboard/test frames to `/dev/fruitjam-dvi`. |
 | `fruitjam-wavplay` | Analyze simple WAV files and play tone segments through the TLV320 tone path. |
-| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, `hid`, parameterized `kbd-init`/`kbd-poll`, `kbd-find`, `kbd-text`/`kbd-events`, and `kbd-shell`/`kbd-auto-shell` boot-keyboard commands. Berry exposes command builders and run wrappers for these keyboard probes. |
+| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, `hid`, parameterized `kbd-init`/`kbd-poll`, `kbd-find`, `kbd-text`/`kbd-events`, and `kbd-shell`/`kbd-auto-shell` boot-keyboard commands. The USB keyboard shell has a four-entry history and command/path tab completion. Berry exposes command builders and run wrappers for these keyboard probes. |
 | `fruitjam-hidkeys` | Decode USB HID boot-keyboard 8-byte reports into text/events, including DATA0/DATA1 `last_rx_hex` packets from the PIO bridge when they contain an 8-byte keyboard report. |
 | `fruitjam-mem`, `free` | Tiny no-fork memory, uptime, load, and commit-pressure summary from `/proc`. |
 | `fruitjam-uptime`, `uptime` | Tiny no-fork uptime and load-average view from `/proc/uptime` and `/proc/loadavg`, with text and JSON output. |
@@ -301,7 +302,8 @@ CDC shell or the AirLift telnet shell:
 The runner first checks that command markers round-trip through the selected
 board shell, then proves the current narrow boot-protocol keyboard path:
 `kbd-find`, the Berry helper, live text/events, and a typed command in
-`kbd-auto-shell`.
+`kbd-auto-shell`. The helper shell supports up/down history recall and tab
+completion for commands and paths.
 
 Recent release-prep verification on June 12, 2026:
 
@@ -562,8 +564,9 @@ UART, or telnet. They cover the features that have been brought up so far.
     ```
 
     `12-usbhost-keyboard.be` prepares the `kbd-find`/live keyboard smoke commands
-    for the PIO USB-host bridge. `berry-run /root/berry/neopixels.be` should
-    drive the five onboard NeoPixels.
+    for the PIO USB-host bridge, including the history/path-completion capable
+    `kbd-auto-shell` helper. `berry-run /root/berry/neopixels.be` should drive
+    the five onboard NeoPixels.
 
 23. Inspect AirLift firmware, join WiFi, and perform an HTTP fetch through the
     ESP32-C6:

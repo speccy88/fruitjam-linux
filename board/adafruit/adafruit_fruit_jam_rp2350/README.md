@@ -67,7 +67,9 @@ Validated on the Fruit Jam board:
   `fruitjam-uart-login` to wait for Enter before execing `hush`, avoiding a
   no-MMU respawn loop when nothing is attached. Telnet sessions use the smaller
   `/usr/bin/fruitjam-shell` command loop with small history and command/path
-  tab completion to preserve no-MMU allocation headroom.
+  tab completion to preserve no-MMU allocation headroom. The experimental USB
+  boot-keyboard `kbd-shell` path also has small history and command/path
+  completion.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps` or `netstat`, and CGI still runs after status/telnet
   checks.

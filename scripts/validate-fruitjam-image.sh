@@ -204,6 +204,8 @@ with tarfile.open(rootfs) as tf:
         b"kbd-poll %u %u",
         b"USB keyboard shell",
         b"usbhost keyboard target",
+        b"line editing: up/down history",
+        b"tab command/path completion",
     ):
         if needle not in usbhost:
             raise SystemExit(f"fruitjam-usbhost missing marker {needle!r}")

@@ -260,7 +260,9 @@ work.
   `fruitjam-usbhost kbd-shell` uses the same polling path to drive a tiny
   command loop from a USB keyboard, which satisfies the first useful
   "typed characters appear in a Linux shell" milestone without adding a full
-  Linux input stack.
+  Linux input stack. That helper shell now includes a four-entry command
+  history plus command/path tab completion, keeping the usable console path
+  explicit and small.
 * Keep the next step hardware-side and minimal: run either the CDC smoke suite
   with `--usb-keyboard --usb-keyboard-require-input`, or the focused
   `scripts/usbhost-keyboard-smoke.py --transport cdc|telnet --require-input`

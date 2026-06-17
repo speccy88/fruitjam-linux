@@ -11,9 +11,11 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -52,6 +54,11 @@
 #define KBD_SCAN_IFACE_MAX 3u
 #define KBD_SCAN_EP_MAX 4u
 #define KBD_SHELL_LINE_SIZE 256
+#define KBD_HISTORY_DEPTH 4
+#define KBD_CH_RIGHT 0x100
+#define KBD_CH_LEFT 0x101
+#define KBD_CH_DOWN 0x102
+#define KBD_CH_UP 0x103
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 struct usbhost_status {
@@ -95,6 +102,10 @@ struct keyboard_target {
 
 static const char *path_dirs[] = {
 	"/bin", "/usr/bin", "/sbin", "/usr/sbin"
+};
+
+static const char *keyboard_builtins[] = {
+	"cd", "echo", "exit", "help", "history", "status", "?"
 };
 
 static void read_status(struct usbhost_status *st);
@@ -425,6 +436,17 @@ static int hid_key_ascii(unsigned char key, bool shift)
 	}
 }
 
+static int hid_key_shell_code(unsigned char key, bool shift)
+{
+	switch (key) {
+	case 79: return KBD_CH_RIGHT;
+	case 80: return KBD_CH_LEFT;
+	case 81: return KBD_CH_DOWN;
+	case 82: return KBD_CH_UP;
+	default: return hid_key_ascii(key, shift);
+	}
+}
+
 static void print_quoted_text(const char *text)
 {
 	putchar('"');
@@ -593,7 +615,7 @@ static size_t collect_hid_text_chars(struct hid_live_state *state,
 
 		if (key < 4 || hid_key_in_prev(state, key))
 			continue;
-		ch = hid_key_ascii(key, shift);
+		ch = hid_key_shell_code(key, shift);
 		if (ch && count < max_chars)
 			chars[count++] = ch;
 	}
@@ -1451,7 +1473,249 @@ static void keyboard_shell_prompt(void)
 	fflush(stdout);
 }
 
-static int keyboard_shell_run_line(char *line, int last_status)
+static int keyboard_shell_append_text(char *line, size_t *len,
+				      size_t line_size, const char *text)
+{
+	while (*text && *len + 1 < line_size) {
+		line[(*len)++] = *text++;
+		putchar(line[*len - 1]);
+	}
+	line[*len] = '\0';
+	fflush(stdout);
+	return *text == '\0';
+}
+
+static void keyboard_shell_redraw_line(const char *line)
+{
+	fputs("\r\033[K", stdout);
+	keyboard_shell_prompt();
+	fputs(line, stdout);
+	fflush(stdout);
+}
+
+static void update_common_prefix(char *common, const char *name)
+{
+	size_t i = 0;
+
+	while (common[i] && name[i] && common[i] == name[i])
+		i++;
+	common[i] = '\0';
+}
+
+static void note_completion_match(const char *name, const char *prefix,
+				  char *common, size_t common_size,
+				  int *matches)
+{
+	size_t prefix_len = strlen(prefix);
+
+	if (strncmp(name, prefix, prefix_len))
+		return;
+	if (*matches > 0 && !strcmp(common, name))
+		return;
+	if (*matches == 0) {
+		snprintf(common, common_size, "%s", name);
+	} else {
+		update_common_prefix(common, name);
+	}
+	(*matches)++;
+}
+
+static int path_is_dir(const char *path)
+{
+	struct stat st;
+
+	return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void note_path_match(const char *dir_prefix, const char *name,
+			    const char *token, char *common,
+			    size_t common_size, int *matches)
+{
+	char candidate[KBD_SHELL_LINE_SIZE];
+	size_t len;
+	int ret;
+
+	ret = snprintf(candidate, sizeof(candidate), "%s%s", dir_prefix, name);
+	if (ret <= 0 || (size_t)ret >= sizeof(candidate))
+		return;
+	len = (size_t)ret;
+	if (path_is_dir(candidate) && len + 1 < sizeof(candidate)) {
+		candidate[len++] = '/';
+		candidate[len] = '\0';
+	}
+	note_completion_match(candidate, token, common, common_size, matches);
+}
+
+static int keyboard_complete_command(char *line, size_t *len,
+				     size_t line_size)
+{
+	char prefix[64];
+	char common[64];
+	size_t i;
+	int matches = 0;
+
+	for (i = 0; i < *len; i++) {
+		if (line[i] == ' ' || line[i] == '\t') {
+			putchar('\a');
+			fflush(stdout);
+			return 0;
+		}
+	}
+	if (*len >= sizeof(prefix)) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	memcpy(prefix, line, *len);
+	prefix[*len] = '\0';
+	common[0] = '\0';
+
+	for (i = 0; i < ARRAY_SIZE(keyboard_builtins); i++)
+		note_completion_match(keyboard_builtins[i], prefix, common,
+				      sizeof(common), &matches);
+	for (i = 0; i < ARRAY_SIZE(path_dirs); i++) {
+		DIR *dir = opendir(path_dirs[i]);
+		struct dirent *de;
+
+		if (!dir)
+			continue;
+		while ((de = readdir(dir)))
+			note_completion_match(de->d_name, prefix, common,
+					      sizeof(common), &matches);
+		closedir(dir);
+	}
+
+	if (matches == 0) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	if (strlen(common) > *len)
+		keyboard_shell_append_text(line, len, line_size,
+					   common + *len);
+	if (matches == 1 && *len + 1 < line_size)
+		keyboard_shell_append_text(line, len, line_size, " ");
+	else if (matches > 1 && strlen(common) == *len)
+		putchar('\a');
+	fflush(stdout);
+	return 1;
+}
+
+static int keyboard_complete_path(char *line, size_t *len, size_t line_size,
+				  size_t token_start)
+{
+	char token[KBD_SHELL_LINE_SIZE];
+	char dir[KBD_SHELL_LINE_SIZE];
+	char dir_prefix[KBD_SHELL_LINE_SIZE];
+	char common[KBD_SHELL_LINE_SIZE];
+	const char *name_prefix;
+	char *slash;
+	DIR *dh;
+	struct dirent *de;
+	size_t token_len = *len - token_start;
+	int matches = 0;
+
+	if (token_len >= sizeof(token)) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	memcpy(token, line + token_start, token_len);
+	token[token_len] = '\0';
+
+	slash = strrchr(token, '/');
+	if (slash) {
+		size_t prefix_len = (size_t)(slash - token) + 1;
+
+		if (prefix_len >= sizeof(dir_prefix)) {
+			putchar('\a');
+			fflush(stdout);
+			return 0;
+		}
+		memcpy(dir_prefix, token, prefix_len);
+		dir_prefix[prefix_len] = '\0';
+		if (prefix_len == 1 && token[0] == '/') {
+			snprintf(dir, sizeof(dir), "/");
+		} else {
+			memcpy(dir, token, prefix_len - 1);
+			dir[prefix_len - 1] = '\0';
+		}
+		name_prefix = slash + 1;
+	} else {
+		snprintf(dir, sizeof(dir), ".");
+		dir_prefix[0] = '\0';
+		name_prefix = token;
+	}
+
+	dh = opendir(dir);
+	if (!dh) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	common[0] = '\0';
+	while ((de = readdir(dh))) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		if (strncmp(de->d_name, name_prefix, strlen(name_prefix)))
+			continue;
+		note_path_match(dir_prefix, de->d_name, token, common,
+				sizeof(common), &matches);
+	}
+	closedir(dh);
+
+	if (matches == 0) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	if (strlen(common) > token_len)
+		keyboard_shell_append_text(line, len, line_size,
+					   common + token_len);
+	if (matches == 1 && *len > 0 && line[*len - 1] != '/' &&
+	    *len + 1 < line_size)
+		keyboard_shell_append_text(line, len, line_size, " ");
+	else if (matches > 1 && strlen(common) == token_len)
+		putchar('\a');
+	fflush(stdout);
+	return 1;
+}
+
+static int keyboard_complete_line(char *line, size_t *len, size_t line_size)
+{
+	size_t token_start = *len;
+
+	while (token_start > 0 &&
+	       line[token_start - 1] != ' ' &&
+	       line[token_start - 1] != '\t')
+		token_start--;
+	if (token_start == 0)
+		return keyboard_complete_command(line, len, line_size);
+	return keyboard_complete_path(line, len, line_size, token_start);
+}
+
+static void keyboard_add_history(
+	char history[KBD_HISTORY_DEPTH][KBD_SHELL_LINE_SIZE],
+	int *history_count, const char *cmd)
+{
+	if (!*cmd)
+		return;
+	if (*history_count > 0 &&
+	    !strcmp(history[*history_count - 1], cmd))
+		return;
+	if (*history_count == KBD_HISTORY_DEPTH) {
+		memmove(history[0], history[1],
+			(KBD_HISTORY_DEPTH - 1) * KBD_SHELL_LINE_SIZE);
+		(*history_count)--;
+	}
+	snprintf(history[*history_count], KBD_SHELL_LINE_SIZE, "%s", cmd);
+	(*history_count)++;
+}
+
+static int keyboard_shell_run_line(
+	char *line, int last_status,
+	char history[KBD_HISTORY_DEPTH][KBD_SHELL_LINE_SIZE],
+	int history_count)
 {
 	char *cmd = trim_text(line);
 	char *argv[16];
@@ -1485,8 +1749,16 @@ static int keyboard_shell_run_line(char *line, int last_status)
 		return 0;
 	}
 	if (!strcmp(argv[0], "?") || !strcmp(argv[0], "help")) {
-		puts("builtins: cd echo exit help status");
+		puts("builtins: cd echo exit help history status");
 		puts("simple commands are searched in /bin /usr/bin /sbin /usr/sbin");
+		puts("line editing: up/down history, tab command/path completion");
+		return 0;
+	}
+	if (!strcmp(argv[0], "history")) {
+		int i;
+
+		for (i = 0; i < history_count; i++)
+			printf("%d %s\n", i + 1, history[i]);
 		return 0;
 	}
 	if (!strcmp(argv[0], "status")) {
@@ -1497,12 +1769,60 @@ static int keyboard_shell_run_line(char *line, int last_status)
 }
 
 static void keyboard_shell_accept_char(char *line, size_t *len,
+				       char history[KBD_HISTORY_DEPTH][KBD_SHELL_LINE_SIZE],
+				       int *history_count, int *history_pos,
 				       int ch, int *last_status, bool *done)
 {
+	if (ch == KBD_CH_UP) {
+		if (*history_count > 0) {
+			if (*history_pos > 0)
+				(*history_pos)--;
+			snprintf(line, KBD_SHELL_LINE_SIZE, "%s",
+				 history[*history_pos]);
+			*len = strlen(line);
+			keyboard_shell_redraw_line(line);
+		} else {
+			putchar('\a');
+			fflush(stdout);
+		}
+		return;
+	}
+	if (ch == KBD_CH_DOWN) {
+		if (*history_count > 0) {
+			if (*history_pos < *history_count - 1) {
+				(*history_pos)++;
+				snprintf(line, KBD_SHELL_LINE_SIZE, "%s",
+					 history[*history_pos]);
+			} else {
+				*history_pos = *history_count;
+				line[0] = '\0';
+			}
+			*len = strlen(line);
+			keyboard_shell_redraw_line(line);
+		} else {
+			putchar('\a');
+			fflush(stdout);
+		}
+		return;
+	}
+	if (ch == KBD_CH_LEFT || ch == KBD_CH_RIGHT) {
+		putchar('\a');
+		fflush(stdout);
+		return;
+	}
 	if (ch == '\n') {
+		char saved[KBD_SHELL_LINE_SIZE];
+		char *cmd;
+
 		putchar('\n');
 		line[*len] = '\0';
-		*last_status = keyboard_shell_run_line(line, *last_status);
+		snprintf(saved, sizeof(saved), "%s", line);
+		cmd = trim_text(saved);
+		keyboard_add_history(history, history_count, cmd);
+		*history_pos = *history_count;
+		*last_status = keyboard_shell_run_line(line, *last_status,
+						       history,
+						       *history_count);
 		if (*last_status < 0) {
 			*done = true;
 			return;
@@ -1519,11 +1839,12 @@ static void keyboard_shell_accept_char(char *line, size_t *len,
 			fputs("\b \b", stdout);
 			fflush(stdout);
 		}
+		*history_pos = *history_count;
 		return;
 	}
 	if (ch == '\t') {
-		putchar('\a');
-		fflush(stdout);
+		keyboard_complete_line(line, len, KBD_SHELL_LINE_SIZE);
+		*history_pos = *history_count;
 		return;
 	}
 	if (ch >= 32 && ch <= 126 && *len + 1 < KBD_SHELL_LINE_SIZE) {
@@ -1531,6 +1852,7 @@ static void keyboard_shell_accept_char(char *line, size_t *len,
 		line[*len] = '\0';
 		putchar(ch);
 		fflush(stdout);
+		*history_pos = *history_count;
 	}
 }
 
@@ -1538,8 +1860,11 @@ static int keyboard_shell(const struct keyboard_target *target,
 			  unsigned int seconds)
 {
 	struct hid_live_state state;
+	char history[KBD_HISTORY_DEPTH][KBD_SHELL_LINE_SIZE];
 	char line[KBD_SHELL_LINE_SIZE];
 	size_t line_len = 0;
+	int history_count = 0;
+	int history_pos = 0;
 	unsigned int loops;
 	unsigned int i;
 	int last_status = 0;
@@ -1574,6 +1899,9 @@ static int keyboard_shell(const struct keyboard_target *target,
 
 			for (j = 0; j < count && !done; j++)
 				keyboard_shell_accept_char(line, &line_len,
+							   history,
+							   &history_count,
+							   &history_pos,
 							   chars[j],
 							   &last_status,
 							   &done);

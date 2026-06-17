@@ -749,7 +749,10 @@ static void action_usbhost(void)
 	} else if (!strcmp(cmd, "in-token") ||
 		   !strcmp(cmd, "get-device-8") ||
 		   !strcmp(cmd, "get-device-8-combo-skipack") ||
-		   !strcmp(cmd, "reset-get-device-8-combo-skipack")) {
+		   !strcmp(cmd, "reset-get-device-8-combo-skipack") ||
+		   !strcmp(cmd, "kbd-init") ||
+		   !strcmp(cmd, "kbd-poll") ||
+		   !strcmp(cmd, "kbd-init-poll")) {
 		if (access(USBHOST_DEV, W_OK) != 0) {
 			json_error("USB host PIO probe requires kernel bridge");
 			return;
@@ -795,7 +798,7 @@ static void action_usbhost(void)
 	printf(",\"power\":%d,\"dp\":%d,\"dm\":%d,\"stack\":",
 	       power, dp, dm);
 	json_string(access(USBHOST_DEV, R_OK) == 0 ?
-		    "kernel bridge line-state; PIO2 host program staged; HID report polling not implemented yet" :
+		    "kernel bridge line-state; PIO2 host program staged; experimental boot-keyboard init/poll available" :
 		    "sysfs line-state only; PIO USB host/HID report polling not implemented yet");
 	printf(",\"present\":%s,\"hid\":false,\"driver\":\"%s\",\"pio_ready\":%s,\"pio_configured\":%s,\"packets\":%d,\"tx_errors\":%d,\"last_tx_result\":%d,\"last_tx_len\":%d,\"rx_attempts\":%d,\"rx_errors\":%d,\"last_rx_result\":%d,\"last_rx_len\":%d,\"last_rx_pid\":%d,\"last_rx_hex\":",
 	       power > 0 && ((dp == 1 && dm == 0) || (dp == 0 && dm == 1)) ?

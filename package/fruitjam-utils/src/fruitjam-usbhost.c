@@ -66,12 +66,12 @@ static const char *sysfs_stack_text =
 static const char *kernel_stack_text =
 	"kernel bridge line-state; PIO USB host/HID report polling not implemented yet";
 static const char *kernel_pio_stack_text =
-	"kernel bridge line-state; PIO2 host program staged; HID report polling not implemented yet";
+	"kernel bridge line-state; PIO2 host program staged; experimental boot-keyboard init/poll available";
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|wait [seconds]|monitor [seconds]}\n");
+		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init|kbd-poll|kbd-init-poll|wait [seconds]|monitor [seconds]}\n");
 }
 
 static int write_file(const char *path, const char *text)
@@ -1069,6 +1069,15 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "reset-get-device-8-stream"))
 		return bridge_action("reset-get-device-8-stream",
 				     "PIO reset/SOF streamed SETUP/IN GET_DESCRIPTOR probe");
+	if (!strcmp(cmd, "kbd-init"))
+		return bridge_action("kbd-init",
+				     "PIO boot-keyboard address/config/protocol probe");
+	if (!strcmp(cmd, "kbd-poll"))
+		return bridge_action("kbd-poll",
+				     "PIO boot-keyboard interrupt IN poll");
+	if (!strcmp(cmd, "kbd-init-poll"))
+		return bridge_action("kbd-init-poll",
+				     "PIO boot-keyboard init and interrupt IN poll");
 	if (!strcmp(cmd, "status")) {
 		read_status(&st);
 		print_human(&st);

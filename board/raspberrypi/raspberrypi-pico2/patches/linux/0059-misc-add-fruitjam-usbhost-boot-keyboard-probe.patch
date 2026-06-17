@@ -1,0 +1,392 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 12:00:00 +0000
+Subject: [PATCH] misc: add Fruit Jam usbhost boot keyboard probe
+
+The previous bridge probes could decode descriptor/report packets once they
+were captured, but received DATA packets were ACKed only after a post-EOP
+debug drain and bookkeeping pass.  That is too late for the Pico-PIO-USB
+transaction model, which sends the ACK immediately when RX-EOP is seen.
+
+ACK DATA0/DATA1 packets in the receive loop as soon as EOP is observed and
+the rolling packet CRC is valid.  Also send low-speed keepalives instead of
+full-speed SOF packets when the line state selected low speed.
+
+With those timing fixes in place, expose a deliberately small boot-keyboard
+probe path: reset the root port, SET_ADDRESS(1), SET_CONFIGURATION(1), switch
+interface 0 to boot protocol, SET_IDLE(0), and poll interrupt IN endpoint 1.
+This is not a hub/composite/general USB stack; it is the first live HID path
+for simple boot-protocol keyboards.
+---
+ drivers/misc/fruitjam_usbhost.c | 268 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 261 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -55,17 +55,23 @@
+ #define FJ_USBHOST_DMA_TIMEOUT_US	2000u
+ #define FJ_USBHOST_SOF_BURST_FRAMES	20u
+ #define FJ_USBHOST_ACTIVE_RESET_MS	50u
++#define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
++#define FJ_USBHOST_BOOT_KEYBOARD_EP	1u
++#define FJ_USBHOST_BOOT_KEYBOARD_IFACE	0u
+ 
+ #define FJ_PIO_SM_ADDR			0x0c
+ #define FJ_RESET_DMA			2u
+ 
+ #define FJ_USB_SYNC			0x80u
++#define FJ_USB_PID_OUT			0xe1u
+ #define FJ_USB_PID_IN			0x69u
+ #define FJ_USB_PID_SOF			0xa5u
+ #define FJ_USB_PID_SETUP		0x2du
+ #define FJ_USB_PID_DATA0		0xc3u
+ #define FJ_USB_PID_DATA1		0x4bu
+ #define FJ_USB_PID_ACK			0xd2u
++#define FJ_USB_PID_NAK			0x5au
++#define FJ_USB_PID_STALL		0x1eu
+ 
+ #define FJ_USB_TX_ENCODED_SE0		0u
+ #define FJ_USB_TX_ENCODED_K		1u
+@@ -1450,6 +1456,37 @@
+ 						 u32 *rx_len)
+ {
+ 	u16 token = 0;
++	u8 setup_packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SETUP, 0, 0 };
++	u8 data_packet[16];
++	u16 crc;
++
++	if (payload_len > 8)
++		return -EINVAL;
++
++	setup_packet[2] = token & 0xff;
++	setup_packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
++			  ((token >> 8) & 0x1f);
++
++	data_packet[0] = FJ_USB_SYNC;
++	data_packet[1] = FJ_USB_PID_DATA0;
++	memcpy(data_packet + 2, payload, payload_len);
++	crc = fj_usbhost_crc16_data(payload, payload_len);
++	data_packet[2 + payload_len] = crc & 0xff;
++	data_packet[3 + payload_len] = crc >> 8;
++
++	return fj_usbhost_pio_tx_two_packets_capture_cpu(
++		uh, setup_packet, sizeof(setup_packet),
++		data_packet, payload_len + 4, encoded_len, rx_len);
++}
++
++static int fj_usbhost_pio_send_setup_data0_combo_addr(struct fruitjam_usbhost *uh,
++						      u8 addr,
++						      const u8 *payload,
++						      u8 payload_len,
++						      u8 *encoded_len,
++						      u32 *rx_len)
++{
++	u16 token = addr & 0x7f;
+ 	u8 setup_packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SETUP, 0, 0 };
+ 	u8 data_packet[16];
+ 	u16 crc;
+@@ -1525,10 +1562,15 @@
+ 
+ static int fj_usbhost_pio_send_ack(struct fruitjam_usbhost *uh)
+ {
+-	u8 packet[2] = { FJ_USB_SYNC, FJ_USB_PID_ACK };
+-	u8 encoded_len = 0;
++	static const u8 ack_encoded[] = {
++		0xdd, 0xdf, 0x5d, 0x7f, 0x25,
++	};
+ 
+-	return fj_usbhost_pio_tx_packet(uh, packet, sizeof(packet), &encoded_len);
++	/*
++	 * Handshakes are timing-sensitive.  For this 5-byte encoded packet,
++	 * direct FIFO writes avoid DMA setup latency.
++	 */
++	return fj_usbhost_pio_tx_encoded_cpu(uh, ack_encoded, sizeof(ack_encoded));
+ }
+ 
+ static int fj_usbhost_pio_tx_test(struct fruitjam_usbhost *uh)
+@@ -1592,8 +1634,30 @@
+ 		uh->rx_errors++;
+ }
+ 
++static bool fj_usbhost_pio_rx_data_crc_ok(struct fruitjam_usbhost *uh, u32 len)
++{
++	u8 pid;
++	u16 expected;
++	u16 got;
++	u32 payload_len;
++
++	if (len < 4)
++		return false;
++	pid = uh->last_rx_bytes[1];
++	if (pid != FJ_USB_PID_DATA0 && pid != FJ_USB_PID_DATA1)
++		return false;
++
++	payload_len = len - 4;
++	expected = fj_usbhost_crc16_data(uh->last_rx_bytes + 2, payload_len);
++	got = uh->last_rx_bytes[len - 2] |
++	      ((u16)uh->last_rx_bytes[len - 1] << 8);
++
++	return expected == got;
++}
++
+ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data)
+ {
++	bool ack_sent = false;
+ 	u32 waited;
+ 	u32 len = 0;
+ 	int ret = -ETIMEDOUT;
+@@ -1623,8 +1687,33 @@
+ 			break;
+ 		}
+ 		if (irq & FJ_PIO_IRQ_RX_EOP) {
++			int ack_ret;
+ 			u32 drain_waited, quiet;
+ 
++			FJ_USBHOST_DRAIN_RX_FIFO();
++			if (ack_data && len >= 2 &&
++			    (uh->last_rx_bytes[1] == FJ_USB_PID_DATA0 ||
++			     uh->last_rx_bytes[1] == FJ_USB_PID_DATA1)) {
++				/*
++				 * The ACK handshake belongs at RX-EOP time, not after the
++				 * status/debug bookkeeping below.  The RX loop has drained
++				 * bytes as they arrived, so the CRC can be checked before
++				 * starting TX.
++				 */
++				if (!fj_usbhost_pio_rx_data_crc_ok(uh, len)) {
++					ret = -EILSEQ;
++					break;
++				}
++				ack_ret = fj_usbhost_pio_send_ack(uh);
++				if (ack_ret) {
++					ret = ack_ret;
++					break;
++				}
++				ack_sent = true;
++				ret = 0;
++				break;
++			}
++
+ 			for (drain_waited = 0, quiet = 0;
+ 			     drain_waited < 50 && quiet < 8; drain_waited++) {
+ 				u32 before = len;
+@@ -1653,10 +1742,10 @@
+ 	}
+ 
+ out:
+-	if (!ret && ack_data && len >= 2 &&
++	if (ack_data && !ack_sent && !ret && len >= 2 &&
+ 	    (uh->last_rx_bytes[1] == FJ_USB_PID_DATA0 ||
+ 	     uh->last_rx_bytes[1] == FJ_USB_PID_DATA1))
+-		fj_usbhost_pio_send_ack(uh);
++		ret = -ETIMEDOUT;
+ 	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+ 	fj_usbhost_pio_record_rx(uh, ret, len);
+ 	return ret;
+@@ -2342,6 +2431,85 @@
+ 		scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+ 			  "combo-skipack descriptor-rx-len=%u pid=0x%02x",
+ 			  uh->last_rx_len, uh->last_rx_pid);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
++static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh);
++
++static int fj_usbhost_pio_control_status_in(struct fruitjam_usbhost *uh,
++					    u8 addr)
++{
++	u8 encoded_len = 0;
++	int ret;
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, addr, 0,
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_DATA1 ||
++	    uh->last_rx_len != 4 ||
++	    !fj_usbhost_pio_rx_data_crc_ok(uh, uh->last_rx_len)) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++	return 0;
++}
++
++static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
++					  u8 addr, u8 request_type,
++					  u8 request, u16 value, u16 index,
++					  const char *name)
++{
++	u8 setup[8] = {
++		request_type, request,
++		value & 0xff, value >> 8,
++		index & 0xff, index >> 8,
++		0x00, 0x00,
++	};
++	u8 encoded_len = 0;
++	u32 setup_rx_len = 0;
++	u32 setup_rx_pid = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	fj_usbhost_pio_prepare_receive(uh);
++	fj_usbhost_pio_clear_rx_irq(uh);
++	ret = fj_usbhost_pio_send_setup_data0_combo_addr(uh, addr, setup,
++							 sizeof(setup),
++							 &encoded_len,
++							 &setup_rx_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	setup_rx_pid = setup_rx_len >= 2 ? uh->last_rx_bytes[1] : 0;
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "%s setup-rx-len=%u setup-rx-pid=0x%02x",
++		  name, setup_rx_len, setup_rx_pid);
++
++	ret = fj_usbhost_pio_control_status_in(uh, addr);
++	if (!ret)
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "%s status-in-ok addr=%u", name, addr);
+ 	return ret;
+ 
+ out_error:
+@@ -2352,7 +2518,74 @@
+ 	uh->last_rx_len = 0;
+ 	uh->last_rx_pid = 0;
+ 	uh->rx_errors++;
++	return ret;
++}
++
++static int fj_usbhost_pio_keyboard_init(struct fruitjam_usbhost *uh)
++{
++	int ret;
++
++	ret = fj_usbhost_pio_reset_active(uh);
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, 0, 0x00, 0x05, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0,
++		"set-address");
++	if (ret)
++		return ret;
++	msleep(10);
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0x00, 0x09, 1, 0,
++		"set-config");
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0x21, 0x0b, 0,
++		FJ_USBHOST_BOOT_KEYBOARD_IFACE, "set-boot-protocol");
++	if (ret)
++		return ret;
++
++	return fj_usbhost_pio_control_no_data(
++		uh, FJ_USBHOST_BOOT_KEYBOARD_ADDR, 0x21, 0x0a, 0,
++		FJ_USBHOST_BOOT_KEYBOARD_IFACE, "set-idle");
++}
++
++static int fj_usbhost_pio_keyboard_poll(struct fruitjam_usbhost *uh)
++{
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN,
++					FJ_USBHOST_BOOT_KEYBOARD_ADDR,
++					FJ_USBHOST_BOOT_KEYBOARD_EP,
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	if (!ret)
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "kbd-poll addr=%u ep=%u len=%u pid=0x%02x",
++			  FJ_USBHOST_BOOT_KEYBOARD_ADDR,
++			  FJ_USBHOST_BOOT_KEYBOARD_EP,
++			  uh->last_rx_len, uh->last_rx_pid);
+ 	return ret;
++}
++
++static int fj_usbhost_pio_keyboard_init_poll(struct fruitjam_usbhost *uh)
++{
++	int ret = fj_usbhost_pio_keyboard_init(uh);
++
++	return ret ? ret : fj_usbhost_pio_keyboard_poll(uh);
+ }
+ 
+ static int fj_usbhost_pio_in_token_gated(struct fruitjam_usbhost *uh)
+@@ -2683,6 +2916,15 @@
+ 
+ 	return fj_usbhost_pio_tx_packet(uh, packet, sizeof(packet),
+ 					encoded_len);
++}
++
++static int fj_usbhost_pio_send_keepalive(struct fruitjam_usbhost *uh,
++					 u8 *encoded_len)
++{
++	static const u8 keepalive_encoded[] = { 0x25 };
++
++	*encoded_len = sizeof(keepalive_encoded);
++	return fj_usbhost_pio_tx_encoded(uh, keepalive_encoded, *encoded_len);
+ }
+ 
+ static int fj_usbhost_pio_sof_burst(struct fruitjam_usbhost *uh, u32 frames)
+@@ -2697,8 +2939,12 @@
+ 	for (frame = 0; frame < frames; frame++) {
+ 		u8 encoded_len = 0;
+ 
+-		ret = fj_usbhost_pio_send_sof(uh, uh->packets & 0x7ff,
+-					      &encoded_len);
++		if (uh->low_speed)
++			ret = fj_usbhost_pio_send_keepalive(uh,
++							    &encoded_len);
++		else
++			ret = fj_usbhost_pio_send_sof(uh, uh->packets & 0x7ff,
++						      &encoded_len);
+ 		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+ 		if (ret)
+ 			return ret;
+@@ -3087,6 +3333,12 @@
+ 		ret = fj_usbhost_pio_get_device8_active_burst(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-stream")) {
+ 		ret = fj_usbhost_pio_get_device8_active_stream(uh);
++	} else if (!strcmp(cmd, "kbd-init")) {
++		ret = fj_usbhost_pio_keyboard_init(uh);
++	} else if (!strcmp(cmd, "kbd-poll")) {
++		ret = fj_usbhost_pio_keyboard_poll(uh);
++	} else if (!strcmp(cmd, "kbd-init-poll")) {
++		ret = fj_usbhost_pio_keyboard_init_poll(uh);
+ 	} else if (!strcmp(cmd, "status")) {
+ 		/* read-only command for shell scripts that write then read */
+ 	} else {
+-- 
+2.39.5

@@ -238,15 +238,17 @@ work.
 * Start with boot-protocol HID keyboard only.
 * First useful test: typed characters appear in the Linux shell.
 * Use `fruitjam-usbhost wait`/`monitor` for line-state smoke checks and
-  `fruitjam-usbhost reset` through `/dev/fruitjam-usbhost` for the first
-  kernel-owned bus-reset primitive while PIO packet I/O is developed.
+  `fruitjam-usbhost reset` through `/dev/fruitjam-usbhost` for kernel-owned
+  bus reset and line-state checks.
 * Keep USB host on PIO2. PIO0 is used by NeoPixels and PIO1 is used by the
   current audio helper, while Pico-PIO-USB needs one complete PIO block for the
   TX/RX/EOP state machines and all 32 instruction words.
-* The bridge now stages the 32-word full-speed host PIO program and reports
-  `pio_ready`; this is the packet-engine landing zone, not HID enumeration yet.
-* Keep the next step Linux-side and minimal: add PIO packet send/receive to the
-  kernel bridge, then poll one boot-protocol keyboard endpoint.
+* The bridge now stages the 32-word host PIO program, reports `pio_ready`,
+  ACKs received DATA packets in the RX-EOP path, sends low-speed keepalives,
+  and exposes experimental `kbd-init`/`kbd-poll` commands for one direct
+  boot-protocol keyboard at address 1 endpoint 1.
+* Keep the next step Linux-side and minimal: hardware-smoke `kbd-init-poll`,
+  then translate stable boot reports into shell/input events.
 * Do not include mouse, storage, arbitrary hub hotplug, or composite-device support in the first keyboard milestone.
 
 ## Milestone G: AirLift networking

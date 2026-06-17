@@ -199,7 +199,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | Telnet service | AirLift TCP/23; optional loopback TCP/23 | Supported | AirLift inbound shell and tiny `fruitjam-telnetd`/`fruitjam-shell`; telnet smoke tests pass. | Only one AirLift telnet session at a time. |
 | FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | Passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. | Upload completion can be slow over the current NINA raw socket path; active FTP remains a future objective. |
 | TFTP service | Optional loopback UDP/69 | Supported | BusyBox `tftpd` serves the TFTP area README when `fruitjam-services core` is started. | Not part of the default external AirLift service set. |
-| USB host data | GPIO1 D+, GPIO2 D- | Partial | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state plus bus-reset timing for `fruitjam-usbhost` status/JSON/wait/monitor/reset diagnostics. The bridge now stages the 32-word PIO2 full-speed host program without sharing PIO0 NeoPixels or PIO1 audio. Host enumeration/report polling is not implemented. | Add PIO token/data transactions and boot-protocol HID keyboard polling next. |
+| USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state, bus-reset timing, PIO2 packet I/O, descriptor/HID decode diagnostics, and a narrow `kbd-init`/`kbd-poll` boot-keyboard probe path. This is not a hub/composite/general USB stack. | Hardware-smoke the new boot-keyboard path and widen endpoint/config parsing after it is stable. |
 | USB host 5V switch | GPIO11 | Partial | `fruitjamctl usb-power on/off` controls power enable. | Needs full USB host stack for devices. |
 | DVI / HSTX output | GPIO12-GPIO19, `/dev/fruitjam-dvi` | Partial | Tiny RGB332 HSTX DVI misc driver plus `fruitjam-dvi` text/dashboard/helper command output; hardware commands were verified on the flashed image. | Full fbdev/console is not implemented. |
 | I2S data path | GPIO24 DIN, GPIO25 MCLK | Partial | Tiny generated-tone path exists for RTTTL and simple WAV tone tests. | Add complete streamed PCM driver/path. |
@@ -229,7 +229,7 @@ process size and memory fragmentation matter.
 | `fruitjam-adc` | Read RP2350 ADC inputs and the internal temperature ADC channel. |
 | `fruitjam-dvi` | Render bounded text/dashboard/test frames to `/dev/fruitjam-dvi`. |
 | `fruitjam-wavplay` | Analyze simple WAV files and play tone segments through the TLV320 tone path. |
-| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, and `hid` diagnostics for descriptor/HID bring-up. |
+| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, `hid`, and experimental `kbd-init`/`kbd-poll` boot-keyboard commands. |
 | `fruitjam-hidkeys` | Decode USB HID boot-keyboard 8-byte reports into text/events, including DATA0/DATA1 `last_rx_hex` packets from the PIO bridge when they contain an 8-byte keyboard report. |
 | `fruitjam-mem`, `free` | Tiny no-fork memory, uptime, load, and commit-pressure summary from `/proc`. |
 | `fruitjam-buttons` | Button daemon for GPIO0/GPIO4/GPIO5 with log, FIFO, SQLite, and MQTT hooks. |

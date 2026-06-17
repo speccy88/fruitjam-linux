@@ -29,8 +29,9 @@ Practical rules:
   substitute for proper kernel LED/input/USB-host/I2S/HSTX drivers.
 * `fruitjamctl bootsel` uses the RP2350 bootrom watchdog-vector protocol and has
   been verified to re-enumerate as ROM BOOTSEL with `picotool info -a`.
-* microSD, HSTX DVI, first-step I2S tone audio, and AirLift userspace networking
-  now have narrow support. USB keyboard protocol support is still not implemented.
+* microSD, HSTX DVI, first-step I2S tone audio, AirLift userspace networking, and
+  USB boot-keyboard probing now have narrow support. A general USB host/input
+  stack is still not implemented.
 * The NeoPixel driver uses PIO directly and is intentionally narrow: five onboard
   GPIO32 pixels through `/dev/neopixels`, not a general RP2350 PIO framework.
 

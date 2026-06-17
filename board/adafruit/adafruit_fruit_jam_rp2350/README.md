@@ -396,12 +396,14 @@ test
 
 * HSTX DVI has a tiny `/dev/fruitjam-dvi` RGB332 frame helper for bounded
   dashboard/text/test frames. Full fbdev/console support is not implemented.
-* USB host 5 V power and D+/D- reset/line-state ownership now have the
-  `/dev/fruitjam-usbhost` kernel bridge, but PIO packet I/O, enumeration, and
-  USB keyboard input protocol support are not implemented.
+* USB host 5 V power, D+/D- reset/line-state ownership, PIO packet I/O, and an
+  experimental boot-keyboard init/poll probe now live behind the
+  `/dev/fruitjam-usbhost` kernel bridge. Hub, composite device, and general
+  Linux input support are not implemented.
 * Buttons, GPIO29, microSD block access, button SQLite logging, GPIO20/GPIO21
-  I2C, AirLift userspace socket access, and first-step TLV320 RTTTL audio work,
-  but WiFi/AirLift Linux netdev support, full PCM/I2S audio, full DVI console,
-  and USB host input still need real Linux support.
+  I2C, AirLift userspace socket access, first-step TLV320 RTTTL audio, and the
+  narrow USB boot-keyboard probe work, but WiFi/AirLift Linux netdev support,
+  full PCM/I2S audio, full DVI console, and general USB host input still need
+  real Linux support.
 * RP2350 atomics are only safe in internal SRAM; see `docs/risks.md` before moving
   lock-heavy structures or userspace runtimes into PSRAM.

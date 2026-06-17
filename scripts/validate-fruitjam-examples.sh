@@ -914,6 +914,22 @@ fi
 grep -q '/etc/profile.d/\*.sh' "$profile_src"
 grep -q 'clear()' "$cls_src"
 grep -q 'cls()' "$cls_src"
+python3 - "$web_cgi_src" "$airlift_src" <<'PY'
+import sys
+from pathlib import Path
+
+cgi = Path(sys.argv[1]).read_text()
+airlift = Path(sys.argv[2]).read_text()
+
+for source, name in ((cgi, "CGI"), (airlift, "AirLift")):
+    if "LINUX_REBOOT_CMD_RESTART2" not in source or 'SYS_reboot' not in source:
+        raise SystemExit(f"{name} BOOTSEL path does not use direct restart2")
+    if 'fruitjamctl", "bootsel"' in source:
+        raise SystemExit(f"{name} BOOTSEL path reintroduced fruitjamctl exec")
+    if '\\"verified\\":false' not in source or "picotool info -a" not in source:
+        raise SystemExit(f"{name} BOOTSEL response does not state host verification is required")
+print("ok web bootsel direct restart guard")
+PY
 echo "ok uart login guard"
 echo "ok clear cls profile guard"
 

@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/reboot.h>
 #include <linux/spi/spidev.h>
 #include <signal.h>
 #include <stdint.h>
@@ -24,6 +25,7 @@
 #include <termios.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -40,7 +42,6 @@
 
 #define AIRLIFT_GPIO_DEV_DEFAULT "/dev/airlift-gpio"
 #define AIRLIFT_SPI_DEV_DEFAULT "/dev/spidev0.0"
-#define FRUITJAMCTL_BIN "/usr/bin/fruitjamctl"
 #define USBHOST_DEV "/dev/fruitjam-usbhost"
 #define AIRLIFT_SPI_HZ 8000000u
 #define AIRLIFT_RESET_GPIO 22u
@@ -2938,18 +2939,13 @@ static int http_parse_uint_limited(const char *s, unsigned int min_value,
 	return 0;
 }
 
-static int http_schedule_bootsel(void)
+static int http_reboot_bootsel_after_delay(unsigned int delay_ms)
 {
-	pid_t pid = vfork();
-
-	if (pid < 0)
-		return -1;
-	if (pid == 0) {
-		execl(FRUITJAMCTL_BIN, "fruitjamctl", "bootsel", "1500",
-		      (char *)NULL);
-		_exit(127);
-	}
-	return 0;
+	if (delay_ms)
+		usleep(delay_ms * 1000u);
+	sync();
+	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
 }
 
 static int http_run_capture_timeout(char *const argv[], char *out,
@@ -3871,15 +3867,18 @@ static int http_send_fruitjam_api(struct airlift *air, uint8_t sock,
 		http_api_wav_play_body(query, body, sizeof(body));
 	else if (!strcmp(action, "bootsel")) {
 		snprintf(body, sizeof(body),
-			 "{\"ok\":true,\"source\":\"airlift-direct\",\"message\":\"rebooting to BOOTSEL\"}");
+			 "{\"ok\":true,\"accepted\":true,\"verified\":false,"
+			 "\"source\":\"airlift-direct\","
+			 "\"message\":\"BOOTSEL request accepted; verify from host with picotool info -a\"}");
 		reboot_bootsel = 1;
 	}
 	else
 		http_json_error_body(body, sizeof(body), "unknown action");
 
 	ret = http_reply_json(air, sock, body);
-	if (!ret && reboot_bootsel)
-		http_schedule_bootsel();
+	if (!ret && reboot_bootsel &&
+	    http_reboot_bootsel_after_delay(1500) < 0)
+		fprintf(stderr, "airliftctl: reboot bootsel: %s\n", strerror(errno));
 	return ret;
 }
 

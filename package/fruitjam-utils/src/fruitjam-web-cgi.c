@@ -20,6 +20,16 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <linux/reboot.h>
+#include <sys/syscall.h>
+#else
+#define LINUX_REBOOT_MAGIC1 0xfee1dead
+#define LINUX_REBOOT_MAGIC2 672274793
+#define LINUX_REBOOT_CMD_RESTART2 0xa1b2c3d4
+#define SYS_reboot (-1)
+#endif
+
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define MAX_PARAMS 24
 #define BUTTON_FIFO "/run/fruitjam-buttons.fifo"
@@ -32,7 +42,6 @@
 #define BERRY_DIR "/root/berry"
 #define WAV_BIN "/usr/bin/fruitjam-wavplay"
 #define WAV_DIR "/mnt/sd/wavs"
-#define FRUITJAMCTL_BIN "/usr/bin/fruitjamctl"
 #define USBHOST_DEV "/dev/fruitjam-usbhost"
 #define USBHOST_RESET_MS 50u
 #define USBHOST_POST_RESET_US 100000u
@@ -835,18 +844,13 @@ static int parse_uint_limited(const char *s, unsigned int min_value,
 	return 0;
 }
 
-static int schedule_bootsel(void)
+static int reboot_bootsel_after_delay(unsigned int delay_ms)
 {
-	pid_t pid = vfork();
-
-	if (pid < 0)
-		return -1;
-	if (pid == 0) {
-		execl(FRUITJAMCTL_BIN, "fruitjamctl", "bootsel", "1200",
-		      (char *)NULL);
-		_exit(127);
-	}
-	return 0;
+	if (delay_ms)
+		usleep(delay_ms * 1000u);
+	sync();
+	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
 }
 
 static void drop_page_cache(void)
@@ -1172,12 +1176,13 @@ static void action_rtttl(void)
 
 static void action_bootsel(void)
 {
-	if (schedule_bootsel() < 0) {
-		json_error("bootsel schedule failed");
-		return;
-	}
-	puts("{\"ok\":true,\"source\":\"direct-cgi\",\"message\":\"rebooting to BOOTSEL\"}");
+	puts("{\"ok\":true,\"accepted\":true,\"verified\":false,"
+	     "\"source\":\"direct-cgi\","
+	     "\"message\":\"BOOTSEL request accepted; verify from host with picotool info -a\"}");
 	fflush(stdout);
+	if (reboot_bootsel_after_delay(1200) < 0)
+		fprintf(stderr, "fruitjam-web-cgi: reboot bootsel: %s\n",
+			strerror(errno));
 }
 
 static void action_button_test(void)

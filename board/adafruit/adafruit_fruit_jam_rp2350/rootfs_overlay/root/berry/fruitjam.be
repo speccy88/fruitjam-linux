@@ -41,6 +41,68 @@ fruitjam.dvi_commands = [
     "pattern"
 ]
 
+fruitjam.hex_values = {
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7,
+    "8": 8,
+    "9": 9,
+    "a": 10,
+    "b": 11,
+    "c": 12,
+    "d": 13,
+    "e": 14,
+    "f": 15,
+    "A": 10,
+    "B": 11,
+    "C": 12,
+    "D": 13,
+    "E": 14,
+    "F": 15
+}
+
+fruitjam.hid_key_names = {
+    40: "enter",
+    41: "esc",
+    42: "backspace",
+    43: "tab",
+    44: "space",
+    45: "-",
+    46: "=",
+    47: "[",
+    48: "]",
+    49: "\\",
+    50: "nonus",
+    51: ";",
+    52: "'",
+    53: "`",
+    54: ",",
+    55: ".",
+    56: "/",
+    57: "capslock",
+    58: "f1",
+    59: "f2",
+    60: "f3",
+    61: "f4",
+    62: "f5",
+    63: "f6",
+    64: "f7",
+    65: "f8",
+    66: "f9",
+    67: "f10",
+    68: "f11",
+    69: "f12",
+    79: "right",
+    80: "left",
+    81: "down",
+    82: "up"
+}
+
 fruitjam.clamp = def(value, low, high)
     if value < low
         return low
@@ -204,6 +266,194 @@ fruitjam.usbhost_status = def()
         "next": "pio-packet-io",
         "first_milestone": "boot-protocol-keyboard"
     }
+end
+
+fruitjam.hex2 = def(value)
+    var digits = "0123456789abcdef"
+    return digits[(value >> 4) & 15] + digits[value & 15]
+end
+
+fruitjam.hex_nibble = def(ch)
+    if fruitjam.hex_values.contains(ch)
+        return fruitjam.hex_values[ch]
+    end
+    return -1
+end
+
+fruitjam.hex_separator = def(ch)
+    return ch == " " || ch == "\n" || ch == "\r" || ch == "\t" ||
+           ch == ":" || ch == "," || ch == "-" || ch == "_"
+end
+
+fruitjam.hex_bytes = def(text, max_bytes)
+    var out = []
+    var hi = -1
+    var i = 0
+    while i < size(text)
+        var ch = text[i]
+        if fruitjam.hex_separator(ch) || ch == "x" || ch == "X"
+            i += 1
+        else
+            var v = fruitjam.hex_nibble(ch)
+            if v < 0
+                return {"ok": false, "error": "bad hex"}
+            end
+            if hi < 0
+                hi = v
+            else
+                if out.size() >= max_bytes
+                    return {"ok": false, "error": "too much hex"}
+                end
+                out.push((hi << 4) | v)
+                hi = -1
+            end
+            i += 1
+        end
+    end
+    if hi >= 0
+        return {"ok": false, "error": "odd hex"}
+    end
+    return {"ok": true, "bytes": out}
+end
+
+fruitjam.usb_pid_valid = def(pid)
+    return (((pid >> 4) ^ (pid & 15)) == 15)
+end
+
+fruitjam.usb_pid_is_data = def(pid)
+    return pid == 0xc3 || pid == 0x4b || pid == 0x87 || pid == 0x0f
+end
+
+fruitjam.hid_key_name = def(key)
+    if key >= 4 && key <= 29
+        return "abcdefghijklmnopqrstuvwxyz"[key - 4]
+    end
+    if key >= 30 && key <= 38
+        return "123456789"[key - 30]
+    end
+    if key == 39
+        return "0"
+    end
+    if fruitjam.hid_key_names.contains(key)
+        return fruitjam.hid_key_names[key]
+    end
+    return "0x" + fruitjam.hex2(key)
+end
+
+fruitjam.hid_key_text_char = def(key, shift)
+    if key >= 4 && key <= 29
+        if shift
+            return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[key - 4]
+        end
+        return "abcdefghijklmnopqrstuvwxyz"[key - 4]
+    end
+    if key >= 30 && key <= 38
+        if shift
+            return "!@#$%^&*("[key - 30]
+        end
+        return "123456789"[key - 30]
+    end
+    if key == 39
+        return shift ? ")" : "0"
+    elif key == 44
+        return " "
+    elif key == 45
+        return shift ? "_" : "-"
+    elif key == 46
+        return shift ? "+" : "="
+    elif key == 47
+        return shift ? "{" : "["
+    elif key == 48
+        return shift ? "}" : "]"
+    elif key == 49
+        return shift ? "|" : "\\"
+    elif key == 51
+        return shift ? ":" : ";"
+    elif key == 52
+        return shift ? "\"" : "'"
+    elif key == 53
+        return shift ? "~" : "`"
+    elif key == 54
+        return shift ? "<" : ","
+    elif key == 55
+        return shift ? ">" : "."
+    elif key == 56
+        return shift ? "?" : "/"
+    end
+    return ""
+end
+
+fruitjam.hid_boot_keyboard_report = def(report, source)
+    if report.size() != 8 || report[1] != 0
+        return {"ok": false, "source": source, "error": "not-boot-keyboard-report"}
+    end
+
+    var shift = (report[0] & (0x02 | 0x20)) != 0
+    var keys = []
+    var text = ""
+    var i = 2
+    while i < 8
+        var key = report[i]
+        if key >= 4
+            var ch = fruitjam.hid_key_text_char(key, shift)
+            var item = {
+                "code": key,
+                "hex": "0x" + fruitjam.hex2(key),
+                "name": fruitjam.hid_key_name(key)
+            }
+            if ch != ""
+                item["char"] = ch
+                text += ch
+            end
+            keys.push(item)
+        end
+        i += 1
+    end
+
+    return {
+        "ok": true,
+        "source": source,
+        "modifiers": report[0],
+        "keys": keys,
+        "text": text
+    }
+end
+
+fruitjam.usbhost_hid_report = def(hex)
+    var parsed = fruitjam.hex_bytes(hex, 32)
+    if !parsed["ok"]
+        return parsed
+    end
+
+    var bytes = parsed["bytes"]
+    if bytes.size() == 0
+        return {"ok": false, "source": "none", "error": "no-rx-data"}
+    end
+
+    var source = "raw-report"
+    var report = bytes
+    var pid_index = 0
+    if bytes.size() >= 2 && fruitjam.usb_pid_valid(bytes[1])
+        pid_index = 1
+    end
+    var pid = bytes[pid_index]
+
+    if fruitjam.usb_pid_valid(pid) && fruitjam.usb_pid_is_data(pid)
+        var payload_with_crc = bytes.size() - pid_index - 1
+        if payload_with_crc < 2
+            return {"ok": false, "source": "usb-data", "error": "data-packet-missing-crc"}
+        end
+        var report_len = payload_with_crc - 2
+        report = []
+        var i = 0
+        while i < report_len
+            report.push(bytes[pid_index + 1 + i])
+            i += 1
+        end
+        source = "usb-data"
+    end
+
+    return fruitjam.hid_boot_keyboard_report(report, source)
 end
 
 fruitjam.adc_read = def(label, channel)

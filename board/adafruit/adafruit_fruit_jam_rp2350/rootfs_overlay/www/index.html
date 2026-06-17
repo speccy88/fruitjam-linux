@@ -695,6 +695,51 @@
       return bytes[offset] | (bytes[offset + 1] << 8);
     }
 
+    function hidKeyName(key) {
+      if (key >= 4 && key <= 29) return String.fromCharCode(97 + key - 4);
+      if (key >= 30 && key <= 38) return String.fromCharCode(49 + key - 30);
+      if (key === 39) return "0";
+      return ({
+        40: "enter", 41: "esc", 42: "backspace", 43: "tab",
+        44: "space", 45: "-", 46: "=", 47: "[", 48: "]",
+        49: "\\", 51: ";", 52: "'", 53: "`", 54: ",",
+        55: ".", 56: "/", 57: "capslock", 58: "f1", 59: "f2",
+        60: "f3", 61: "f4", 62: "f5", 63: "f6", 64: "f7",
+        65: "f8", 66: "f9", 67: "f10", 68: "f11", 69: "f12",
+        79: "right", 80: "left", 81: "down", 82: "up"
+      })[key] || hex2(key);
+    }
+
+    function hidKeyChar(key, shift) {
+      if (key >= 4 && key <= 29) {
+        return String.fromCharCode((shift ? 65 : 97) + key - 4);
+      }
+      if (key >= 30 && key <= 38) {
+        return (shift ? "!@#$%^&*(" : "123456789")[key - 30];
+      }
+      if (key === 39) return shift ? ")" : "0";
+      return ({
+        40: "\n", 41: "\u001b", 42: "\u007f", 43: "\t",
+        44: " ", 45: shift ? "_" : "-", 46: shift ? "+" : "=",
+        47: shift ? "{" : "[", 48: shift ? "}" : "]",
+        49: shift ? "|" : "\\", 51: shift ? ":" : ";",
+        52: shift ? "\"" : "'", 53: shift ? "~" : "`",
+        54: shift ? "<" : ",", 55: shift ? ">" : ".",
+        56: shift ? "?" : "/"
+      })[key] || "";
+    }
+
+    function addHidKeyboardHints(lines, data) {
+      if (data.length !== 8 || data[1] !== 0) return;
+      const keys = data.slice(2).filter((key) => key >= 4);
+      const names = keys.map((key) => hidKeyName(key) + "(" + hex2(key) + ")");
+      const shift = (data[0] & 0x22) !== 0;
+      const text = keys.map((key) => hidKeyChar(key, shift)).filter(Boolean).join("");
+      lines.push("rx hid: boot keyboard report modifiers=" + hex2(data[0]) +
+        " keys=" + (names.length ? names.join(",") : "none"));
+      if (text) lines.push("rx hid text: " + JSON.stringify(text));
+    }
+
     function addDescriptorHints(lines, data) {
       if (data.length < 2) return;
       if (data[1] === 1) {
@@ -758,7 +803,9 @@
         lines.push("rx data: payloadBytes=" + dataLen +
           " crc16=" + (payloadWithCrc >= 2 ? "present" : "missing"));
         if (dataLen > 0) {
-          addDescriptorHints(lines, bytes.slice(pidIndex + 1, pidIndex + 1 + dataLen));
+          const payload = bytes.slice(pidIndex + 1, pidIndex + 1 + dataLen);
+          addDescriptorHints(lines, payload);
+          addHidKeyboardHints(lines, payload);
         }
       }
       return lines;

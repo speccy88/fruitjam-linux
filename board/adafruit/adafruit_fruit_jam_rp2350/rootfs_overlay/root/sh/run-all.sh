@@ -135,6 +135,7 @@ fruitjam-mem
 section usbhost
 sh /root/sh/14-usbhost-status.sh
 sh /root/sh/16-hidkeys-decode.sh
+sh /root/sh/17-usbhost-hid-decode.sh
 
 section i2c
 fruitjam-i2c ping 0x18

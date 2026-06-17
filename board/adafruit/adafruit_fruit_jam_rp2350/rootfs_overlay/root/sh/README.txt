@@ -28,6 +28,7 @@ Files:
   14-usbhost-status.sh     Report USB host status and issue a bus reset.
   15-wav-analyze.sh        Analyze the first SD WAV file without playing audio.
   16-hidkeys-decode.sh     Decode synthetic USB HID boot-keyboard reports.
+  17-usbhost-hid-decode.sh Decode USB-host DATA packets as boot-keyboard reports.
   serial-over-tcp.sh       Long-running TCP bridge for a character device.
   run-all.sh               Runs finite shell hardware checks; RTTTL is direct.
 

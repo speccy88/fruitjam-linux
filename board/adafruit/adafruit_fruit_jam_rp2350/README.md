@@ -45,8 +45,8 @@ Validated on the Fruit Jam board:
 * `berry -e 'print("berry ok")'`.
 * Berry REPL expression evaluation.
 * `/root/berry/fruitjam.be` provides an importable Berry hardware helper module
-  for GPIO/buttons, ADC, USB-host status, device presence, audio clock, DVI
-  command writes, and NeoPixels.
+  for GPIO/buttons, ADC, USB-host status, USB HID report decode, device
+  presence, audio clock, DVI command writes, and NeoPixels.
 * `/root/berry/neopixels.be` runs with `berry-run /root/berry/neopixels.be` and lights the
   five onboard NeoPixels.
 * BusyBox `vi` is enabled as `/bin/vi`.
@@ -193,13 +193,15 @@ make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
 bridge so hardware validation can proceed over UART and USB CDC.
 `/dev/fruitjam-usbhost` owns the USB host power switch plus GPIO1/GPIO2
 line-state and reset timing in the kernel. `fruitjam-usbhost status`, `json`,
-`wait`, `monitor`, and `reset` use that bridge when present and fall back to
-sysfs GPIO on older images. The bridge stages the 32-word PIO2 full-speed host
+`wait`, `monitor`, `reset`, `decode`, and `hid` use that bridge when present and
+fall back to sysfs GPIO on older images. The bridge stages the 32-word PIO2 full-speed host
 program so USB packet work has a dedicated block that does not collide with PIO0
 NeoPixels or PIO1 audio. PIO token/data transactions and boot-keyboard report
 polling are still being developed.
-`fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events so
-the first bridge milestone has a tested key translation path ready.
+`fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events. It
+also accepts DATA0/DATA1 `last_rx_hex` packets from `fruitjam-usbhost` when the
+payload is an 8-byte keyboard report, so bridge captures can feed the same
+tested key translation path.
 
 The `bootsel` command requests a restart into the RP2350 ROM BOOTSEL loader. It
 has been verified on Fruit Jam hardware by running `fruitjamctl bootsel` from the

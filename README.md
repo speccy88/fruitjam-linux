@@ -32,8 +32,8 @@ fruitjam-rtttl scale
 The examples are intentionally part of the image:
 
 * `/root/berry` contains Berry language and hardware examples, including the
-  importable `fruitjam` hardware module, NeoPixel animations, and direct
-  sysfs/ADC/button reads.
+  importable `fruitjam` hardware module, NeoPixel animations, USB HID decode,
+  and direct sysfs/ADC/button reads.
 * `/root/sh` contains shell examples for services, HTTP/CGI, NeoPixels, buttons,
   I2C, ADC, SD, DVI, USB-host status, WAV analysis, and small utility checks.
 * `/root/rtttl` contains RTTTL tunes for the TLV320DAC3100 audio bring-up path.
@@ -186,7 +186,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | UART console header | GPIO8 TX, GPIO9 RX | Supported | Hardware UART shell/log path at 115200 8N1. | Keep as fallback when USB or graphics work changes. |
 | ROM BOOTSEL from Linux | RP2350 reboot command | Supported | `fruitjamctl bootsel` re-enters BOOTSEL and `picotool info -a` sees the ROM. | None. |
 | BusyBox userspace | `/bin`, `/usr/bin` | Supported | BusyBox tools plus `vi`, `hush`, web/network helpers, `free`/`fruitjam-mem`, and Fruit Jam tools. | Keep applets constrained for no-MMU allocation behavior. |
-| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, USB-host status, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. | Extend the Berry module as more kernel helpers land. |
+| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, USB-host status, USB HID report decode, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. | Extend the Berry module as more kernel helpers land. |
 | Onboard NeoPixels | GPIO32, five LEDs | Supported | PIO-backed `/dev/neopixels`; Berry and CGI can update pixels. | None for basic color writes. |
 | Buttons | GPIO0, GPIO4, GPIO5 | Supported | Sysfs GPIO input, `fruitjam-buttons`, button log, CGI status, synthetic test events. | Physical edge logging should get longer soak testing. |
 | Red LED / IR pin | GPIO29 | Partial | LED control through sysfs/`fruitjamctl`; active-low output works. | IR receiver decoding is not implemented. |
@@ -229,8 +229,8 @@ process size and memory fragmentation matter.
 | `fruitjam-adc` | Read RP2350 ADC inputs and the internal temperature ADC channel. |
 | `fruitjam-dvi` | Render bounded text/dashboard/test frames to `/dev/fruitjam-dvi`. |
 | `fruitjam-wavplay` | Analyze simple WAV files and play tone segments through the TLV320 tone path. |
-| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, and `reset` diagnostics for HID bring-up. |
-| `fruitjam-hidkeys` | Decode USB HID boot-keyboard 8-byte reports into text/events for the upcoming PIO packet I/O bridge. |
+| `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, and `hid` diagnostics for descriptor/HID bring-up. |
+| `fruitjam-hidkeys` | Decode USB HID boot-keyboard 8-byte reports into text/events, including DATA0/DATA1 `last_rx_hex` packets from the PIO bridge when they contain an 8-byte keyboard report. |
 | `fruitjam-mem`, `free` | Tiny no-fork memory, uptime, load, and commit-pressure summary from `/proc`. |
 | `fruitjam-buttons` | Button daemon for GPIO0/GPIO4/GPIO5 with log, FIFO, SQLite, and MQTT hooks. |
 | `fruitjam-buttonlog` | Dump the fixed-schema button SQLite 3 log. |

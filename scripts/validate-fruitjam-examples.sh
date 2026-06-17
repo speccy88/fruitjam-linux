@@ -7,6 +7,7 @@ shell_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/root/sh
 rtttl_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/root/rtttl"
 host_berry="$repo/buildroot/dl/berry/git/berry"
 web_cgi_src="$repo/package/fruitjam-utils/src/fruitjam-web-cgi.c"
+web_dispatch_cgi_src="$repo/package/fruitjam-utils/src/fruitjam-web-dispatch-cgi.c"
 berry_json_src="$repo/package/fruitjam-utils/src/fruitjam-berry-json.c"
 web_page_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/www/index.html"
 dvi_src="$repo/package/fruitjam-utils/src/fruitjam-dvi.c"
@@ -115,7 +116,7 @@ awk -v repl="var FAKE_ROOT = \"$fakefs\"" '
 mv "$tmp/berry/07-fruitjam-module-fakefs.be.tmp" "$tmp/berry/07-fruitjam-module-fakefs.be"
 
 echo "== berry whitelist sync =="
-python3 - "$berry_src" "$web_cgi_src" "$berry_json_src" <<'PY'
+python3 - "$berry_src" "$web_cgi_src" "$web_dispatch_cgi_src" "$berry_json_src" "$airlift_src" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -433,7 +434,14 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os \
 "$tmp/fruitjam-usbhost" reset 10 > "$tmp/fruitjam-usbhost-reset.txt"
 "$tmp/fruitjam-usbhost" decode c312010002000000403412 > "$tmp/fruitjam-usbhost-decode-direct.txt"
 "$tmp/fruitjam-usbhost" decode f04b12010002000000403412 > "$tmp/fruitjam-usbhost-decode-bridge.txt"
-python3 - "$tmp/fruitjam-usbhost.txt" "$tmp/fruitjam-usbhost.json" "$tmp/fruitjam-usbhost-wait.txt" "$tmp/fruitjam-usbhost-monitor.txt" "$tmp/fruitjam-usbhost-reset.txt" "$gpio_root" "$tmp/fruitjam-usbhost-decode-direct.txt" "$tmp/fruitjam-usbhost-decode-bridge.txt" <<'PY'
+"$tmp/fruitjam-usbhost" decode f04b0000040000000000abcd > "$tmp/fruitjam-usbhost-decode-hid.txt"
+"$tmp/fruitjam-usbhost" hid f04b0000040000000000abcd > "$tmp/fruitjam-usbhost-hid-packet.txt"
+"$tmp/fruitjam-usbhost" hid 0200050000000000 > "$tmp/fruitjam-usbhost-hid-raw.txt"
+if "$tmp/fruitjam-usbhost" hid f04b12010002000000403412 > "$tmp/fruitjam-usbhost-hid-descriptor.txt" 2>&1; then
+	echo "fruitjam-usbhost hid accepted a descriptor packet as keyboard input" >&2
+	exit 1
+fi
+python3 - "$tmp/fruitjam-usbhost.txt" "$tmp/fruitjam-usbhost.json" "$tmp/fruitjam-usbhost-wait.txt" "$tmp/fruitjam-usbhost-monitor.txt" "$tmp/fruitjam-usbhost-reset.txt" "$gpio_root" "$tmp/fruitjam-usbhost-decode-direct.txt" "$tmp/fruitjam-usbhost-decode-bridge.txt" "$tmp/fruitjam-usbhost-decode-hid.txt" "$tmp/fruitjam-usbhost-hid-packet.txt" "$tmp/fruitjam-usbhost-hid-raw.txt" "$tmp/fruitjam-usbhost-hid-descriptor.txt" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -446,6 +454,10 @@ reset = Path(sys.argv[5]).read_text()
 gpio_root = Path(sys.argv[6])
 decode_direct = Path(sys.argv[7]).read_text()
 decode_bridge = Path(sys.argv[8]).read_text()
+decode_hid = Path(sys.argv[9]).read_text()
+hid_packet = Path(sys.argv[10]).read_text()
+hid_raw = Path(sys.argv[11]).read_text()
+hid_descriptor = Path(sys.argv[12]).read_text()
 if "usbhost device full-speed-device" not in text:
     raise SystemExit("fruitjam-usbhost status did not classify full-speed device")
 if "pio-packet-io" not in text:
@@ -470,10 +482,26 @@ if "descriptor device-prefix" not in decode_direct or "maxpkt0=64" not in decode
     raise SystemExit("fruitjam-usbhost device descriptor decode regressed")
 if "prefix-bytes=1" not in decode_bridge or "pid=DATA1" not in decode_bridge:
     raise SystemExit("fruitjam-usbhost bridge-format packet decode regressed")
+if "hid boot-keyboard modifiers=0x00 keys=a(0x04)" not in decode_hid:
+    raise SystemExit("fruitjam-usbhost HID packet hint regressed")
+if 'hid-text "a"' not in decode_hid:
+    raise SystemExit("fruitjam-usbhost HID text hint regressed")
+if "usbhost hid boot-keyboard modifiers=0x00 keys=a(0x04)" not in hid_packet:
+    raise SystemExit("fruitjam-usbhost hid packet decode regressed")
+if 'usbhost hid-text "a"' not in hid_packet:
+    raise SystemExit("fruitjam-usbhost hid packet text regressed")
+if "usbhost hid boot-keyboard modifiers=0x02 keys=b(0x05)" not in hid_raw:
+    raise SystemExit("fruitjam-usbhost hid raw report decode regressed")
+if 'usbhost hid-text "B"' not in hid_raw:
+    raise SystemExit("fruitjam-usbhost hid raw report text regressed")
+if "not-boot-keyboard-report" not in hid_descriptor:
+    raise SystemExit("fruitjam-usbhost hid descriptor rejection regressed")
 PY
 echo "ok fruitjam-usbhost status"
 echo "ok fruitjam-usbhost json wait monitor reset"
 echo "ok fruitjam-usbhost rx decode"
+echo "ok fruitjam-usbhost HID packet decode"
+echo "ok fruitjam-usbhost hid command"
 
 echo "== hid boot-keyboard decoder host behavior =="
 cc -Wall -Wextra -Wno-deprecated-declarations -Os \
@@ -490,13 +518,26 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os \
 	0000000000000000 > "$tmp/fruitjam-hidkeys-held.txt"
 printf '00:00:04:00:00:00:00:00\n00:00:00:00:00:00:00:00\n' | \
 	"$tmp/fruitjam-hidkeys" --events > "$tmp/fruitjam-hidkeys-events.txt"
-python3 - "$tmp/fruitjam-hidkeys.txt" "$tmp/fruitjam-hidkeys-held.txt" "$tmp/fruitjam-hidkeys-events.txt" <<'PY'
+"$tmp/fruitjam-hidkeys" \
+	f04b0000040000000000abcd \
+	f04b0000000000000000abcd > "$tmp/fruitjam-hidkeys-packet.txt"
+"$tmp/fruitjam-hidkeys" --events \
+	f04b0000040000000000abcd \
+	f04b0000000000000000abcd > "$tmp/fruitjam-hidkeys-packet-events.txt"
+if "$tmp/fruitjam-hidkeys" f04b12010002000000403412 > "$tmp/fruitjam-hidkeys-descriptor.txt" 2> "$tmp/fruitjam-hidkeys-descriptor.err"; then
+	echo "fruitjam-hidkeys accepted a descriptor packet as keyboard input" >&2
+	exit 1
+fi
+python3 - "$tmp/fruitjam-hidkeys.txt" "$tmp/fruitjam-hidkeys-held.txt" "$tmp/fruitjam-hidkeys-events.txt" "$tmp/fruitjam-hidkeys-packet.txt" "$tmp/fruitjam-hidkeys-packet-events.txt" "$tmp/fruitjam-hidkeys-descriptor.err" <<'PY'
 import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text()
 held = Path(sys.argv[2]).read_text()
 events = Path(sys.argv[3]).read_text()
+packet = Path(sys.argv[4]).read_text()
+packet_events = Path(sys.argv[5]).read_text()
+descriptor_err = Path(sys.argv[6]).read_text()
 if text != "aB\n":
     raise SystemExit(f"fruitjam-hidkeys text decode regressed: {text!r}")
 if held != "a":
@@ -505,9 +546,18 @@ if "press key=a char=a code=0x04 modifiers=0x00" not in events:
     raise SystemExit("fruitjam-hidkeys events missing press")
 if "release key=a code=0x04" not in events:
     raise SystemExit("fruitjam-hidkeys events missing release")
+if packet != "a":
+    raise SystemExit(f"fruitjam-hidkeys packet decode regressed: {packet!r}")
+if "press key=a char=a code=0x04 modifiers=0x00" not in packet_events:
+    raise SystemExit("fruitjam-hidkeys packet events missing press")
+if "release key=a code=0x04" not in packet_events:
+    raise SystemExit("fruitjam-hidkeys packet events missing release")
+if "not a boot-keyboard report" not in descriptor_err:
+    raise SystemExit("fruitjam-hidkeys descriptor packet rejection regressed")
 PY
 echo "ok fruitjam-hidkeys text"
 echo "ok fruitjam-hidkeys events"
+echo "ok fruitjam-hidkeys USB packet decode"
 
 echo "== usbhost kernel bridge source guards =="
 	python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" "$web_page_src" <<'PY'
@@ -905,6 +955,8 @@ if "pio_configured" not in helper or "last_tx_result" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not surface PIO TX counters")
 if "decode [RX-HEX]" not in helper or "descriptor device-prefix" not in helper:
     raise SystemExit("fruitjam-usbhost helper missing RX descriptor decoder")
+if "hid [RX-HEX|REPORT-HEX]" not in helper or "decode_hid_hex" not in helper or "boot-keyboard modifiers" not in helper:
+    raise SystemExit("fruitjam-usbhost helper missing HID packet decoder")
 for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirLift")):
     for needle in (
         "in-token",
@@ -918,6 +970,9 @@ for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirL
             raise SystemExit(f"{name} does not surface USB host RX probe field {needle}")
 for needle in (
     "decodeUsbRx",
+    "hidKeyName",
+    "rx hid: boot keyboard report",
+    "rx hid text",
     "usbPidName",
     "rx descriptor",
     "boot keyboard interface yes",

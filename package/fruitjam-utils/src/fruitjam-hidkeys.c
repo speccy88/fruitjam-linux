@@ -2,9 +2,9 @@
 /*
  * Tiny USB HID boot-keyboard report decoder for Fruit Jam bring-up.
  *
- * The real GPIO1/GPIO2 PIO USB host bridge will hand 8-byte boot-keyboard
- * reports to this same translation logic. Keeping it as a small standalone
- * helper makes the key mapping testable before the host protocol driver lands.
+ * The GPIO1/GPIO2 PIO USB host bridge reports packet bytes while the protocol
+ * driver is still coming up. Keeping the key mapping here makes both raw
+ * 8-byte reports and captured DATA packets testable before polling lands.
  */
 
 #include <ctype.h>
@@ -16,6 +16,8 @@
 
 #define REPORT_LEN 8
 #define KEY_SLOTS 6
+#define INPUT_BYTES_MAX 128
+#define USB_PACKET_CRC_LEN 2
 #define MOD_LSHIFT 0x02u
 #define MOD_RSHIFT 0x20u
 
@@ -29,7 +31,10 @@ static void usage(FILE *out)
 		"usage: fruitjam-hidkeys [--events] [REPORT-HEX ...]\n"
 		"\n"
 		"Decode USB HID boot-keyboard 8-byte reports. Reports may be\n"
-		"written as 16 hex digits or separated with spaces, ':' or ','.\n");
+		"written as 16 hex digits or separated with spaces, ':' or ','.\n"
+		"Input may also be a DATA0/DATA1 last_rx_hex packet from\n"
+		"fruitjam-usbhost; the optional bridge prefix and trailing USB\n"
+		"CRC16 are stripped when the payload is a boot-keyboard report.\n");
 }
 
 static int hexval(int c)
@@ -47,6 +52,16 @@ static bool is_sep(int c)
 {
 	return isspace((unsigned char)c) || c == ':' || c == ',' || c == '-' ||
 		c == '_';
+}
+
+static bool usb_pid_valid(unsigned char pid)
+{
+	return (((pid >> 4) ^ (pid & 0x0f)) == 0x0f);
+}
+
+static bool usb_pid_is_data(unsigned char pid)
+{
+	return pid == 0xc3 || pid == 0x4b || pid == 0x87 || pid == 0x0f;
 }
 
 static const char *key_name(unsigned char key)
@@ -242,15 +257,15 @@ static int feed_byte(unsigned char byte, unsigned char report[REPORT_LEN],
 	return 0;
 }
 
-static int feed_hex_text(const char *text, unsigned char report[REPORT_LEN],
-			 size_t *report_pos, struct hidkeys_state *state,
-			 bool events)
+static int parse_hex_bytes(const char *text, unsigned char *bytes,
+			   size_t max_bytes, size_t *byte_count)
 {
 	const unsigned char *p = (const unsigned char *)text;
+	size_t n = 0;
+	int hi = -1;
 
 	while (*p) {
-		int hi;
-		int lo;
+		int v;
 
 		if (*p == '#')
 			break;
@@ -258,17 +273,102 @@ static int feed_hex_text(const char *text, unsigned char report[REPORT_LEN],
 			p++;
 			continue;
 		}
+		if (*p == 'x' || *p == 'X') {
+			p++;
+			continue;
+		}
 
-		hi = hexval(*p++);
-		if (hi < 0 || !*p)
+		v = hexval(*p++);
+		if (v < 0)
 			return -1;
-		lo = hexval(*p++);
-		if (lo < 0)
-			return -1;
-		feed_byte((unsigned char)((hi << 4) | lo), report, report_pos,
-			  state, events);
+		if (hi < 0) {
+			hi = v;
+		} else {
+			if (n >= max_bytes)
+				return -1;
+			bytes[n++] = (unsigned char)((hi << 4) | v);
+			hi = -1;
+		}
 	}
+
+	if (hi >= 0)
+		return -1;
+	*byte_count = n;
 	return 0;
+}
+
+static int usb_data_payload(const unsigned char *bytes, size_t len,
+			    const unsigned char **payload, size_t *payload_len)
+{
+	size_t pid_index;
+	size_t payload_with_crc;
+	unsigned char pid;
+
+	if (!len)
+		return 0;
+
+	pid_index = (len >= 2 && usb_pid_valid(bytes[1])) ? 1 : 0;
+	pid = bytes[pid_index];
+	if (!usb_pid_valid(pid) || !usb_pid_is_data(pid))
+		return 0;
+
+	payload_with_crc = len - pid_index - 1;
+	if (payload_with_crc < REPORT_LEN + USB_PACKET_CRC_LEN)
+		return 0;
+
+	*payload = &bytes[pid_index + 1];
+	*payload_len = payload_with_crc - USB_PACKET_CRC_LEN;
+	return 1;
+}
+
+static int feed_bytes(const unsigned char *bytes, size_t len,
+		      unsigned char report[REPORT_LEN], size_t *report_pos,
+		      struct hidkeys_state *state, bool events)
+{
+	const unsigned char *payload = NULL;
+	size_t payload_len = 0;
+	int packet;
+	size_t i;
+
+	packet = usb_data_payload(bytes, len, &payload, &payload_len);
+	if (packet < 0)
+		return packet;
+	if (packet > 0) {
+		if (*report_pos)
+			return -3;
+		if (payload_len != REPORT_LEN || payload[1] != 0)
+			return -2;
+		process_report(state, payload, events);
+		return 0;
+	}
+
+	for (i = 0; i < len; i++)
+		feed_byte(bytes[i], report, report_pos, state, events);
+	return 0;
+}
+
+static int feed_hex_text(const char *text, unsigned char report[REPORT_LEN],
+			 size_t *report_pos, struct hidkeys_state *state,
+			 bool events)
+{
+	unsigned char bytes[INPUT_BYTES_MAX];
+	size_t len = 0;
+
+	if (parse_hex_bytes(text, bytes, sizeof(bytes), &len) < 0)
+		return -1;
+	return feed_bytes(bytes, len, report, report_pos, state, events);
+}
+
+static const char *feed_error(int ret)
+{
+	switch (ret) {
+	case -2:
+		return "USB DATA packet is not a boot-keyboard report";
+	case -3:
+		return "USB DATA packet cannot follow a partial raw report";
+	default:
+		return "bad hex input";
+	}
 }
 
 int main(int argc, char **argv)
@@ -299,10 +399,12 @@ int main(int argc, char **argv)
 
 	if (arg < argc) {
 		for (; arg < argc; arg++) {
-			if (feed_hex_text(argv[arg], report, &report_pos, &state,
-					  events) < 0) {
-				fprintf(stderr, "fruitjam-hidkeys: bad hex report: %s\n",
-					argv[arg]);
+			int ret = feed_hex_text(argv[arg], report, &report_pos,
+						&state, events);
+
+			if (ret < 0) {
+				fprintf(stderr, "fruitjam-hidkeys: %s: %s\n",
+					feed_error(ret), argv[arg]);
 				return 2;
 			}
 		}
@@ -310,9 +412,12 @@ int main(int argc, char **argv)
 		char line[256];
 
 		while (fgets(line, sizeof(line), stdin)) {
-			if (feed_hex_text(line, report, &report_pos, &state,
-					  events) < 0) {
-				fprintf(stderr, "fruitjam-hidkeys: bad hex input\n");
+			int ret = feed_hex_text(line, report, &report_pos,
+						&state, events);
+
+			if (ret < 0) {
+				fprintf(stderr, "fruitjam-hidkeys: %s\n",
+					feed_error(ret));
 				return 2;
 			}
 		}

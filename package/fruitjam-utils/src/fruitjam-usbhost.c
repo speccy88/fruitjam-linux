@@ -35,6 +35,10 @@
 #define BRIDGE_BUF_MAX 1024
 #define RX_HEX_MAX 65
 #define RX_BYTES_MAX 32
+#define HID_REPORT_LEN 8
+#define HID_KEY_SLOTS 6
+#define HID_MOD_LSHIFT 0x02u
+#define HID_MOD_RSHIFT 0x20u
 
 struct usbhost_status {
 	int power;
@@ -67,7 +71,7 @@ static const char *kernel_pio_stack_text =
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|wait [seconds]|monitor [seconds]}\n");
+		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|wait [seconds]|monitor [seconds]}\n");
 }
 
 static int write_file(const char *path, const char *text)
@@ -297,6 +301,150 @@ static bool usb_pid_is_data(unsigned char pid)
 	return pid == 0xc3 || pid == 0x4b || pid == 0x87 || pid == 0x0f;
 }
 
+static const char *hid_key_name(unsigned char key)
+{
+	static char name[8];
+
+	if (key >= 4 && key <= 29) {
+		name[0] = (char)('a' + key - 4);
+		name[1] = '\0';
+		return name;
+	}
+	if (key >= 30 && key <= 38) {
+		name[0] = (char)('1' + key - 30);
+		name[1] = '\0';
+		return name;
+	}
+	if (key == 39)
+		return "0";
+
+	switch (key) {
+	case 40: return "enter";
+	case 41: return "esc";
+	case 42: return "backspace";
+	case 43: return "tab";
+	case 44: return "space";
+	case 45: return "-";
+	case 46: return "=";
+	case 47: return "[";
+	case 48: return "]";
+	case 49: return "\\";
+	case 50: return "nonus";
+	case 51: return ";";
+	case 52: return "'";
+	case 53: return "`";
+	case 54: return ",";
+	case 55: return ".";
+	case 56: return "/";
+	case 57: return "capslock";
+	case 58: return "f1";
+	case 59: return "f2";
+	case 60: return "f3";
+	case 61: return "f4";
+	case 62: return "f5";
+	case 63: return "f6";
+	case 64: return "f7";
+	case 65: return "f8";
+	case 66: return "f9";
+	case 67: return "f10";
+	case 68: return "f11";
+	case 69: return "f12";
+	case 79: return "right";
+	case 80: return "left";
+	case 81: return "down";
+	case 82: return "up";
+	default:
+		snprintf(name, sizeof(name), "0x%02x", key);
+		return name;
+	}
+}
+
+static int hid_key_ascii(unsigned char key, bool shift)
+{
+	if (key >= 4 && key <= 29)
+		return (shift ? 'A' : 'a') + key - 4;
+	if (key >= 30 && key <= 38) {
+		static const char normal[] = "123456789";
+		static const char shifted[] = "!@#$%^&*(";
+
+		return shift ? shifted[key - 30] : normal[key - 30];
+	}
+	if (key == 39)
+		return shift ? ')' : '0';
+
+	switch (key) {
+	case 40: return '\n';
+	case 41: return '\033';
+	case 42: return '\177';
+	case 43: return '\t';
+	case 44: return ' ';
+	case 45: return shift ? '_' : '-';
+	case 46: return shift ? '+' : '=';
+	case 47: return shift ? '{' : '[';
+	case 48: return shift ? '}' : ']';
+	case 49: return shift ? '|' : '\\';
+	case 51: return shift ? ':' : ';';
+	case 52: return shift ? '"' : '\'';
+	case 53: return shift ? '~' : '`';
+	case 54: return shift ? '<' : ',';
+	case 55: return shift ? '>' : '.';
+	case 56: return shift ? '?' : '/';
+	default: return 0;
+	}
+}
+
+static void print_quoted_text(const char *text)
+{
+	putchar('"');
+	while (*text) {
+		if (*text == '"' || *text == '\\')
+			putchar('\\');
+		putchar(*text++);
+	}
+	puts("\"");
+}
+
+static bool print_hid_keyboard_hint(const unsigned char *data, size_t len,
+				    const char *prefix)
+{
+	char text[HID_KEY_SLOTS + 1];
+	size_t text_len = 0;
+	bool shift;
+	bool any = false;
+	size_t i;
+
+	if (len != HID_REPORT_LEN || data[1] != 0)
+		return false;
+
+	shift = data[0] & (HID_MOD_LSHIFT | HID_MOD_RSHIFT);
+	printf("%s boot-keyboard modifiers=0x%02x keys=", prefix, data[0]);
+	for (i = 2; i < HID_REPORT_LEN; i++) {
+		unsigned char key = data[i];
+		int ch;
+
+		if (key < 4)
+			continue;
+		if (any)
+			putchar(',');
+		printf("%s(0x%02x)", hid_key_name(key), key);
+		any = true;
+
+		ch = hid_key_ascii(key, shift);
+		if (ch >= 32 && ch <= 126 && text_len < HID_KEY_SLOTS)
+			text[text_len++] = (char)ch;
+	}
+	if (!any)
+		fputs("none", stdout);
+	putchar('\n');
+
+	if (text_len) {
+		text[text_len] = '\0';
+		printf("%s-text ", prefix);
+		print_quoted_text(text);
+	}
+	return true;
+}
+
 static unsigned int le16(const unsigned char *p)
 {
 	return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
@@ -374,8 +522,52 @@ static int decode_rx_hex(const char *hex)
 
 		printf("usbhost decode data payload-bytes=%zu crc16=%s\n",
 		       data_len, payload_with_crc >= 2 ? "present" : "missing");
-		if (data_len)
+		if (data_len) {
 			print_descriptor_hint(&bytes[pid_index + 1], data_len);
+			print_hid_keyboard_hint(&bytes[pid_index + 1], data_len,
+						"usbhost decode hid");
+		}
+	}
+	return 0;
+}
+
+static int decode_hid_hex(const char *hex)
+{
+	unsigned char bytes[RX_BYTES_MAX];
+	const unsigned char *report = bytes;
+	size_t len = 0;
+	size_t report_len = 0;
+	size_t pid_index;
+	unsigned char pid;
+
+	if (!hex || !*hex) {
+		puts("usbhost hid no-rx-data");
+		return 1;
+	}
+	if (parse_hex_bytes(hex, bytes, sizeof(bytes), &len) < 0 || !len) {
+		fprintf(stderr, "fruitjam-usbhost: bad HID hex\n");
+		return 1;
+	}
+
+	pid_index = (len >= 2 && usb_pid_valid(bytes[1])) ? 1 : 0;
+	pid = bytes[pid_index];
+	if (usb_pid_valid(pid) && usb_pid_is_data(pid)) {
+		size_t payload_with_crc = len - pid_index - 1;
+
+		if (payload_with_crc < 2) {
+			puts("usbhost hid data-packet-missing-crc");
+			return 2;
+		}
+		report = &bytes[pid_index + 1];
+		report_len = payload_with_crc - 2;
+	} else {
+		report = bytes;
+		report_len = len;
+	}
+
+	if (!print_hid_keyboard_hint(report, report_len, "usbhost hid")) {
+		puts("usbhost hid not-boot-keyboard-report");
+		return 2;
 	}
 	return 0;
 }
@@ -892,6 +1084,12 @@ int main(int argc, char **argv)
 			return decode_rx_hex(argv[2]);
 		read_status(&st);
 		return decode_rx_hex(st.last_rx_hex);
+	}
+	if (!strcmp(cmd, "hid")) {
+		if (argc > 2)
+			return decode_hid_hex(argv[2]);
+		read_status(&st);
+		return decode_hid_hex(st.last_rx_hex);
 	}
 	if (!strcmp(cmd, "wait")) {
 		if (parse_seconds(argc > 2 ? argv[2] : NULL, 5, &seconds) < 0) {

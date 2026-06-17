@@ -24,8 +24,11 @@ Files:
   06-fruitjam-module.be    Smoke test for the importable fruitjam hardware module.
   07-fruitjam-module-fakefs.be
                             Host validation fixture for fake GPIO/ADC/audio/DVI/NeoPixel paths.
+  08-usbhost-hid-decode.be
+                            Berry decode checks for raw and DATA0/DATA1 HID keyboard reports.
   fruitjam.be              Importable helpers for GPIO, buttons, ADC, USB-host status,
-                            audio clock, DVI command writes, device presence, and NeoPixels.
+                            HID decode, audio clock, DVI command writes, device presence,
+                            and NeoPixels.
   fruitjam_lib.be          Small importable Berry module used by the language tour.
   neopixels.be             Five-pixel static smoke pattern.
   neopixel-colors.be       RGB color cycle inspired by the Fruit Jam NeoPixel examples.

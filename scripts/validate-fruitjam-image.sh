@@ -54,6 +54,7 @@ required = [
     "./usr/bin/fruitjam-pgrep",
     "./usr/bin/pgrep",
     "./usr/bin/pkill",
+    "./usr/bin/fruitjam-shell",
     "./usr/bin/mosquitto_pub",
     "./usr/bin/mosquitto_sub",
     "./usr/bin/wget",
@@ -241,6 +242,11 @@ with tarfile.open(rootfs) as tf:
     for needle in (b"EPSV", b"EPRT", b"PORT", b"APPE", b"RNFR"):
         if needle not in ftpd:
             raise SystemExit(f"fruitjam-ftpd missing marker {needle!r}")
+
+    shell = read_bytes(tf, "./usr/bin/fruitjam-shell")
+    for needle in (b"history", b"tab command/path completion", b"simple commands"):
+        if needle not in shell:
+            raise SystemExit(f"fruitjam-shell missing marker {needle!r}")
 
     telnetd = read_bytes(tf, "./usr/sbin/fruitjam-telnetd")
     if len(telnetd) < 4096 or not telnetd.startswith(b"bFLT"):

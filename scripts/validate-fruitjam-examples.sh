@@ -463,7 +463,7 @@ echo "ok uart login enter exec"
 echo "== telnet shell host line editing =="
 cc -Wall -Wextra -Wno-deprecated-declarations -Os \
 	-o "$tmp/fruitjam-shell" "$repo/package/fruitjam-utils/src/fruitjam-shell.c"
-python3 - "$tmp/fruitjam-shell" <<'PY'
+python3 - "$tmp/fruitjam-shell" "$tmp" <<'PY'
 import errno
 import fcntl
 import os
@@ -473,8 +473,21 @@ import sys
 import time
 
 exe = sys.argv[1]
+work = sys.argv[2]
+path_dir = os.path.join(work, "shelltab")
+os.makedirs(path_dir, exist_ok=True)
+with open(os.path.join(path_dir, "path-ok.txt"), "w", encoding="utf-8") as f:
+    f.write("PATH_TAB_OK\n")
+
 master, slave = pty.openpty()
-proc = subprocess.Popen([exe], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+proc = subprocess.Popen(
+    [exe],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    close_fds=True,
+    cwd=work,
+)
 os.close(slave)
 flags = fcntl.fcntl(master, fcntl.F_GETFL)
 fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -499,6 +512,8 @@ def read_for(seconds):
 read_for(0.5)
 os.write(master, b"ec\tTAB_OK\r")
 read_for(0.5)
+os.write(master, b"cat she\tpa\t\r")
+read_for(0.5)
 os.write(master, b"echo HIST_OK\r")
 read_for(0.5)
 os.write(master, b"\x1b[A\r")
@@ -510,7 +525,9 @@ read_for(0.5)
 proc.wait(timeout=2)
 text = out.decode("utf-8", "replace")
 if "echo TAB_OK" not in text or "TAB_OK" not in text:
-    raise SystemExit("fruitjam-shell tab completion failed")
+    raise SystemExit("fruitjam-shell command tab completion failed")
+if "cat shelltab/path-ok.txt" not in text or "PATH_TAB_OK" not in text:
+    raise SystemExit("fruitjam-shell path tab completion failed")
 if text.count("HIST_OK") < 2:
     raise SystemExit("fruitjam-shell history recall failed")
 if "history" not in text or "echo HIST_OK" not in text:

@@ -66,8 +66,8 @@ Validated on the Fruit Jam board:
 * USB CDC login shells use standalone `/usr/bin/hush`; the hardware UART uses
   `fruitjam-uart-login` to wait for Enter before execing `hush`, avoiding a
   no-MMU respawn loop when nothing is attached. Telnet sessions use the smaller
-  `/usr/bin/fruitjam-shell` command loop with small history and tab completion
-  to preserve no-MMU allocation headroom.
+  `/usr/bin/fruitjam-shell` command loop with small history and command/path
+  tab completion to preserve no-MMU allocation headroom.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps` or `netstat`, and CGI still runs after status/telnet
   checks.

@@ -81,7 +81,7 @@ The Fruit Jam target is named `adafruit_fruit_jam_rp2350`. It uses:
   no-MMU respawn loop when nothing is attached to GPIO8/GPIO9. Telnet uses a
   tiny `fruitjam-telnetd` plus `/usr/bin/fruitjam-shell` so remote login does
   not require a large shell allocation, with a four-entry command history and
-  command-name tab completion for telnet sessions.
+  command/path tab completion for telnet sessions.
 * Berry installed as `/usr/bin/berry`, including `-e`, script execution, and REPL.
 * BusyBox `vi`.
 * PIO-backed `/dev/neopixels` for the five onboard NeoPixels, plus
@@ -222,7 +222,7 @@ process size and memory fragmentation matter.
 | --- | --- |
 | `fruitjam-services` | Start, stop, restart, and inspect Fruit Jam services without large `ps`/`netstat` helpers. |
 | `fruitjam-telnetd` | Tiny TCP/23 telnet shell service. |
-| `fruitjam-shell` | Tiny command shell used by telnet sessions, with recent command history and command-name tab completion. |
+| `fruitjam-shell` | Tiny command shell used by telnet sessions, with recent command history and command/path tab completion. |
 | `fruitjam-ftpd` | Tiny FTP server rooted at `/mnt/sd`, with passive and active data modes for loopback service tests. |
 | BusyBox `httpd` | Local web server and CGI runner under `/www`. |
 | `/cgi-bin/fruitjam.cgi` | JSON hardware playground API using direct C/tiny-helper hardware actions, bounded USB keyboard probes, plus an explicit Berry runner. |
@@ -420,8 +420,8 @@ UART, or telnet. They cover the features that have been brought up so far.
 
    Expected output includes `Fruit Jam telnet shell` and `TELNET_OK`.
    Interactive telnet sessions also support up/down history recall and tab
-   completion for builtins and commands in `/bin`, `/usr/bin`, `/sbin`, and
-   `/usr/sbin`.
+   completion for builtins, commands in `/bin`, `/usr/bin`, `/sbin`, and
+   `/usr/sbin`, plus filesystem paths in command arguments.
 
 10. Check the FTP control path:
 

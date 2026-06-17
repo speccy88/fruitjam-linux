@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -116,6 +117,32 @@ static void note_completion_match(const char *name, const char *prefix,
 	(*matches)++;
 }
 
+static int path_is_dir(const char *path)
+{
+	struct stat st;
+
+	return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void note_path_match(const char *dir_prefix, const char *name,
+			    const char *token, char *common,
+			    size_t common_size, int *matches)
+{
+	char candidate[LINE_SIZE];
+	size_t len;
+	int ret;
+
+	ret = snprintf(candidate, sizeof(candidate), "%s%s", dir_prefix, name);
+	if (ret <= 0 || (size_t)ret >= sizeof(candidate))
+		return;
+	len = (size_t)ret;
+	if (path_is_dir(candidate) && len + 1 < sizeof(candidate)) {
+		candidate[len++] = '/';
+		candidate[len] = '\0';
+	}
+	note_completion_match(candidate, token, common, common_size, matches);
+}
+
 static int complete_command(char *line, size_t *len, size_t line_size)
 {
 	char prefix[64];
@@ -167,6 +194,98 @@ static int complete_command(char *line, size_t *len, size_t line_size)
 		putchar('\a');
 	fflush(stdout);
 	return 1;
+}
+
+static int complete_path(char *line, size_t *len, size_t line_size,
+			 size_t token_start)
+{
+	char token[LINE_SIZE];
+	char dir[LINE_SIZE];
+	char dir_prefix[LINE_SIZE];
+	char common[LINE_SIZE];
+	const char *name_prefix;
+	char *slash;
+	DIR *dh;
+	struct dirent *de;
+	size_t token_len = *len - token_start;
+	int matches = 0;
+
+	if (token_len >= sizeof(token)) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	memcpy(token, line + token_start, token_len);
+	token[token_len] = '\0';
+
+	slash = strrchr(token, '/');
+	if (slash) {
+		size_t prefix_len = (size_t)(slash - token) + 1;
+
+		if (prefix_len >= sizeof(dir_prefix)) {
+			putchar('\a');
+			fflush(stdout);
+			return 0;
+		}
+		memcpy(dir_prefix, token, prefix_len);
+		dir_prefix[prefix_len] = '\0';
+		if (prefix_len == 1 && token[0] == '/') {
+			snprintf(dir, sizeof(dir), "/");
+		} else {
+			memcpy(dir, token, prefix_len - 1);
+			dir[prefix_len - 1] = '\0';
+		}
+		name_prefix = slash + 1;
+	} else {
+		snprintf(dir, sizeof(dir), ".");
+		dir_prefix[0] = '\0';
+		name_prefix = token;
+	}
+
+	dh = opendir(dir);
+	if (!dh) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	common[0] = '\0';
+	while ((de = readdir(dh))) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		if (strncmp(de->d_name, name_prefix, strlen(name_prefix)))
+			continue;
+		note_path_match(dir_prefix, de->d_name, token, common,
+				sizeof(common), &matches);
+	}
+	closedir(dh);
+
+	if (matches == 0) {
+		putchar('\a');
+		fflush(stdout);
+		return 0;
+	}
+	if (strlen(common) > token_len)
+		append_text(line, len, line_size, common + token_len);
+	if (matches == 1 && *len > 0 && line[*len - 1] != '/' &&
+	    *len + 1 < line_size)
+		append_text(line, len, line_size, " ");
+	else if (matches > 1 && strlen(common) == token_len)
+		putchar('\a');
+	fflush(stdout);
+	return 1;
+}
+
+static int complete_line(char *line, size_t *len, size_t line_size)
+{
+	size_t token_start = *len;
+
+	while (token_start > 0 &&
+	       line[token_start - 1] != ' ' &&
+	       line[token_start - 1] != '\t')
+		token_start--;
+	if (token_start == 0)
+		return complete_command(line, len, line_size);
+	return complete_path(line, len, line_size, token_start);
 }
 
 static void add_history(char history[HISTORY_DEPTH][LINE_SIZE],
@@ -267,7 +386,7 @@ static int read_interactive_line(char *line, size_t line_size,
 			continue;
 		}
 		if (c == '\t') {
-			complete_command(line, &len, line_size);
+			complete_line(line, &len, line_size);
 			history_pos = history_count;
 			continue;
 		}
@@ -407,7 +526,7 @@ int main(void)
 		if (!strcmp(argv[0], "?") || !strcmp(argv[0], "help")) {
 			puts("builtins: cd echo exit help history status");
 			puts("simple commands are searched in /bin /usr/bin /sbin /usr/sbin");
-			puts("line editing: up/down history, tab command completion");
+			puts("line editing: up/down history, tab command/path completion");
 			last_status = 0;
 			continue;
 		}

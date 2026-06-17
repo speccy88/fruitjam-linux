@@ -21,6 +21,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -158,6 +159,18 @@ static const char *const berry_scripts[] = {
 #define TELNET_WILL 251u
 #define TELNET_SB 250u
 #define TELNET_SE 240u
+#define TELNET_OPT_ECHO 1u
+#define TELNET_OPT_SGA 3u
+#define TELNET_OPT_NAWS 31u
+#ifndef TIOCGPTN
+#define TIOCGPTN 0x80045430
+#endif
+#ifndef TIOCSPTLCK
+#define TIOCSPTLCK 0x40045431
+#endif
+#ifndef TIOCSCTTY
+#define TIOCSCTTY 0x540E
+#endif
 
 #define WL_IDLE_STATUS 0
 #define WL_NO_SSID_AVAIL 1
@@ -1674,10 +1687,85 @@ static int spawn_shell(const char *shell, int *in_fd, int *out_fd, pid_t *pid)
 	return 0;
 }
 
+static int spawn_shell_pty(const char *shell, int *master_fd, pid_t *pid)
+{
+    int master;
+    int unlock = 0;
+    int ptn = 0;
+    char slave_name[32];
+    pid_t child;
+
+    master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    if (master < 0) {
+        perror("airliftctl: open ptmx");
+        return -1;
+    }
+    if (ioctl(master, TIOCSPTLCK, &unlock) < 0 ||
+        ioctl(master, TIOCGPTN, &ptn) < 0) {
+        perror("airliftctl: pty setup");
+        close(master);
+        return -1;
+    }
+    snprintf(slave_name, sizeof(slave_name), "/dev/pts/%d", ptn);
+
+    child = vfork();
+    if (child < 0) {
+        perror("airliftctl: vfork");
+        close(master);
+        return -1;
+    }
+    if (child == 0) {
+        static char *const envp[] = {
+            "TERM=vt100",
+            "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+            "HOME=/root",
+            NULL
+        };
+        int s;
+
+        setsid();
+        s = open(slave_name, O_RDWR);
+        if (s < 0)
+            _exit(127);
+        ioctl(s, TIOCSCTTY, 0);
+        dup2(s, STDIN_FILENO);
+        dup2(s, STDOUT_FILENO);
+        dup2(s, STDERR_FILENO);
+        if (s > STDERR_FILENO)
+            close(s);
+        close(master);
+        execle(shell, shell, (char *)NULL, envp);
+        _exit(127);
+    }
+
+    set_nonblock(master);
+    *master_fd = master;
+    *pid = child;
+    return 0;
+}
+
+static void telnet_send_negotiation(struct airlift *air, uint8_t sock)
+{
+    static const uint8_t nego[] = {
+        TELNET_IAC, TELNET_WILL, TELNET_OPT_ECHO,
+        TELNET_IAC, TELNET_WILL, TELNET_OPT_SGA,
+        TELNET_IAC, TELNET_DO,   TELNET_OPT_NAWS,
+    };
+
+    tcp_send(air, sock, nego, sizeof(nego));
+    tcp_check_sent(air, sock);
+}
+
 static int telnet_reply_option(struct airlift *air, uint8_t sock, uint8_t cmd,
 			       uint8_t opt)
 {
 	uint8_t resp[3];
+
+	if ((cmd == TELNET_DO || cmd == TELNET_DONT) &&
+	    (opt == TELNET_OPT_ECHO || opt == TELNET_OPT_SGA))
+		return 0;
+	if ((cmd == TELNET_WILL || cmd == TELNET_WONT) && opt == TELNET_OPT_NAWS)
+		return 0;
 
 	resp[0] = TELNET_IAC;
 	resp[1] = (cmd == TELNET_DO || cmd == TELNET_DONT) ? TELNET_WONT : TELNET_DONT;
@@ -1722,6 +1810,8 @@ static int write_telnet_payload(struct airlift *air, uint8_t sock, int fd,
 		uint8_t c = buf[i];
 
 		if (c != TELNET_IAC) {
+			if (c == 0)
+				continue;  /* drop telnet CR-NUL filler */
 			out[out_len++] = c;
 			if (out_len == sizeof(out)) {
 				if (write_child_payload(fd, out, out_len) < 0)
@@ -1750,14 +1840,36 @@ static int write_telnet_payload(struct airlift *air, uint8_t sock, int fd,
 			telnet_reply_option(air, sock, c, buf[i]);
 			continue;
 		}
-		if (c == TELNET_SB) {
-			while (++i < len) {
-				if (buf[i] == TELNET_IAC && i + 1 < len && buf[i + 1] == TELNET_SE) {
-					i++;
-					break;
-				}
-			}
-		}
+        if (c == TELNET_SB) {
+            uint8_t sbopt = (++i < len) ? buf[i] : 0;
+            uint8_t sub[8];
+            size_t sn = 0;
+
+            while (++i < len) {
+                if (buf[i] == TELNET_IAC) {
+                    if (i + 1 < len && buf[i + 1] == TELNET_IAC) {
+                        if (sn < sizeof(sub))
+                            sub[sn++] = TELNET_IAC;
+                        i++;
+                        continue;
+                    }
+                    if (i + 1 < len && buf[i + 1] == TELNET_SE)
+                        i++;
+                    break;
+                }
+                if (sn < sizeof(sub))
+                    sub[sn++] = buf[i];
+            }
+            if (sbopt == TELNET_OPT_NAWS && sn >= 4) {
+                struct winsize ws;
+
+                memset(&ws, 0, sizeof(ws));
+                ws.ws_col = (uint16_t)((sub[0] << 8) | sub[1]);
+                ws.ws_row = (uint16_t)((sub[2] << 8) | sub[3]);
+                if (ws.ws_col && ws.ws_row)
+                    ioctl(fd, TIOCSWINSZ, &ws);
+            }
+        }
 	}
 	if (out_len && write_child_payload(fd, out, out_len) < 0)
 		return -1;
@@ -1803,7 +1915,7 @@ static void telnet_session_close(struct airlift *air, struct telnet_session *ses
 {
 	if (session->child_in >= 0)
 		close(session->child_in);
-	if (session->child_out >= 0)
+	if (session->child_out >= 0 && session->child_out != session->child_in)
 		close(session->child_out);
 	if (session->child_alive) {
 		kill(session->pid, SIGTERM);
@@ -1817,9 +1929,13 @@ static void telnet_session_close(struct airlift *air, struct telnet_session *ses
 static int telnet_session_start(struct telnet_session *session, uint8_t sock,
 				const char *shell)
 {
+	int master;
+
 	telnet_session_init(session);
-	if (spawn_shell(shell, &session->child_in, &session->child_out, &session->pid) < 0)
+	if (spawn_shell_pty(shell, &master, &session->pid) < 0)
 		return -1;
+	session->child_in = master;
+	session->child_out = master;
 	session->sock = sock;
 	session->child_alive = 1;
 	session->idle_ms = env_ms("AIRLIFT_TELNET_IDLE_MS", AIRLIFT_SHELL_IDLE_MS, 60000L);
@@ -4688,6 +4804,8 @@ static int serve_inbound(struct airlift *air)
 				tcp_send_fmt(air, client_sock,
 					     "Fruit Jam telnet shell failed to start\r\n");
 				tcp_close_client(air, client_sock);
+			} else {
+				telnet_send_negotiation(air, client_sock);
 			}
 		}
 

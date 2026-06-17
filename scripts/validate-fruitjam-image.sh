@@ -48,6 +48,7 @@ required = [
     "./usr/bin/mosquitto_pub",
     "./usr/bin/mosquitto_sub",
     "./usr/bin/wget",
+    "./usr/sbin/fruitjam-ftpd",
     "./usr/sbin/fruitjam-telnetd",
     "./www/cgi-bin/env.cgi",
     "./www/cgi-bin/fruitjam.cgi",
@@ -206,6 +207,11 @@ with tarfile.open(rootfs) as tf:
     for needle in (b"mqtt-sub", b"mqtt-pub", b"USERNAME PASSWORD"):
         if needle not in airliftctl:
             raise SystemExit(f"airliftctl missing marker {needle!r}")
+
+    ftpd = read_bytes(tf, "./usr/sbin/fruitjam-ftpd")
+    for needle in (b"EPSV", b"EPRT", b"PORT", b"APPE", b"RNFR"):
+        if needle not in ftpd:
+            raise SystemExit(f"fruitjam-ftpd missing marker {needle!r}")
 
     telnetd = read_bytes(tf, "./usr/sbin/fruitjam-telnetd")
     if len(telnetd) < 4096 or not telnetd.startswith(b"bFLT"):

@@ -142,8 +142,9 @@ Validated on hardware:
   without spawning `ps`/`netstat`, avoiding the no-MMU fragmentation regression
   that previously broke CGI after status checks.
 * AirLift inbound passive FTP lists, uploads, and downloads files under
-  `/mnt/sd`. The optional loopback core service set also includes tiny FTP and
-  TFTP daemons for target-side smoke tests.
+  `/mnt/sd`. The optional loopback core service set also includes tiny FTP with
+  PASV/EPSV and PORT/EPRT data modes plus TFTP daemons for target-side smoke
+  tests.
 * `/proc/partitions` reports `mmcblk0` and `mmcblk0p1`; `/mnt/sd` is VFAT,
   writable, unmountable, and remountable.
 * Synthetic button events written to `/run/fruitjam-buttons.fifo` are logged to
@@ -203,7 +204,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | ESP32-C6 AirLift | SPI GPIO28/30/31/46, READY GPIO3, IRQ GPIO23, reset GPIO22 | Partial | NINA firmware `3.3.0`; `airliftctl` can probe, scan, join WiFi, TCP GET, MQTT publish, and serve inbound HTTP/telnet/FTP. | Not a Linux `wlan0` interface yet; normal `wget` still only uses Linux sockets. |
 | HTTP user pages and playground | AirLift TCP/80; optional loopback HTTP | Supported | `/` serves `/mnt/sd/www/index.html`; `/playground` serves the built-in hardware UI; `/cgi-bin/fruitjam.cgi` reports status and controls NeoPixels, RTTTL, WAVs, I2C, ADC, DVI, USB-host status plus bounded keyboard probes, buttons, built-in Berry examples, and user Berry files from `/mnt/sd/berry`. Hardware actions use direct C/tiny-helper paths. | Use `http://<board-ip>/playground` after AirLift joins WiFi, or `fruitjam-services core` for loopback tests. |
 | Telnet service | AirLift TCP/23; optional loopback TCP/23 | Supported | AirLift inbound shell and tiny `fruitjam-telnetd`/`fruitjam-shell`; telnet smoke tests pass. | Only one AirLift telnet session at a time. |
-| FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | Passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. | Upload completion can be slow over the current NINA raw socket path; active FTP remains a future objective. |
+| FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | AirLift passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. The optional loopback `fruitjam-ftpd` supports PASV/EPSV and PORT/EPRT, plus STOR/APPE/RETR/LIST/NLST/RNFR/RNTO/MKD/RMD/DELE. | Upload completion can be slow over the current NINA raw socket path. |
 | TFTP service | Optional loopback UDP/69 | Supported | BusyBox `tftpd` serves the TFTP area README when `fruitjam-services core` is started. | Not part of the default external AirLift service set. |
 | USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state, bus-reset timing, PIO2 packet I/O, descriptor/HID decode diagnostics, parameterized `kbd-init`/`kbd-poll` boot-keyboard probes, bounded `kbd-find` target auto-scan, `kbd-text`/`kbd-events` polling loops, and `kbd-shell`/`kbd-auto-shell` for a tiny USB-keyboard-driven command loop. This is not a hub/composite/general USB stack. | Run `./scripts/cdc-smoke-test.py --usb-keyboard --usb-keyboard-require-input` on the current board, then decide whether to keep this as an explicit helper or integrate a broader console path. |
 | USB host 5V switch | GPIO11 | Partial | `fruitjamctl usb-power on/off` controls power enable. | Needs full USB host stack for devices. |
@@ -222,7 +223,7 @@ process size and memory fragmentation matter.
 | `fruitjam-services` | Start, stop, restart, and inspect Fruit Jam services without large `ps`/`netstat` helpers. |
 | `fruitjam-telnetd` | Tiny TCP/23 telnet shell service. |
 | `fruitjam-shell` | Tiny command shell used by telnet sessions, with recent command history and command-name tab completion. |
-| `fruitjam-ftpd` | Tiny FTP server rooted at `/mnt/sd`, so `/wavs` is visible to FTP clients. |
+| `fruitjam-ftpd` | Tiny FTP server rooted at `/mnt/sd`, with passive and active data modes for loopback service tests. |
 | BusyBox `httpd` | Local web server and CGI runner under `/www`. |
 | `/cgi-bin/fruitjam.cgi` | JSON hardware playground API using direct C/tiny-helper hardware actions, bounded USB keyboard probes, plus an explicit Berry runner. |
 | BusyBox `tftpd` | TFTP server rooted at `/tmp/tftp`. |
@@ -284,6 +285,17 @@ loops, and the `kbd-auto-shell` helper shell. Add
 you want captured text/events plus a typed `echo USBKBD_SMOKE` shell command to
 be required. Use `--skip-airlift` or `--skip-services` to narrow the suite
 during bring-up.
+
+For the USB-host keyboard milestone alone, the focused runner can use either the
+CDC shell or the AirLift telnet shell:
+
+```sh
+./scripts/usbhost-keyboard-smoke.py --transport cdc --port /dev/tty.usbmodem1101 --require-input
+./scripts/usbhost-keyboard-smoke.py --transport telnet --telnet-host <board-ip> --require-input
+```
+
+This proves the current narrow boot-protocol keyboard path: `kbd-find`, the
+Berry helper, live text/events, and a typed command in `kbd-auto-shell`.
 
 Recent release-prep verification on June 12, 2026:
 

@@ -61,7 +61,8 @@ Validated on the Fruit Jam board:
   the ESP32-C6 when WiFi is configured, plus the `fruitjam-buttons` daemon.
   The loopback `fruitjam-services core` set starts `fruitjam-httpd`,
   `fruitjam-telnetd`, `fruitjam-ftpd`, and TFTP on demand for target-side smoke
-  tests.
+  tests; the tiny loopback FTP daemon supports PASV/EPSV and PORT/EPRT data
+  modes.
 * USB CDC login shells use standalone `/usr/bin/hush`; the hardware UART uses
   `fruitjam-uart-login` to wait for Enter before execing `hush`, avoiding a
   no-MMU respawn loop when nothing is attached. Telnet sessions use the smaller

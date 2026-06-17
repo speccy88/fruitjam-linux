@@ -26,9 +26,19 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef FTP_ROOT
 #define FTP_ROOT "/mnt/sd"
+#endif
+#ifndef FTP_PORT
 #define FTP_PORT 21
+#endif
 #define FTP_CONTROL_IDLE_SECONDS 10
+
+struct ftp_data_state {
+	int pasv_fd;
+	int have_active;
+	struct sockaddr_in active_addr;
+};
 
 static int reply(FILE *ctrl, int code, const char *fmt, ...)
 {
@@ -197,7 +207,137 @@ static int open_listener(uint16_t port)
 	return fd;
 }
 
-static int start_passive(FILE *ctrl, int ctrl_fd, int *pasv_fd)
+static void data_clear(struct ftp_data_state *data)
+{
+	if (data->pasv_fd >= 0) {
+		close(data->pasv_fd);
+		data->pasv_fd = -1;
+	}
+	data->have_active = 0;
+	memset(&data->active_addr, 0, sizeof(data->active_addr));
+}
+
+static void data_init(struct ftp_data_state *data)
+{
+	data->pasv_fd = -1;
+	data->have_active = 0;
+	memset(&data->active_addr, 0, sizeof(data->active_addr));
+}
+
+static int parse_u8(const char *s, char **end, unsigned int *value)
+{
+	unsigned long parsed;
+
+	if (!isdigit((unsigned char)*s))
+		return -1;
+	errno = 0;
+	parsed = strtoul(s, end, 10);
+	if (errno || parsed > 255)
+		return -1;
+	*value = (unsigned int)parsed;
+	return 0;
+}
+
+static int parse_port_arg(const char *arg, struct sockaddr_in *addr)
+{
+	unsigned int v[6];
+	char *end;
+	int i;
+
+	memset(addr, 0, sizeof(*addr));
+	for (i = 0; i < 6; i++) {
+		if (parse_u8(arg, &end, &v[i]) < 0)
+			return -1;
+		if (i < 5) {
+			if (*end != ',')
+				return -1;
+			arg = end + 1;
+		} else if (*end) {
+			return -1;
+		}
+	}
+
+	addr->sin_family = AF_INET;
+	addr->sin_addr.s_addr = htonl((v[0] << 24) | (v[1] << 16) |
+				      (v[2] << 8) | v[3]);
+	addr->sin_port = htons((uint16_t)((v[4] << 8) | v[5]));
+	return ntohs(addr->sin_port) ? 0 : -1;
+}
+
+static int parse_ipv4(const char *s, uint32_t *ip)
+{
+	unsigned int v[4];
+	char *end;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		if (parse_u8(s, &end, &v[i]) < 0)
+			return -1;
+		if (i < 3) {
+			if (*end != '.')
+				return -1;
+			s = end + 1;
+		} else if (*end) {
+			return -1;
+		}
+	}
+	*ip = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+	return 0;
+}
+
+static int parse_eprt_arg(const char *arg, struct sockaddr_in *addr)
+{
+	char delim;
+	char *proto_end;
+	char *addr_end;
+	char *port_end;
+	unsigned long port;
+	uint32_t ip;
+
+	memset(addr, 0, sizeof(*addr));
+	if (!arg || !*arg)
+		return -1;
+	delim = *arg++;
+	if (!delim)
+		return -1;
+	if (strncmp(arg, "1", 1) || arg[1] != delim)
+		return -1;
+	arg += 2;
+	proto_end = strchr(arg, delim);
+	if (!proto_end)
+		return -1;
+	*proto_end = '\0';
+	if (parse_ipv4(arg, &ip) < 0)
+		return -1;
+	arg = proto_end + 1;
+	addr_end = strchr(arg, delim);
+	if (!addr_end)
+		return -1;
+	*addr_end = '\0';
+	errno = 0;
+	port = strtoul(arg, &port_end, 10);
+	if (errno || *port_end || port == 0 || port > 65535)
+		return -1;
+	if (addr_end[1] != '\0')
+		return -1;
+
+	addr->sin_family = AF_INET;
+	addr->sin_addr.s_addr = htonl(ip);
+	addr->sin_port = htons((uint16_t)port);
+	return 0;
+}
+
+static int start_active(FILE *ctrl, struct ftp_data_state *data,
+			const struct sockaddr_in *addr, const char *name)
+{
+	data_clear(data);
+	data->active_addr = *addr;
+	data->have_active = 1;
+	return reply(ctrl, 200, "%s command successful", name);
+}
+
+static int start_passive(FILE *ctrl, int ctrl_fd, struct ftp_data_state *data,
+			 int extended)
 {
 	struct sockaddr_in local;
 	struct sockaddr_in data_addr;
@@ -206,10 +346,7 @@ static int start_passive(FILE *ctrl, int ctrl_fd, int *pasv_fd)
 	uint16_t port;
 	int fd;
 
-	if (*pasv_fd >= 0) {
-		close(*pasv_fd);
-		*pasv_fd = -1;
-	}
+	data_clear(data);
 
 	fd = open_listener(0);
 	if (fd < 0)
@@ -229,35 +366,65 @@ static int start_passive(FILE *ctrl, int ctrl_fd, int *pasv_fd)
 
 	ip = ntohl(local.sin_addr.s_addr);
 	port = ntohs(data_addr.sin_port);
-	*pasv_fd = fd;
+	data->pasv_fd = fd;
+	if (extended)
+		return reply(ctrl, 229, "Entering Extended Passive Mode (|||%u|)",
+			     port);
 	return reply(ctrl, 227, "Entering Passive Mode (%u,%u,%u,%u,%u,%u)",
 		     (ip >> 24) & 0xff, (ip >> 16) & 0xff,
 		     (ip >> 8) & 0xff, ip & 0xff, port >> 8, port & 0xff);
 }
 
-static int accept_data(FILE *ctrl, int *pasv_fd)
+static int accept_data(FILE *ctrl, struct ftp_data_state *data)
 {
 	int fd;
 
-	if (*pasv_fd < 0) {
-		reply(ctrl, 425, "Use PASV first");
+	if (data->have_active) {
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (fd < 0) {
+			reply(ctrl, 425, "Cannot open active socket");
+			data_clear(data);
+			return -1;
+		}
+		if (connect(fd, (struct sockaddr *)&data->active_addr,
+			    sizeof(data->active_addr)) < 0) {
+			close(fd);
+			reply(ctrl, 425, "Active data connection failed");
+			data_clear(data);
+			return -1;
+		}
+		data_clear(data);
+		return fd;
+	}
+
+	if (data->pasv_fd < 0) {
+		reply(ctrl, 425, "Use PASV/EPSV or PORT/EPRT first");
 		return -1;
 	}
-	fd = accept(*pasv_fd, NULL, NULL);
-	close(*pasv_fd);
-	*pasv_fd = -1;
+	fd = accept(data->pasv_fd, NULL, NULL);
+	close(data->pasv_fd);
+	data->pasv_fd = -1;
 	if (fd < 0)
 		reply(ctrl, 425, "Data connection failed");
 	return fd;
 }
 
-static void do_list(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
+static void do_list(FILE *ctrl, struct ftp_data_state *data_state,
+		    const char *cwd, const char *arg, int names_only)
 {
 	char path[160];
 	char virt[128];
 	DIR *dir;
 	struct dirent *de;
 	int data;
+
+	while (arg[0] == '-') {
+		arg = strchr(arg, ' ');
+		if (!arg)
+			arg = "";
+		while (*arg == ' ')
+			arg++;
+	}
 
 	if (path_from_cwd(cwd, *arg ? arg : ".", virt, sizeof(virt),
 			  path, sizeof(path)) < 0) {
@@ -270,7 +437,7 @@ static void do_list(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 		return;
 	}
 	reply(ctrl, 150, "Opening data connection");
-	data = accept_data(ctrl, pasv_fd);
+	data = accept_data(ctrl, data_state);
 	if (data >= 0) {
 		while ((de = readdir(dir)) != NULL) {
 			char child[192];
@@ -286,6 +453,10 @@ static void do_list(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 			if (n <= 0 || (size_t)n >= sizeof(child))
 				continue;
 			have_st = stat(child, &st) == 0;
+			if (names_only) {
+				dprintf(data, "%s\r\n", de->d_name);
+				continue;
+			}
 			if (have_st && S_ISDIR(st.st_mode))
 				perms = "drwxr-xr-x";
 			ftp_format_list_date(have_st ? st.st_mtime : 0, date, sizeof(date));
@@ -300,7 +471,8 @@ static void do_list(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 	closedir(dir);
 }
 
-static void do_retr(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
+static void do_retr(FILE *ctrl, struct ftp_data_state *data_state,
+		    const char *cwd, const char *arg)
 {
 	char path[160];
 	char virt[128];
@@ -320,7 +492,7 @@ static void do_retr(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 		return;
 	}
 	reply(ctrl, 150, "Opening data connection");
-	data = accept_data(ctrl, pasv_fd);
+	data = accept_data(ctrl, data_state);
 	if (data >= 0) {
 		while ((len = read(file, buf, sizeof(buf))) > 0)
 			write(data, buf, (size_t)len);
@@ -330,7 +502,8 @@ static void do_retr(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 	close(file);
 }
 
-static void do_stor(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
+static void do_stor(FILE *ctrl, struct ftp_data_state *data_state,
+		    const char *cwd, const char *arg, int append)
 {
 	char path[160];
 	char virt[128];
@@ -344,13 +517,14 @@ static void do_stor(FILE *ctrl, int *pasv_fd, const char *cwd, const char *arg)
 		reply(ctrl, 550, "Bad path");
 		return;
 	}
-	file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	file = open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC),
+		    0644);
 	if (file < 0) {
 		reply(ctrl, 550, "Cannot create file");
 		return;
 	}
 	reply(ctrl, 150, "Opening data connection");
-	data = accept_data(ctrl, pasv_fd);
+	data = accept_data(ctrl, data_state);
 	if (data >= 0) {
 		while ((len = read(data, buf, sizeof(buf))) > 0)
 			write(file, buf, (size_t)len);
@@ -430,14 +604,32 @@ static void do_mkd(FILE *ctrl, const char *cwd, const char *arg)
 		reply(ctrl, 257, "\"%s\" created", virt);
 }
 
+static void do_rmd(FILE *ctrl, const char *cwd, const char *arg)
+{
+	char path[160];
+	char virt[128];
+
+	if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+				   path, sizeof(path)) < 0) {
+		reply(ctrl, 501, "Bad directory");
+		return;
+	}
+	if (rmdir(path) < 0)
+		reply(ctrl, 550, "Remove directory failed");
+	else
+		reply(ctrl, 250, "Directory removed");
+}
+
 static void serve_client(int fd)
 {
 	struct timeval timeout = { FTP_CONTROL_IDLE_SECONDS, 0 };
 	FILE *ctrl = fdopen(fd, "r+");
 	char line[160];
 	char cwd[128] = "/";
-	int pasv_fd = -1;
+	char rename_from[160] = "";
+	struct ftp_data_state data;
 
+	data_init(&data);
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 	if (!ctrl) {
 		close(fd);
@@ -460,7 +652,10 @@ static void serve_client(int fd)
 		} else if (!strcasecmp(line, "FEAT")) {
 			fprintf(ctrl,
 				"211-Features\r\n"
+				" EPSV\r\n"
 				" PASV\r\n"
+				" EPRT\r\n"
+				" PORT\r\n"
 				" SIZE\r\n"
 				" MDTM\r\n"
 				" UTF8\r\n"
@@ -486,21 +681,47 @@ static void serve_client(int fd)
 			}
 		} else if (!strcasecmp(line, "TYPE")) {
 			reply(ctrl, 200, "Type set");
+		} else if (!strcasecmp(line, "MODE") ||
+			   !strcasecmp(line, "STRU")) {
+			reply(ctrl, 200, "OK");
 		} else if (!strcasecmp(line, "NOOP")) {
 			reply(ctrl, 200, "OK");
+		} else if (!strcasecmp(line, "ALLO")) {
+			reply(ctrl, 202, "No storage allocation needed");
+		} else if (!strcasecmp(line, "REST")) {
+			if (!*arg || !strcmp(arg, "0"))
+				reply(ctrl, 350, "Restarting at 0");
+			else
+				reply(ctrl, 502, "Restart offsets are not supported");
 		} else if (!strcasecmp(line, "OPTS")) {
 			if (!strncasecmp(arg, "UTF8", 4))
 				reply(ctrl, 200, "UTF8 mode enabled");
 			else
 				reply(ctrl, 502, "Option not implemented");
+		} else if (!strcasecmp(line, "PORT")) {
+			struct sockaddr_in active;
+
+			if (parse_port_arg(arg, &active) < 0)
+				reply(ctrl, 501, "Bad PORT");
+			else
+				start_active(ctrl, &data, &active, "PORT");
+		} else if (!strcasecmp(line, "EPRT")) {
+			struct sockaddr_in active;
+
+			if (parse_eprt_arg(arg, &active) < 0)
+				reply(ctrl, 501, "Bad EPRT");
+			else
+				start_active(ctrl, &data, &active, "EPRT");
 		} else if (!strcasecmp(line, "PASV")) {
-			start_passive(ctrl, fd, &pasv_fd);
+			start_passive(ctrl, fd, &data, 0);
+		} else if (!strcasecmp(line, "EPSV")) {
+			start_passive(ctrl, fd, &data, 1);
 		} else if (!strcasecmp(line, "LIST") || !strcasecmp(line, "NLST")) {
-			do_list(ctrl, &pasv_fd, cwd, arg);
+			do_list(ctrl, &data, cwd, arg, !strcasecmp(line, "NLST"));
 		} else if (!strcasecmp(line, "RETR")) {
-			do_retr(ctrl, &pasv_fd, cwd, arg);
-		} else if (!strcasecmp(line, "STOR")) {
-			do_stor(ctrl, &pasv_fd, cwd, arg);
+			do_retr(ctrl, &data, cwd, arg);
+		} else if (!strcasecmp(line, "STOR") || !strcasecmp(line, "APPE")) {
+			do_stor(ctrl, &data, cwd, arg, !strcasecmp(line, "APPE"));
 		} else if (!strcasecmp(line, "SIZE")) {
 			do_size(ctrl, cwd, arg);
 		} else if (!strcasecmp(line, "MDTM")) {
@@ -509,6 +730,38 @@ static void serve_client(int fd)
 			do_dele(ctrl, cwd, arg);
 		} else if (!strcasecmp(line, "MKD") || !strcasecmp(line, "XMKD")) {
 			do_mkd(ctrl, cwd, arg);
+		} else if (!strcasecmp(line, "RMD") || !strcasecmp(line, "XRMD")) {
+			do_rmd(ctrl, cwd, arg);
+		} else if (!strcasecmp(line, "RNFR")) {
+			char virt[128];
+
+			if (!*arg || path_from_cwd(cwd, arg, virt, sizeof(virt),
+						   rename_from,
+						   sizeof(rename_from)) < 0) {
+				rename_from[0] = '\0';
+				reply(ctrl, 501, "Bad filename");
+			} else if (access(rename_from, F_OK) < 0) {
+				rename_from[0] = '\0';
+				reply(ctrl, 550, "Not found");
+			} else {
+				reply(ctrl, 350, "Ready for RNTO");
+			}
+		} else if (!strcasecmp(line, "RNTO")) {
+			char virt[128];
+			char path[160];
+
+			if (!rename_from[0]) {
+				reply(ctrl, 503, "Use RNFR first");
+			} else if (!*arg ||
+				   path_from_cwd(cwd, arg, virt, sizeof(virt),
+						 path, sizeof(path)) < 0) {
+				reply(ctrl, 501, "Bad filename");
+			} else if (rename(rename_from, path) < 0) {
+				reply(ctrl, 550, "Rename failed");
+			} else {
+				rename_from[0] = '\0';
+				reply(ctrl, 250, "Renamed");
+			}
 		} else if (!strcasecmp(line, "QUIT")) {
 			reply(ctrl, 221, "Bye");
 			break;
@@ -517,8 +770,7 @@ static void serve_client(int fd)
 		}
 	}
 
-	if (pasv_fd >= 0)
-		close(pasv_fd);
+	data_clear(&data);
 	if (ferror(ctrl))
 		reply(ctrl, 421, "Control connection idle timeout");
 	fclose(ctrl);

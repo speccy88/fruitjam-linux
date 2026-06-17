@@ -14,6 +14,7 @@ dvi_src="$repo/package/fruitjam-utils/src/fruitjam-dvi.c"
 rtttl_src_c="$repo/package/fruitjam-utils/src/fruitjam-rtttl.c"
 wavplay_src="$repo/package/fruitjam-utils/src/fruitjam-wavplay.c"
 telnetd_src="$repo/package/fruitjam-utils/src/fruitjam-telnetd.c"
+ftpd_src="$repo/package/fruitjam-utils/src/fruitjam-ftpd.c"
 wget_src="$repo/package/fruitjam-utils/src/fruitjam-wget.c"
 httpd_src="$repo/package/fruitjam-utils/src/fruitjam-httpd.c"
 services_src="$repo/package/fruitjam-utils/src/fruitjam-services.c"
@@ -26,6 +27,7 @@ mosquitto_sub_src="$repo/package/fruitjam-utils/src/mosquitto_sub.c"
 uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
 cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
+usb_keyboard_smoke_src="$repo/scripts/usbhost-keyboard-smoke.py"
 bootloader_clocks_src="$repo/package/pico2-bootloader/bootloader/src/clocks.h"
 kernel_usbhost_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0020-misc-add-fruitjam-usbhost-bridge-driver.patch"
 kernel_usbhost_pio_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0021-misc-stage-fruitjam-usbhost-pio2-engine.patch"
@@ -509,6 +511,170 @@ if text.count("HIST_OK") < 2:
 if "history" not in text or "echo HIST_OK" not in text:
     raise SystemExit("fruitjam-shell history builtin failed")
 print("ok fruitjam-shell line editing")
+PY
+
+echo "== ftp daemon host behavior =="
+ftp_root="$tmp/ftp-root"
+mkdir -p "$ftp_root"
+printf 'hello ftp\n' > "$ftp_root/hello.txt"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-DFTP_ROOT="\"$ftp_root\"" \
+	-o "$tmp/fruitjam-ftpd" "$ftpd_src"
+python3 - "$tmp/fruitjam-ftpd" "$ftp_root" <<'PY'
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+exe = sys.argv[1]
+root = Path(sys.argv[2])
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+port = free_port()
+proc = subprocess.Popen([exe, str(port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def connect_control():
+    deadline = time.time() + 3
+    last = None
+    while time.time() < deadline:
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=1)
+        except OSError as exc:
+            last = exc
+            time.sleep(0.05)
+    raise RuntimeError(f"ftp control did not open: {last}")
+
+def read_reply(ctrl):
+    ctrl.settimeout(3)
+    data = bytearray()
+    while True:
+        chunk = ctrl.recv(1)
+        if not chunk:
+            raise RuntimeError("ftp control closed")
+        data.extend(chunk)
+        if data.endswith(b"\r\n"):
+            text = data.decode("utf-8", "replace")
+            if len(text) >= 4 and text[3] == "-":
+                code = text[:3] + " "
+                while code not in text.splitlines()[-1]:
+                    line = bytearray()
+                    while True:
+                        chunk = ctrl.recv(1)
+                        if not chunk:
+                            raise RuntimeError("ftp control closed in multiline reply")
+                        line.extend(chunk)
+                        if line.endswith(b"\r\n"):
+                            break
+                    text += line.decode("utf-8", "replace")
+            return text
+
+def send(ctrl, command):
+    ctrl.sendall((command + "\r\n").encode())
+    return read_reply(ctrl)
+
+def assert_code(reply, code):
+    if not reply.startswith(str(code) + " ") and not reply.startswith(str(code) + "-"):
+        raise RuntimeError(f"expected FTP {code}, got {reply!r}")
+
+def active_listener():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    return s, s.getsockname()[1]
+
+def port_arg(port):
+    return "127,0,0,1,%u,%u" % (port >> 8, port & 0xff)
+
+ctrl = None
+try:
+    ctrl = connect_control()
+    assert_code(read_reply(ctrl), 220)
+    assert_code(send(ctrl, "USER anonymous"), 331)
+    assert_code(send(ctrl, "PASS x"), 230)
+    feat = send(ctrl, "FEAT")
+    for marker in ("EPSV", "PASV", "EPRT", "PORT", "SIZE", "MDTM"):
+        if marker not in feat:
+            raise RuntimeError(f"FEAT missing {marker}: {feat!r}")
+
+    epsv = send(ctrl, "EPSV")
+    assert_code(epsv, 229)
+    match = re.search(r"\(\|\|\|([0-9]+)\|\)", epsv)
+    if not match:
+        raise RuntimeError(f"bad EPSV reply: {epsv!r}")
+    data = socket.create_connection(("127.0.0.1", int(match.group(1))), timeout=3)
+    assert_code(send(ctrl, "LIST"), 150)
+    listing = data.recv(4096).decode("utf-8", "replace")
+    data.close()
+    assert_code(read_reply(ctrl), 226)
+    if "hello.txt" not in listing:
+        raise RuntimeError(f"passive LIST missing hello.txt: {listing!r}")
+
+    listener, active_port = active_listener()
+    assert_code(send(ctrl, "PORT " + port_arg(active_port)), 200)
+    ctrl.sendall(b"STOR active.txt\r\n")
+    assert_code(read_reply(ctrl), 150)
+    conn, _ = listener.accept()
+    conn.sendall(b"active-ok")
+    conn.close()
+    listener.close()
+    assert_code(read_reply(ctrl), 226)
+    if (root / "active.txt").read_text() != "active-ok":
+        raise RuntimeError("active STOR wrote wrong data")
+
+    listener, active_port = active_listener()
+    assert_code(send(ctrl, "PORT " + port_arg(active_port)), 200)
+    ctrl.sendall(b"APPE active.txt\r\n")
+    assert_code(read_reply(ctrl), 150)
+    conn, _ = listener.accept()
+    conn.sendall(b"-append")
+    conn.close()
+    listener.close()
+    assert_code(read_reply(ctrl), 226)
+
+    listener, active_port = active_listener()
+    assert_code(send(ctrl, f"EPRT |1|127.0.0.1|{active_port}|"), 200)
+    ctrl.sendall(b"RETR active.txt\r\n")
+    assert_code(read_reply(ctrl), 150)
+    conn, _ = listener.accept()
+    got = bytearray()
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        got.extend(chunk)
+    conn.close()
+    listener.close()
+    assert_code(read_reply(ctrl), 226)
+    if got != b"active-ok-append":
+        raise RuntimeError(f"active RETR got {got!r}")
+
+    assert_code(send(ctrl, "RNFR active.txt"), 350)
+    assert_code(send(ctrl, "RNTO renamed.txt"), 250)
+    assert_code(send(ctrl, "SIZE renamed.txt"), 213)
+    assert_code(send(ctrl, "MKD tempdir"), 257)
+    assert_code(send(ctrl, "RMD tempdir"), 250)
+    assert_code(send(ctrl, "DELE renamed.txt"), 250)
+    assert_code(send(ctrl, "QUIT"), 221)
+finally:
+    if ctrl is not None:
+        ctrl.close()
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+
+print("ok fruitjam-ftpd passive and active transfers")
 PY
 
 echo "== memory helper host behavior =="
@@ -1511,6 +1677,11 @@ python3 -m py_compile "$cdc_smoke_src"
 grep -q -- '--usb-keyboard' "$cdc_smoke_src"
 grep -q -- 'usbhost_keyboard_tests' "$cdc_smoke_src"
 echo "ok cdc smoke usb keyboard guard"
+python3 -m py_compile "$usb_keyboard_smoke_src"
+"$usb_keyboard_smoke_src" --self-test --require-input >/dev/null
+grep -q -- '--transport' "$usb_keyboard_smoke_src"
+grep -q -- 'kbd-auto-shell' "$usb_keyboard_smoke_src"
+echo "ok focused usb keyboard smoke guard"
 grep -q 'ttyAMA0::respawn:/usr/bin/fruitjam-uart-login' "$inittab_src"
 if grep -q 'ttyAMA0::respawn:/usr/bin/hush' "$inittab_src"; then
 	echo "ttyAMA0 hush respawn loop was reintroduced" >&2

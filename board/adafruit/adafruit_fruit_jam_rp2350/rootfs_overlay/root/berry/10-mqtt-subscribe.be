@@ -1,28 +1,25 @@
+import sys
+import string
+
+sys.path().push("/root/berry")
+import fruitjam
+
 var out = "/tmp/fruitjam-mqtt-sub.sh"
+var result = fruitjam.mqtt_subscribe_script(out)
+assert(result["ok"])
 
-var script = "#!/bin/sh\n" +
-    "set -eu\n" +
-    ": ${MQTT_HOST:=192.0.2.10}\n" +
-    ": ${MQTT_PORT:=1883}\n" +
-    ": ${MQTT_TOPIC:=charlie/#}\n" +
-    ": ${MQTT_CLIENT_ID:=fruitjam-berry-sub}\n" +
-    ": ${MQTT_TRANSPORT:=airlift}\n" +
-    ": ${MQTT_COUNT:=1}\n" +
-    ": ${MQTT_WAIT:=30}\n" +
-    "cmd=\"mosquitto_sub\"\n" +
-    "if [ \"$MQTT_TRANSPORT\" = airlift ]; then cmd=\"$cmd --airlift\"; fi\n" +
-    "if [ -n \"${MQTT_USER:-}\" ]; then\n" +
-    "  exec $cmd -h \"$MQTT_HOST\" -p \"$MQTT_PORT\" -i \"$MQTT_CLIENT_ID\" -u \"$MQTT_USER\" -P \"${MQTT_PASSWORD:-}\" -t \"$MQTT_TOPIC\" -C \"$MQTT_COUNT\" -W \"$MQTT_WAIT\" -v\n" +
-    "else\n" +
-    "  exec $cmd -h \"$MQTT_HOST\" -p \"$MQTT_PORT\" -i \"$MQTT_CLIENT_ID\" -t \"$MQTT_TOPIC\" -C \"$MQTT_COUNT\" -W \"$MQTT_WAIT\" -v\n" +
-    "fi\n"
-
-var f = open(out, "w")
-f.write(script)
-f.close()
+var sample = fruitjam.mqtt_sub_command(
+    "broker.local", 1883, "charlie/#", "fruitjam-berry-sub",
+    "user", "", "airlift", 1, 30, true)
+assert(string.find(sample, "mosquitto_sub --airlift") == 0)
+assert(string.find(sample, "-t 'charlie/#'") >= 0)
+assert(string.find(sample, "-C '1'") >= 0)
+assert(string.find(sample, "-W '30'") >= 0)
+assert(string.find(sample, "-v") >= 0)
 
 print("Fruit Jam Berry MQTT subscribe example")
 print("wrote " + out)
+print("module command sample: " + sample)
 print("run with broker settings, for example:")
 print("MQTT_HOST=broker.local MQTT_USER=user MQTT_PASSWORD=... sh " + out)
 print("10-mqtt-subscribe.be: ok")

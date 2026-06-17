@@ -1,4 +1,5 @@
 import sys
+import string
 
 sys.path().push("/root/berry")
 import fruitjam
@@ -97,6 +98,23 @@ assert(fruitjam.dvi_command("show")["ok"])
 assert(fruitjam.read_text(fruitjam.paths["dvi"]) == "show")
 assert(!fruitjam.dvi_command("exec fruitjam-services status")["ok"])
 print("fake dvi: ok")
+
+assert(fruitjam.shell_quote("jam's") == "'jam'\\''s'")
+var pub = fruitjam.mqtt_pub_command(
+    "broker.local", 1883, "charlie/test", "hello jam",
+    "fruitjam-berry-pub", "fred", "pass word", "airlift")
+assert(string.find(pub, "mosquitto_pub --airlift") == 0)
+assert(string.find(pub, "-u 'fred'") >= 0)
+assert(string.find(pub, "-P 'pass word'") >= 0)
+assert(string.find(pub, "-m 'hello jam'") >= 0)
+var sub = fruitjam.mqtt_sub_command(
+    "broker.local", 1883, "charlie/#", "fruitjam-berry-sub",
+    "fred", "pass word", "airlift", 2, 10, true)
+assert(string.find(sub, "mosquitto_sub --airlift") == 0)
+assert(string.find(sub, "-C '2'") >= 0)
+assert(string.find(sub, "-W '10'") >= 0)
+assert(string.find(sub, "-v") >= 0)
+print("fake mqtt helpers: ok")
 
 var neo = fruitjam.neopixel_pixels([
     [-1, 0, 999],

@@ -102,9 +102,21 @@ with tarfile.open(rootfs) as tf:
         '"pio_ready"',
         '"last_rx_hex"',
         '"probe_summary"',
+        "mqtt_pub_command",
+        "mqtt_sub_command",
+        "mqtt_publish_script",
+        "mqtt_subscribe_script",
     ):
         if needle not in fruitjam_be:
             raise SystemExit(f"fruitjam.be missing {needle!r}")
+    for name, needles in (
+        ("./root/berry/09-mqtt-publish.be", ("mqtt_publish_script", "mqtt_pub_command")),
+        ("./root/berry/10-mqtt-subscribe.be", ("mqtt_subscribe_script", "mqtt_sub_command")),
+    ):
+        example = read_text(tf, name)
+        for needle in needles:
+            if needle not in example:
+                raise SystemExit(f"{name} missing {needle!r}")
 
     sh_run_all = read_text(tf, "./root/sh/run-all.sh")
     if "15-wav-analyze.sh" not in sh_run_all:

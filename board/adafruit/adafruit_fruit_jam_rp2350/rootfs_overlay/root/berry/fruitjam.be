@@ -2,6 +2,7 @@ var fruitjam = module("fruitjam")
 
 import time
 import string
+import os
 
 fruitjam.paths = {
     "neopixels": "/dev/neopixels",
@@ -146,6 +147,10 @@ fruitjam.write_text = def(path, text)
     var f = open(path, "w")
     f.write(text)
     f.close()
+end
+
+fruitjam.shell_quote = def(value)
+    return "'" + string.replace(str(value), "'", "'\\''") + "'"
 end
 
 fruitjam.int_or = def(value, fallback)
@@ -587,6 +592,107 @@ fruitjam.dvi_command = def(command)
     except .. as e, m
         return {"ok": false, "command": command, "error": str(e) + ": " + str(m)}
     end
+end
+
+fruitjam.mqtt_transport_flag = def(transport)
+    if transport == "airlift"
+        return " --airlift"
+    end
+    return ""
+end
+
+fruitjam.mqtt_auth_args = def(username, password)
+    if username != nil && username != ""
+        var pass = ""
+        if password != nil
+            pass = password
+        end
+        return " -u " + fruitjam.shell_quote(username) +
+               " -P " + fruitjam.shell_quote(pass)
+    end
+    return ""
+end
+
+fruitjam.mqtt_pub_command = def(host, port, topic, message, client_id, username, password, transport)
+    return "mosquitto_pub" + fruitjam.mqtt_transport_flag(transport) +
+           " -h " + fruitjam.shell_quote(host) +
+           " -p " + fruitjam.shell_quote(port) +
+           " -i " + fruitjam.shell_quote(client_id) +
+           fruitjam.mqtt_auth_args(username, password) +
+           " -t " + fruitjam.shell_quote(topic) +
+           " -m " + fruitjam.shell_quote(message)
+end
+
+fruitjam.mqtt_sub_command = def(host, port, topic, client_id, username, password, transport, count, wait, verbose)
+    var cmd = "mosquitto_sub" + fruitjam.mqtt_transport_flag(transport) +
+        " -h " + fruitjam.shell_quote(host) +
+        " -p " + fruitjam.shell_quote(port) +
+        " -i " + fruitjam.shell_quote(client_id) +
+        fruitjam.mqtt_auth_args(username, password) +
+        " -t " + fruitjam.shell_quote(topic)
+    if count != nil && count > 0
+        cmd += " -C " + fruitjam.shell_quote(count)
+    end
+    if wait != nil && wait > 0
+        cmd += " -W " + fruitjam.shell_quote(wait)
+    end
+    if verbose
+        cmd += " -v"
+    end
+    return cmd
+end
+
+fruitjam.mqtt_publish = def(host, port, topic, message, client_id, username, password, transport)
+    var cmd = fruitjam.mqtt_pub_command(host, port, topic, message, client_id, username, password, transport)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.mqtt_subscribe = def(host, port, topic, client_id, username, password, transport, count, wait, verbose)
+    var cmd = fruitjam.mqtt_sub_command(host, port, topic, client_id, username, password, transport, count, wait, verbose)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.mqtt_publish_script = def(path)
+    var script = "#!/bin/sh\n" +
+        "set -eu\n" +
+        ": ${MQTT_HOST:=192.0.2.10}\n" +
+        ": ${MQTT_PORT:=1883}\n" +
+        ": ${MQTT_TOPIC:=charlie/test}\n" +
+        ": ${MQTT_MESSAGE:=hello-from-berry}\n" +
+        ": ${MQTT_CLIENT_ID:=fruitjam-berry-pub}\n" +
+        ": ${MQTT_TRANSPORT:=airlift}\n" +
+        "cmd=\"mosquitto_pub\"\n" +
+        "if [ \"$MQTT_TRANSPORT\" = airlift ]; then cmd=\"$cmd --airlift\"; fi\n" +
+        "if [ -n \"${MQTT_USER:-}\" ]; then\n" +
+        "  exec $cmd -h \"$MQTT_HOST\" -p \"$MQTT_PORT\" -i \"$MQTT_CLIENT_ID\" -u \"$MQTT_USER\" -P \"${MQTT_PASSWORD:-}\" -t \"$MQTT_TOPIC\" -m \"$MQTT_MESSAGE\"\n" +
+        "else\n" +
+        "  exec $cmd -h \"$MQTT_HOST\" -p \"$MQTT_PORT\" -i \"$MQTT_CLIENT_ID\" -t \"$MQTT_TOPIC\" -m \"$MQTT_MESSAGE\"\n" +
+        "fi\n"
+    fruitjam.write_text(path, script)
+    return {"ok": true, "path": path}
+end
+
+fruitjam.mqtt_subscribe_script = def(path)
+    var script = "#!/bin/sh\n" +
+        "set -eu\n" +
+        ": ${MQTT_HOST:=192.0.2.10}\n" +
+        ": ${MQTT_PORT:=1883}\n" +
+        ": ${MQTT_TOPIC:=charlie/#}\n" +
+        ": ${MQTT_CLIENT_ID:=fruitjam-berry-sub}\n" +
+        ": ${MQTT_TRANSPORT:=airlift}\n" +
+        ": ${MQTT_COUNT:=1}\n" +
+        ": ${MQTT_WAIT:=30}\n" +
+        "cmd=\"mosquitto_sub\"\n" +
+        "if [ \"$MQTT_TRANSPORT\" = airlift ]; then cmd=\"$cmd --airlift\"; fi\n" +
+        "if [ -n \"${MQTT_USER:-}\" ]; then\n" +
+        "  exec $cmd -h \"$MQTT_HOST\" -p \"$MQTT_PORT\" -i \"$MQTT_CLIENT_ID\" -u \"$MQTT_USER\" -P \"${MQTT_PASSWORD:-}\" -t \"$MQTT_TOPIC\" -C \"$MQTT_COUNT\" -W \"$MQTT_WAIT\" -v\n" +
+        "else\n" +
+        "  exec $cmd -h \"$MQTT_HOST\" -p \"$MQTT_PORT\" -i \"$MQTT_CLIENT_ID\" -t \"$MQTT_TOPIC\" -C \"$MQTT_COUNT\" -W \"$MQTT_WAIT\" -v\n" +
+        "fi\n"
+    fruitjam.write_text(path, script)
+    return {"ok": true, "path": path}
 end
 
 fruitjam.neopixel_write = def(commands)

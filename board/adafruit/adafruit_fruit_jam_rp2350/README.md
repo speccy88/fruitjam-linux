@@ -268,7 +268,11 @@ The daemon calls `mosquitto_pub --airlift`, which execs `airliftctl mqtt-pub`
 and sends one MQTT 3.1.1 QoS 0 publish over the ESP32-C6 NINA TCP socket API.
 For finite subscribe tests, use `mosquitto_sub --airlift -h "$MQTT_HOST" -p
 "$MQTT_PORT" -t 'fruitjam/#' -C 1 -W 30 -v`; add `-u`/`-P` when your broker
-requires authentication.
+requires authentication. Berry programs can use the importable `fruitjam` module
+to build or run the same AirLift-aware commands with `mqtt_pub_command`,
+`mqtt_sub_command`, `mqtt_publish`, and `mqtt_subscribe`; the included
+`09-mqtt-publish.be` and `10-mqtt-subscribe.be` examples generate
+environment-configurable wrapper scripts under `/tmp`.
 
 ## I2C
 
@@ -393,6 +397,8 @@ and REPL support:
 berry -e 'print("hello fruit jam")'
 berry
 berry-run /root/berry/06-fruitjam-module.be
+berry-run /root/berry/09-mqtt-publish.be
+berry-run /root/berry/10-mqtt-subscribe.be
 berry-run /root/berry/neopixels.be
 ```
 

@@ -192,7 +192,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | UART console header | GPIO8 TX, GPIO9 RX | Supported | Hardware UART shell/log path at 115200 8N1. | Keep as fallback when USB or graphics work changes. |
 | ROM BOOTSEL from Linux | RP2350 reboot command | Supported | `fruitjamctl bootsel` re-enters BOOTSEL and `picotool info -a` sees the ROM. | None. |
 | BusyBox userspace | `/bin`, `/usr/bin` | Supported | BusyBox tools plus `vi`, `hush`, web/network helpers, `free`/`fruitjam-mem`, and Fruit Jam tools. | Keep applets constrained for no-MMU allocation behavior. |
-| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, USB-host status through the kernel bridge when present, USB HID report decode, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
+| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, USB-host status through the kernel bridge when present, USB HID report decode, MQTT command helpers, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
 | Onboard NeoPixels | GPIO32, five LEDs | Supported | PIO-backed `/dev/neopixels`; Berry and CGI can update pixels. | None for basic color writes. |
 | Buttons | GPIO0, GPIO4, GPIO5 | Supported | Sysfs GPIO input, `fruitjam-buttons`, button log, CGI status, synthetic test events. | Physical edge logging should get longer soak testing. |
 | Red LED / IR pin | GPIO29 | Partial | LED control through sysfs/`fruitjamctl`; active-low output works. | IR receiver decoding is not implemented. |
@@ -565,10 +565,15 @@ UART, or telnet. They cover the features that have been brought up so far.
     ```sh
     mosquitto_sub --airlift -h 192.0.2.10 -p 1883 -t 'fruitjam/#' -C 1 -W 30 -v
     mosquitto_pub --airlift -h 192.0.2.10 -p 1883 -t fruitjam/test -m hello-from-fruitjam
+    berry-run /root/berry/09-mqtt-publish.be
+    berry-run /root/berry/10-mqtt-subscribe.be
     ```
 
     Replace the broker address with your own MQTT broker. Add `-u USER -P
-    PASSWORD` when your broker requires authentication.
+    PASSWORD` when your broker requires authentication. The Berry examples use
+    the `fruitjam` module MQTT helpers to build AirLift-aware `mosquitto_pub`
+    and `mosquitto_sub` commands, then write environment-configurable scripts
+    under `/tmp`.
 
 25. Route button events to MQTT through the SD-card config:
 

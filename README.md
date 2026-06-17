@@ -130,9 +130,10 @@ Validated on hardware:
 * The `/playground` page is a self-contained reactive Fruit Jam hardware
   playground. `/cgi-bin/fruitjam.cgi` exposes JSON actions for status,
   NeoPixels, button test events, RTTTL playback, WAV listing/playback, ADC
-  reads, DVI rendering, USB-host status, I2C checks, and explicit Berry example
-  runs. Hardware actions use direct C/tiny-helper paths; Berry is only invoked
-  by the Berry runner.
+  reads, DVI rendering, USB-host status, I2C checks, explicit Berry example
+  runs, and regular user `.be` files directly under `/mnt/sd/berry`. Hardware
+  actions use direct C/tiny-helper paths; Berry is only invoked by the Berry
+  runner.
 * AirLift inbound telnet accepts a remote shell and echoed `TELNET_OK`.
 * Default AirLift startup is wrapped by `fruitjam-services airlift-monitor`,
   which reruns the inbound server if it exits after leaving ESP32-C6 TCP sockets
@@ -191,7 +192,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | UART console header | GPIO8 TX, GPIO9 RX | Supported | Hardware UART shell/log path at 115200 8N1. | Keep as fallback when USB or graphics work changes. |
 | ROM BOOTSEL from Linux | RP2350 reboot command | Supported | `fruitjamctl bootsel` re-enters BOOTSEL and `picotool info -a` sees the ROM. | None. |
 | BusyBox userspace | `/bin`, `/usr/bin` | Supported | BusyBox tools plus `vi`, `hush`, web/network helpers, `free`/`fruitjam-mem`, and Fruit Jam tools. | Keep applets constrained for no-MMU allocation behavior. |
-| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, USB-host status, USB HID report decode, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. | Extend the Berry module as more kernel helpers land. |
+| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, USB-host status, USB HID report decode, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
 | Onboard NeoPixels | GPIO32, five LEDs | Supported | PIO-backed `/dev/neopixels`; Berry and CGI can update pixels. | None for basic color writes. |
 | Buttons | GPIO0, GPIO4, GPIO5 | Supported | Sysfs GPIO input, `fruitjam-buttons`, button log, CGI status, synthetic test events. | Physical edge logging should get longer soak testing. |
 | Red LED / IR pin | GPIO29 | Partial | LED control through sysfs/`fruitjamctl`; active-low output works. | IR receiver decoding is not implemented. |
@@ -200,7 +201,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | ADC / analog header | GPIO40-GPIO47 ADC | Supported | `fruitjam-adc` reads ADC channels and internal temperature through sysfs. | Calibration/scale polish. |
 | TLV320DAC3100 audio | I2C `0x18`, GPIO24 DIN, GPIO25 MCLK, GPIO26 BCLK, GPIO27 WS | Partial | `/dev/fruitjam-audio` generates PIO clocks; `fruitjam-rtttl` configures the codec and microphone-verified RTTTL output works. | Full streamed PCM/I2S playback is not implemented. |
 | ESP32-C6 AirLift | SPI GPIO28/30/31/46, READY GPIO3, IRQ GPIO23, reset GPIO22 | Partial | NINA firmware `3.3.0`; `airliftctl` can probe, scan, join WiFi, TCP GET, MQTT publish, and serve inbound HTTP/telnet/FTP. | Not a Linux `wlan0` interface yet; normal `wget` still only uses Linux sockets. |
-| HTTP user pages and playground | AirLift TCP/80; optional loopback HTTP | Supported | `/` serves `/mnt/sd/www/index.html`; `/playground` serves the built-in hardware UI; `/cgi-bin/fruitjam.cgi` reports status and controls NeoPixels, RTTTL, WAVs, I2C, ADC, DVI, USB-host status, buttons, and explicit Berry examples. Hardware actions use direct C/tiny-helper paths. | Use `http://<board-ip>/playground` after AirLift joins WiFi, or `fruitjam-services core` for loopback tests. |
+| HTTP user pages and playground | AirLift TCP/80; optional loopback HTTP | Supported | `/` serves `/mnt/sd/www/index.html`; `/playground` serves the built-in hardware UI; `/cgi-bin/fruitjam.cgi` reports status and controls NeoPixels, RTTTL, WAVs, I2C, ADC, DVI, USB-host status, buttons, built-in Berry examples, and user Berry files from `/mnt/sd/berry`. Hardware actions use direct C/tiny-helper paths. | Use `http://<board-ip>/playground` after AirLift joins WiFi, or `fruitjam-services core` for loopback tests. |
 | Telnet service | AirLift TCP/23; optional loopback TCP/23 | Supported | AirLift inbound shell and tiny `fruitjam-telnetd`/`fruitjam-shell`; telnet smoke tests pass. | Only one AirLift telnet session at a time. |
 | FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | Passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. | Upload completion can be slow over the current NINA raw socket path; active FTP remains a future objective. |
 | TFTP service | Optional loopback UDP/69 | Supported | BusyBox `tftpd` serves the TFTP area README when `fruitjam-services core` is started. | Not part of the default external AirLift service set. |

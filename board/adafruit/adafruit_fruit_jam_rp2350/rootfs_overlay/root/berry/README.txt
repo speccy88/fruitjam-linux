@@ -13,6 +13,16 @@ Run the visual NeoPixel set:
 
   berry-run /root/berry/run-visual.be
 
+Run your own Berry files from the web playground:
+
+  mkdir -p /mnt/sd/berry
+  cp my-script.be /mnt/sd/berry/
+  open http://<fruit-jam-ip>/playground
+
+The playground lists built-in examples plus regular `.be` files directly under
+/mnt/sd/berry. SD-card files are shown as `SD: name.be` and are run through the
+same tiny JSON helper as the built-in examples.
+
 Files:
 
   00-hello.be              Tiny Berry sanity check.

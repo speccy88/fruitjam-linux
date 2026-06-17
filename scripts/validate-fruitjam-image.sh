@@ -83,6 +83,7 @@ with tarfile.open(rootfs) as tf:
         '"/cgi-bin/fruitjam.cgi"',
         'data-dvi="dashboard"',
         'data-usbhost="status"',
+        'return "SD: " + name.slice(5);',
     ):
         if needle not in index:
             raise SystemExit(f"www/index.html missing {needle!r}")
@@ -104,9 +105,15 @@ with tarfile.open(rootfs) as tf:
             raise SystemExit(f"fruitjam-wavplay missing marker {needle!r}")
 
     web_cgi = read_bytes(tf, "./www/cgi-bin/fruitjam.cgi")
-    for needle in (b"direct-cgi", b"berry-list", b"wav-list", b"usbhost"):
+    for needle in (b"direct-cgi", b"berry-list", b"wav-list", b"usbhost",
+                   b"/mnt/sd/berry", b"user_scripts", b"user:"):
         if needle not in web_cgi:
             raise SystemExit(f"fruitjam.cgi missing marker {needle!r}")
+
+    berry_json = read_bytes(tf, "./usr/bin/fruitjam-berry-json")
+    for needle in (b"tiny-berry-json", b"script_source", b"/mnt/sd/berry", b"user:"):
+        if needle not in berry_json:
+            raise SystemExit(f"fruitjam-berry-json missing marker {needle!r}")
 
     usbhost = read_bytes(tf, "./usr/bin/fruitjam-usbhost")
     for needle in (

@@ -839,7 +839,7 @@
         const data = await get({ action: "berry-list" }, 10000);
         const scripts = (data.scripts || []).slice().sort();
         $("#berryScript").innerHTML = scripts.map((name) =>
-          '<option value="' + esc(name) + '">' + esc(name) + '</option>'
+          '<option value="' + esc(name) + '">' + esc(berryLabel(name)) + '</option>'
         ).join("");
         $("#berryOut").textContent = scripts.length ? "Ready." : "No scripts.";
         log("berry list " + scripts.length);
@@ -849,6 +849,13 @@
       } finally {
         busy("#reloadBerry", false);
       }
+    }
+
+    function berryLabel(name) {
+      if (name.indexOf("user:") === 0) {
+        return "SD: " + name.slice(5);
+      }
+      return name;
     }
 
     async function runBerry() {

@@ -21,11 +21,21 @@
 #include <unistd.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#ifndef BERRY_JSON_BIN
 #define BERRY_JSON_BIN "/usr/bin/fruitjam-berry-json"
+#endif
+#ifndef BERRY_DIR
 #define BERRY_DIR "/root/berry"
+#endif
+#ifndef BERRY_USER_DIR
+#define BERRY_USER_DIR "/mnt/sd/berry"
+#endif
+#define BERRY_USER_PREFIX "user:"
 #define WAV_DIR "/mnt/sd/wavs"
 #define BUTTON_FIFO "/run/fruitjam-buttons.fifo"
 #define BERRY_SCRIPT_MAX 63
+#define BERRY_REF_MAX (sizeof(BERRY_USER_PREFIX) + BERRY_SCRIPT_MAX)
+#define BERRY_USER_LIST_MAX 32
 #define WAV_FILE_MAX 95
 #define WAV_LIST_MAX 32
 
@@ -320,26 +330,119 @@ static int known_berry_script(const char *name)
 	return 0;
 }
 
+static int berry_path_in_dir(const char *dir, const char *name,
+			     char *path, size_t path_len)
+{
+	int ret;
+
+	if (!valid_berry_script(name))
+		return -1;
+	ret = snprintf(path, path_len, "%s/%s", dir, name);
+	return ret > 0 && (size_t)ret < path_len ? 0 : -1;
+}
+
+static int regular_file_at_path(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) < 0)
+		return 0;
+	return S_ISREG(st.st_mode);
+}
+
+static int user_berry_script_exists(const char *name)
+{
+	char path[sizeof(BERRY_USER_DIR) + 1 + BERRY_SCRIPT_MAX];
+
+	if (berry_path_in_dir(BERRY_USER_DIR, name, path, sizeof(path)) < 0)
+		return 0;
+	return regular_file_at_path(path);
+}
+
+static int berry_ref_user_name(const char *ref, const char **name)
+{
+	size_t prefix_len = strlen(BERRY_USER_PREFIX);
+
+	if (!ref || strncmp(ref, BERRY_USER_PREFIX, prefix_len))
+		return 0;
+	*name = ref + prefix_len;
+	return 1;
+}
+
+static int known_berry_ref(const char *ref)
+{
+	const char *user_name;
+
+	if (berry_ref_user_name(ref, &user_name))
+		return user_berry_script_exists(user_name);
+	return known_berry_script(ref);
+}
+
+static int print_user_berry_scripts(int prefixed, int first)
+{
+	DIR *dir;
+	struct dirent *ent;
+	unsigned int count = 0;
+
+	dir = opendir(BERRY_USER_DIR);
+	if (!dir)
+		return first;
+	while ((ent = readdir(dir)) && count < BERRY_USER_LIST_MAX) {
+		char ref[BERRY_REF_MAX + 1];
+		size_t prefix_len = strlen(BERRY_USER_PREFIX);
+		size_t name_len = strlen(ent->d_name);
+
+		if (!user_berry_script_exists(ent->d_name))
+			continue;
+		if (name_len > BERRY_SCRIPT_MAX)
+			continue;
+		if (!first)
+			putchar(',');
+		if (prefixed) {
+			memcpy(ref, BERRY_USER_PREFIX, prefix_len);
+			memcpy(ref + prefix_len, ent->d_name, name_len + 1);
+			json_string(ref);
+		} else {
+			json_string(ent->d_name);
+		}
+		first = 0;
+		count++;
+	}
+	closedir(dir);
+	return first;
+}
+
 static void action_berry_list(void)
 {
 	size_t i;
+	int first = 1;
 
-	printf("{\"ok\":true,\"source\":\"direct-cgi-tiny\",\"dir\":\"%s\",\"scripts\":[",
-	       BERRY_DIR);
+	printf("{\"ok\":true,\"source\":\"direct-cgi-tiny\",\"dir\":\"%s\",\"user_dir\":\"%s\",\"scripts\":[",
+	       BERRY_DIR, BERRY_USER_DIR);
+	for (i = 0; i < ARRAY_SIZE(berry_scripts); i++) {
+		if (!first)
+			putchar(',');
+		json_string(berry_scripts[i]);
+		first = 0;
+	}
+	first = print_user_berry_scripts(1, first);
+	printf("],\"examples\":[");
 	for (i = 0; i < ARRAY_SIZE(berry_scripts); i++) {
 		if (i)
 			putchar(',');
 		json_string(berry_scripts[i]);
 	}
+	printf("],\"user_scripts\":[");
+	print_user_berry_scripts(0, 1);
 	puts("]}");
 }
 
 static void action_berry_run(void)
 {
-	char script[BERRY_SCRIPT_MAX + 1];
+	char script[BERRY_REF_MAX + 1];
 
 	if (!query_param("script", script, sizeof(script)) ||
-	    !known_berry_script(script)) {
+	    !known_berry_ref(script)) {
 		json_error("bad berry script");
 		return;
 	}

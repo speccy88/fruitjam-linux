@@ -32,6 +32,9 @@ Included:
 * USB CDC ACM gadget console on `/dev/ttyGS0`.
 * Berry package installed as `/usr/bin/berry`.
 * Berry `-e`, script execution, and REPL.
+* The HTTP playground runs built-in Berry examples and regular user `.be` files
+  placed directly under `/mnt/sd/berry` through the tiny `fruitjam-berry-json`
+  helper, keeping Berry out of the larger CGI process on no-MMU systems.
 * BusyBox `vi`.
 * PIO-backed `/dev/neopixels` driver for the five onboard GPIO32 NeoPixels.
 * `/root/berry/neopixels.be` Berry smoke-test script.

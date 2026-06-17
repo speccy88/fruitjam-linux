@@ -23,9 +23,18 @@
 #include <unistd.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#ifndef BERRY_BIN
 #define BERRY_BIN "/usr/bin/berry"
+#endif
+#ifndef BERRY_DIR
 #define BERRY_DIR "/root/berry"
+#endif
+#ifndef BERRY_USER_DIR
+#define BERRY_USER_DIR "/mnt/sd/berry"
+#endif
+#define BERRY_USER_PREFIX "user:"
 #define BERRY_SCRIPT_MAX 63
+#define BERRY_PATH_MAX 192
 
 static const char *const berry_scripts[] = {
 	"00-hello.be",
@@ -129,14 +138,50 @@ static int known_berry_script(const char *name)
 	return 0;
 }
 
-static int berry_script_path(const char *name, char *path, size_t path_len)
+static int regular_file_at_path(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) < 0)
+		return 0;
+	return S_ISREG(st.st_mode);
+}
+
+static int berry_path_in_dir(const char *dir, const char *name,
+			     char *path, size_t path_len)
 {
 	int ret;
 
-	if (!known_berry_script(name))
+	if (!valid_berry_script(name))
 		return -1;
-	ret = snprintf(path, path_len, "%s/%s", BERRY_DIR, name);
+	ret = snprintf(path, path_len, "%s/%s", dir, name);
 	return ret > 0 && (size_t)ret < path_len ? 0 : -1;
+}
+
+static int berry_script_path(const char *ref, char *path, size_t path_len,
+			     const char **script_source)
+{
+	const char *user_name;
+
+	if (!ref)
+		return -1;
+	user_name = !strncmp(ref, BERRY_USER_PREFIX,
+			     strlen(BERRY_USER_PREFIX)) ?
+		ref + strlen(BERRY_USER_PREFIX) : NULL;
+	if (user_name) {
+		if (berry_path_in_dir(BERRY_USER_DIR, user_name,
+				      path, path_len) < 0 ||
+		    !regular_file_at_path(path))
+			return -1;
+		*script_source = "user";
+		return 0;
+	}
+
+	if (!known_berry_script(ref) ||
+	    berry_path_in_dir(BERRY_DIR, ref, path, path_len) < 0)
+		return -1;
+	*script_source = "example";
+	return 0;
 }
 
 static int run_capture_timeout(char *const argv[], char *out,
@@ -207,7 +252,8 @@ static int run_capture_timeout(char *const argv[], char *out,
 int main(int argc, char **argv)
 {
 	const char *script;
-	char path[sizeof(BERRY_DIR) + 1 + BERRY_SCRIPT_MAX];
+	const char *script_source;
+	char path[BERRY_PATH_MAX];
 	char output[768];
 	int ret;
 
@@ -216,7 +262,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	script = argv[1];
-	if (berry_script_path(script, path, sizeof(path)) < 0) {
+	if (berry_script_path(script, path, sizeof(path), &script_source) < 0) {
 		json_error("bad berry script");
 		return 0;
 	}
@@ -233,6 +279,8 @@ int main(int argc, char **argv)
 	printf("{\"ok\":%s,\"exit\":%d,\"source\":\"tiny-berry-json\",\"script\":",
 	       ret == 0 ? "true" : "false", ret);
 	json_string(script);
+	printf(",\"script_source\":");
+	json_string(script_source);
 	printf(",\"output\":");
 	json_string(output);
 	puts("}");

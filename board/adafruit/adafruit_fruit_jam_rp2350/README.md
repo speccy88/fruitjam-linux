@@ -322,8 +322,9 @@ scripts/validate-fruitjam-examples.sh
 
 This compiles the web CGI for the host and checks JSON responses, verifies the
 HTTP-callable Berry whitelist matches the installed `/root/berry` examples,
-parses all RTTTL tunes by generating throwaway WAVs, and runs the finite Berry
-examples with graceful hardware skips.
+checks the SD-card Berry script reference path, parses all RTTTL tunes by
+generating throwaway WAVs, and runs the finite Berry examples with graceful
+hardware skips.
 
 ## AirLift networking
 
@@ -393,6 +394,15 @@ berry -e 'print("hello fruit jam")'
 berry
 berry-run /root/berry/06-fruitjam-module.be
 berry-run /root/berry/neopixels.be
+```
+
+The hardware playground can also run regular user scripts placed directly in
+`/mnt/sd/berry`. They appear in the Berry selector as `SD: name.be` and are
+executed by the same tiny JSON helper used for built-in examples:
+
+```sh
+mkdir -p /mnt/sd/berry
+cp my-script.be /mnt/sd/berry/
 ```
 
 The NeoPixel driver exposes `/dev/neopixels` with a simple text command interface:

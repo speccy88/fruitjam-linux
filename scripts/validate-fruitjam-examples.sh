@@ -81,6 +81,14 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/fruitjam-examples.XXXXXX")
 trap 'test -z "${httpd_pid:-}" || kill "$httpd_pid" 2>/dev/null || true; test -z "${uart_pid:-}" || kill "$uart_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT HUP INT TERM
 
 cp -R "$berry_src" "$tmp/berry"
+user_berry_dir="$tmp/user-berry"
+mkdir -p "$user_berry_dir"
+cat > "$user_berry_dir/user-http.be" <<'EOF'
+print("USER_HTTP_BERRY_OK")
+EOF
+cat > "$user_berry_dir/not-berry.txt" <<'EOF'
+not a berry script
+EOF
 
 rewrite_berry_dir() {
 	file=$1
@@ -276,6 +284,12 @@ if query == "action=berry-list":
     for required in ("00-hello.be", "run-all.be", "neopixel-rainbow-10s.be"):
         if required not in scripts:
             raise SystemExit(f"berry-list missing {required}")
+    if "user:user-http.be" not in scripts:
+        raise SystemExit("berry-list missing SD-card user script reference")
+    if "user:not-berry.txt" in scripts or "not-berry.txt" in (data.get("user_scripts") or []):
+        raise SystemExit("berry-list exposed non-Berry SD file")
+    if "user-http.be" not in (data.get("user_scripts") or []):
+        raise SystemExit("berry-list missing user_scripts entry")
 if query == "action=usbhost":
     if data.get("hid") is not False or data.get("driver") not in ("sysfs-line-state", "kernel-line-state"):
         raise SystemExit("usbhost API must not claim HID stack support yet")
@@ -297,6 +311,7 @@ PY
 
 echo "== web cgi host JSON =="
 cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-DBERRY_USER_DIR="\"$user_berry_dir\"" \
 	-o "$tmp/fruitjam-web.cgi" "$web_cgi_src"
 check_cgi_json "action=status"
 check_cgi_json "action=i2c"
@@ -305,6 +320,60 @@ check_cgi_json "action=berry-list"
 check_cgi_json "action=wav-list"
 check_cgi_json "action=neopixels"
 check_cgi_json "action=berry-run&script=../../bad.be"
+
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-DBERRY_USER_DIR="\"$user_berry_dir\"" \
+	-o "$tmp/fruitjam-web-dispatch.cgi" "$web_dispatch_cgi_src"
+QUERY_STRING="action=berry-list" "$tmp/fruitjam-web-dispatch.cgi" > "$tmp/fruitjam-web-dispatch.out"
+python3 - "$tmp/fruitjam-web-dispatch.out" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_text()
+header, sep, body = raw.partition("\n\n")
+if not sep or "Content-Type: application/json" not in header:
+    raise SystemExit("dispatch CGI berry-list missing JSON header")
+data = json.loads(body)
+scripts = data.get("scripts") or []
+if data.get("source") != "direct-cgi-tiny":
+    raise SystemExit("dispatch CGI source marker changed")
+if "00-hello.be" not in scripts or "user:user-http.be" not in scripts:
+    raise SystemExit(f"dispatch CGI berry-list missing scripts: {scripts}")
+if "user-http.be" not in (data.get("user_scripts") or []):
+    raise SystemExit("dispatch CGI missing user_scripts entry")
+PY
+echo "ok cgi dispatch berry-list"
+
+echo "== berry JSON helper host behavior =="
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-DBERRY_BIN="\"$host_berry\"" \
+	-DBERRY_DIR="\"$tmp/berry\"" \
+	-DBERRY_USER_DIR="\"$user_berry_dir\"" \
+	-o "$tmp/fruitjam-berry-json" "$berry_json_src"
+"$tmp/fruitjam-berry-json" 00-hello.be > "$tmp/berry-json-example.out"
+"$tmp/fruitjam-berry-json" user:user-http.be > "$tmp/berry-json-user.out"
+"$tmp/fruitjam-berry-json" user:not-berry.txt > "$tmp/berry-json-bad.out"
+python3 - "$tmp/berry-json-example.out" "$tmp/berry-json-user.out" "$tmp/berry-json-bad.out" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+example = json.loads(Path(sys.argv[1]).read_text())
+user = json.loads(Path(sys.argv[2]).read_text())
+bad = json.loads(Path(sys.argv[3]).read_text())
+if not example.get("ok") or example.get("script_source") != "example":
+    raise SystemExit(f"built-in Berry JSON run failed: {example}")
+if "Fruit Jam Berry hello" not in example.get("output", ""):
+    raise SystemExit("built-in Berry JSON output missing hello text")
+if not user.get("ok") or user.get("script_source") != "user":
+    raise SystemExit(f"user Berry JSON run failed: {user}")
+if "USER_HTTP_BERRY_OK" not in user.get("output", ""):
+    raise SystemExit("user Berry JSON output missing marker")
+if bad.get("ok") is not False:
+    raise SystemExit("Berry JSON helper accepted invalid user script")
+PY
+echo "ok berry JSON helper"
 
 echo "== loopback http route host test =="
 sd_www="$tmp/sd-www"

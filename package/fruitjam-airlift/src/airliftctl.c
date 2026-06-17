@@ -43,6 +43,8 @@
 #define AIRLIFT_GPIO_DEV_DEFAULT "/dev/airlift-gpio"
 #define AIRLIFT_SPI_DEV_DEFAULT "/dev/spidev0.0"
 #define USBHOST_DEV "/dev/fruitjam-usbhost"
+#define AIRLIFT_HEARTBEAT_PATH "/run/fruitjam-airlift-inbound.heartbeat"
+#define AIRLIFT_HEARTBEAT_INTERVAL_MS 5000L
 #define AIRLIFT_SPI_HZ 8000000u
 #define AIRLIFT_RESET_GPIO 22u
 #define AIRLIFT_READY_GPIO 3u
@@ -242,6 +244,8 @@ struct telnet_session {
 static struct response response_buf;
 static uint8_t command_buf[768];
 static volatile sig_atomic_t stop_requested;
+static int inbound_heartbeat_active;
+static long inbound_heartbeat_next_ms;
 static int airlift_lock_fd = -1;
 
 static void airlift_lock_release(void)
@@ -291,6 +295,31 @@ static long now_ms(void)
 
 	gettimeofday(&tv, NULL);
 	return (long)tv.tv_sec * 1000L + tv.tv_usec / 1000L;
+}
+
+static void inbound_heartbeat_touch(void)
+{
+	char line[32];
+	long now = now_ms();
+	int fd;
+	int len;
+
+	if (!inbound_heartbeat_active)
+		return;
+	fd = open(AIRLIFT_HEARTBEAT_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		return;
+	len = snprintf(line, sizeof(line), "%ld\n", now);
+	if (len > 0 && (size_t)len < sizeof(line))
+		write(fd, line, (size_t)len);
+	close(fd);
+	inbound_heartbeat_next_ms = now + AIRLIFT_HEARTBEAT_INTERVAL_MS;
+}
+
+static void inbound_heartbeat_poll(void)
+{
+	if (inbound_heartbeat_active && now_ms() >= inbound_heartbeat_next_ms)
+		inbound_heartbeat_touch();
 }
 
 static int parse_port(const char *s, uint16_t *port)
@@ -1510,6 +1539,7 @@ static int nina_socket_send_all(struct airlift *air, uint8_t sock,
 		uint16_t want = len - offset;
 		uint16_t sent = 0;
 
+		inbound_heartbeat_poll();
 		if (want > AIRLIFT_SEND_CHUNK)
 			want = AIRLIFT_SEND_CHUNK;
 		if (nina_socket_send(air, sock, data + offset, want, &sent) < 0)
@@ -2414,6 +2444,7 @@ static int ftp_raw_read_line_poll(struct airlift *air, uint8_t sock,
 	while (!stop_requested && now_ms() < deadline) {
 		uint8_t flags = 0;
 
+		inbound_heartbeat_poll();
 		if (nina_socket_poll(air, sock, &flags) < 0 ||
 		    (flags & NINA_SOCKET_POLL_ERR))
 			return -1;
@@ -2483,6 +2514,7 @@ static int http_read_line_recv(struct airlift *air, uint8_t sock, char *line,
 		uint8_t c;
 		uint16_t len = 1;
 
+		inbound_heartbeat_poll();
 		if (nina_socket_recv(air, sock, &c, &len) < 0)
 			return -1;
 		if (len == 0) {
@@ -3932,6 +3964,7 @@ static int http_send_file(struct airlift *air, uint8_t sock, const char *path)
 	while (!stop_requested) {
 		ssize_t got = read(fd, buf, sizeof(buf));
 
+		inbound_heartbeat_poll();
 		if (got < 0) {
 			close(fd);
 			return -1;
@@ -3997,6 +4030,7 @@ static int MAYBE_UNUSED http_send_cgi(struct airlift *air, uint8_t sock,
 	while (!stop_requested && now_ms() < deadline) {
 		pid_t ret = waitpid(child, NULL, WNOHANG);
 
+		inbound_heartbeat_poll();
 		if (ret == child) {
 			done = 1;
 			break;
@@ -4055,6 +4089,7 @@ static int MAYBE_UNUSED http_send_cgi(struct airlift *air, uint8_t sock,
 	}
 	lseek(fd, (off_t)body_offset, SEEK_SET);
 	while ((got = read(fd, buf, sizeof(buf))) > 0) {
+		inbound_heartbeat_poll();
 		if (nina_socket_send_all(air, sock, buf, (uint16_t)got) < 0) {
 			close(fd);
 			unlink(path);
@@ -4524,6 +4559,7 @@ static int ftp_send_data_file(struct airlift *air, uint8_t data_sock,
 	while (!stop_requested) {
 		ssize_t got = read(fd, buf, sizeof(buf));
 
+		inbound_heartbeat_poll();
 		if (got < 0) {
 			close(fd);
 			ftp_close_data_client(air, &data_client);
@@ -4599,6 +4635,7 @@ static int ftp_send_listing(struct airlift *air, uint8_t data_sock,
 		struct stat st;
 		int len;
 
+		inbound_heartbeat_poll();
 		if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
 			continue;
 		len = snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
@@ -4639,6 +4676,7 @@ static int ftp_recv_data_file(struct airlift *air, uint8_t data_sock,
 	while (!stop_requested && now_ms() < deadline) {
 		uint8_t flags = 0;
 
+		inbound_heartbeat_poll();
 		if (nina_socket_poll_raw(air, data_client, &flags) < 0)
 			break;
 		if (flags & NINA_SOCKET_POLL_RD) {
@@ -4699,6 +4737,7 @@ static int serve_ftp_client(struct airlift *air, uint8_t sock, uint8_t data_sock
 						 http_sock, shell_sock, line,
 						 sizeof(line), AIRLIFT_FTP_IDLE_MS);
 
+		inbound_heartbeat_poll();
 		if (got == FTP_READ_NEW_CONTROL) {
 			ftp_reply(air, sock, 421, "Closing idle control connection");
 			break;
@@ -5176,6 +5215,8 @@ static int serve_inbound(struct airlift *air)
 	stop_requested = 0;
 	signal(SIGINT, request_stop);
 	signal(SIGTERM, request_stop);
+	inbound_heartbeat_active = 1;
+	inbound_heartbeat_touch();
 	if (ftp_sock != NINA_NO_SOCKET)
 		printf("airlift inbound ftp listening on port %u socket %u\n",
 		       DEFAULT_FTP_PORT, ftp_sock);
@@ -5190,6 +5231,7 @@ static int serve_inbound(struct airlift *air)
 	while (!stop_requested) {
 		uint8_t client_sock = NINA_NO_SOCKET;
 
+		inbound_heartbeat_poll();
 		telnet_session_poll(air, &telnet);
 
 		client_sock = NINA_NO_SOCKET;
@@ -5247,9 +5289,11 @@ static int serve_inbound(struct airlift *air)
 	nina_socket_close(air, ftp_sock);
 	nina_socket_close(air, http_sock);
 	tcp_stop_server(air, shell_sock);
+	inbound_heartbeat_active = 0;
 	return 0;
 
 fail:
+	inbound_heartbeat_active = 0;
 	if (ftp_sock != NINA_NO_SOCKET)
 		nina_socket_close(air, ftp_sock);
 	if (shell_sock != NINA_NO_SOCKET)

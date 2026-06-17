@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -31,6 +32,8 @@ static const char *sd_web_root = "/mnt/sd/www";
 static const char *sd_index_path = "/mnt/sd/www/index.html";
 static const char *tftp_root = "/tmp/tftp";
 static const char *airlift_monitor_pid = "/run/fruitjam-airlift-monitor.pid";
+static const char *airlift_heartbeat_path = "/run/fruitjam-airlift-inbound.heartbeat";
+static const unsigned int airlift_heartbeat_stale_sec = 180;
 static const char *const wifi_conf_paths[] = {
 	"/mnt/sd/fruitjam/wifi.conf",
 	"/etc/fruitjam-wifi.conf",
@@ -622,6 +625,81 @@ static int pid_is_alive(pid_t pid)
 	return 0;
 }
 
+static int wait_airlift_serve(pid_t pid, time_t started_at)
+{
+	int status;
+
+	for (;;) {
+		pid_t ret = waitpid(pid, &status, WNOHANG);
+
+		if (ret == pid) {
+			if (WIFEXITED(status))
+				return WEXITSTATUS(status);
+			if (WIFSIGNALED(status))
+				return 128 + WTERMSIG(status);
+			return 1;
+		}
+		if (ret < 0 && errno == EINTR)
+			continue;
+		if (ret < 0) {
+			fprintf(stderr, "fruitjam-services: wait airliftctl: %s\n",
+				strerror(errno));
+			return -1;
+		}
+
+		if (service_stop_requested) {
+			kill(pid, SIGTERM);
+			while ((ret = waitpid(pid, &status, 0)) < 0 && errno == EINTR)
+				;
+			if (ret == pid && WIFSIGNALED(status))
+				return 128 + WTERMSIG(status);
+			return 0;
+		}
+
+		{
+			struct stat st;
+			time_t now = time(NULL);
+			time_t last = started_at;
+
+			if (stat(airlift_heartbeat_path, &st) == 0)
+				last = st.st_mtime;
+			if (now >= last &&
+			    (unsigned int)(now - last) > airlift_heartbeat_stale_sec) {
+				fprintf(stderr,
+					"fruitjam-services: AirLift inbound heartbeat stale; restarting\n");
+				kill(pid, SIGTERM);
+				usleep(700000);
+				if (pid_is_alive(pid))
+					kill(pid, SIGKILL);
+				while ((ret = waitpid(pid, &status, 0)) < 0 &&
+				       errno == EINTR)
+					;
+				return 124;
+			}
+		}
+
+		usleep(5000000);
+	}
+}
+
+static int spawn_wait_airlift_serve(char *const argv[])
+{
+	time_t started_at = time(NULL);
+	pid_t pid;
+
+	unlink(airlift_heartbeat_path);
+	pid = vfork();
+	if (pid < 0) {
+		fprintf(stderr, "fruitjam-services: vfork %s: %s\n", argv[0], strerror(errno));
+		return -1;
+	}
+	if (pid == 0) {
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	return wait_airlift_serve(pid, started_at);
+}
+
 static void request_service_stop(int sig)
 {
 	(void)sig;
@@ -683,7 +761,7 @@ static int airlift_monitor(void)
 
 		failures = 0;
 		fprintf(stderr, "fruitjam-services: starting AirLift inbound server\n");
-		ret = spawn_wait(serve);
+		ret = spawn_wait_airlift_serve(serve);
 		if (service_stop_requested)
 			break;
 		fprintf(stderr, "fruitjam-services: AirLift inbound server exited %d\n",
@@ -692,6 +770,7 @@ static int airlift_monitor(void)
 		sleep(failures > 3 ? 10 : 2);
 	}
 	unlink(airlift_monitor_pid);
+	unlink(airlift_heartbeat_path);
 	return 0;
 }
 
@@ -840,6 +919,7 @@ static int stop_services(void)
 		kill(pid, SIGKILL);
 	signal_services(SIGKILL);
 	unlink(airlift_monitor_pid);
+	unlink(airlift_heartbeat_path);
 	return 0;
 }
 
@@ -905,10 +985,21 @@ static void print_matching_processes(void)
 	{
 		pid_t pid;
 
-			if (read_pid_file(airlift_monitor_pid, &pid) == 0 &&
-			    pid_is_alive(pid))
-				printf("  %ld fruitjam-services airlift-monitor\n",
-				       (long)pid);
+		if (read_pid_file(airlift_monitor_pid, &pid) == 0 &&
+		    pid_is_alive(pid))
+			printf("  %ld fruitjam-services airlift-monitor\n",
+			       (long)pid);
+	}
+	{
+		struct stat st;
+
+		if (stat(airlift_heartbeat_path, &st) == 0) {
+			time_t now = time(NULL);
+			long age = now >= st.st_mtime ? (long)(now - st.st_mtime) : 0;
+
+			printf("  airlift-heartbeat age=%lds stale-after=%us\n",
+			       age, airlift_heartbeat_stale_sec);
+		}
 	}
 }
 

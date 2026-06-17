@@ -981,8 +981,8 @@ if '"airlift-monitor"' not in services or "fruitjam-airlift-monitor.pid" not in 
     raise SystemExit("fruitjam-services missing AirLift inbound monitor/pidfile guard")
 if '"airlift-monitor", NULL' not in services:
     raise SystemExit("fruitjam-services default AirLift worker does not use the monitor")
-if "spawn_wait(serve)" not in services:
-    raise SystemExit("fruitjam-services AirLift monitor does not wait for serve-inbound exits")
+if "spawn_wait_airlift_serve(serve)" not in services:
+    raise SystemExit("fruitjam-services AirLift monitor does not use heartbeat-aware wait")
 if "pid_is_alive" not in services or "request_service_stop" not in services:
     raise SystemExit("fruitjam-services AirLift monitor missing stale pid/stop handling")
 if "unlink(airlift_monitor_pid)" not in services:
@@ -1023,6 +1023,18 @@ for needle, label in [
         raise SystemExit(f"airliftctl missing {label}")
 if "AIRLIFT_START_LOG" not in airlift or "print_cached_airlift_info" not in airlift:
     raise SystemExit("airliftctl missing cached read-only AirLift info fallback")
+if "AIRLIFT_HEARTBEAT_PATH" not in airlift or "inbound_heartbeat_poll" not in airlift:
+    raise SystemExit("airliftctl missing inbound heartbeat updates")
+for needle, label in [
+    ("airlift_heartbeat_path", "AirLift heartbeat path"),
+    ("spawn_wait_airlift_serve", "AirLift heartbeat-aware wait"),
+    ("WNOHANG", "nonblocking AirLift monitor wait"),
+    ("airlift_heartbeat_stale_sec", "AirLift stale heartbeat window"),
+    ("AirLift inbound heartbeat stale; restarting", "AirLift stale restart log"),
+    ("airlift-heartbeat age=", "AirLift heartbeat status output"),
+]:
+    if needle not in services:
+        raise SystemExit(f"fruitjam-services missing {label}")
 
 print("ok telnetd no-mmu guard")
 print("ok wget no-mmu guard")
@@ -1033,6 +1045,7 @@ print("ok sd web route guard")
 print("ok airlift join guard")
 print("ok airlift lock guard")
 print("ok airlift cached info guard")
+print("ok airlift heartbeat guard")
 PY
 
 echo "== audio and dvi helper syntax =="

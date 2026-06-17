@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,7 @@
 #define GPIO_PATH_MAX 192
 #define BRIDGE_BUF_MAX 1024
 #define RX_HEX_MAX 65
+#define RX_BYTES_MAX 32
 
 struct usbhost_status {
 	int power;
@@ -65,7 +67,7 @@ static const char *kernel_pio_stack_text =
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-usbhost {status|json|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|wait [seconds]|monitor [seconds]}\n");
+		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|wait [seconds]|monitor [seconds]}\n");
 }
 
 static int write_file(const char *path, const char *text)
@@ -213,6 +215,169 @@ static const char *usb_state(int power, int dp, int dm)
 	if (!dp && dm)
 		return "low-speed-device";
 	return "invalid-both-lines-high";
+}
+
+static int hex_value(int c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+static int parse_hex_bytes(const char *text, unsigned char *bytes,
+			   size_t max_bytes, size_t *byte_count)
+{
+	size_t n = 0;
+	int hi = -1;
+
+	while (*text) {
+		int v;
+
+		if (isspace((unsigned char)*text) || *text == ':' ||
+		    *text == ',' || *text == '-' || *text == '_') {
+			text++;
+			continue;
+		}
+		if (*text == 'x' || *text == 'X') {
+			text++;
+			continue;
+		}
+		v = hex_value((unsigned char)*text);
+		if (v < 0)
+			return -1;
+		if (hi < 0) {
+			hi = v;
+		} else {
+			if (n >= max_bytes)
+				return -1;
+			bytes[n++] = (unsigned char)((hi << 4) | v);
+			hi = -1;
+		}
+		text++;
+	}
+	if (hi >= 0)
+		return -1;
+	*byte_count = n;
+	return 0;
+}
+
+static bool usb_pid_valid(unsigned char pid)
+{
+	return (((pid >> 4) ^ (pid & 0x0f)) == 0x0f);
+}
+
+static const char *usb_pid_name(unsigned char pid)
+{
+	switch (pid) {
+	case 0xe1: return "OUT";
+	case 0x69: return "IN";
+	case 0xa5: return "SOF";
+	case 0x2d: return "SETUP";
+	case 0xc3: return "DATA0";
+	case 0x4b: return "DATA1";
+	case 0x87: return "DATA2";
+	case 0x0f: return "MDATA";
+	case 0xd2: return "ACK";
+	case 0x5a: return "NAK";
+	case 0x1e: return "STALL";
+	case 0x96: return "NYET";
+	case 0x3c: return "PRE/ERR";
+	case 0x78: return "SPLIT";
+	case 0xb4: return "PING";
+	default: return "unknown";
+	}
+}
+
+static bool usb_pid_is_data(unsigned char pid)
+{
+	return pid == 0xc3 || pid == 0x4b || pid == 0x87 || pid == 0x0f;
+}
+
+static unsigned int le16(const unsigned char *p)
+{
+	return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+}
+
+static void print_descriptor_hint(const unsigned char *data, size_t len)
+{
+	if (len < 2)
+		return;
+
+	if (data[1] == 1) {
+		if (len >= 8) {
+			printf("usbhost decode descriptor device-prefix bLength=%u bcdUSB=0x%04x class=0x%02x subclass=0x%02x protocol=0x%02x maxpkt0=%u\n",
+			       data[0], le16(&data[2]), data[4], data[5],
+			       data[6], data[7]);
+		} else {
+			printf("usbhost decode descriptor device-prefix truncated=%zu\n",
+			       len);
+		}
+		if (len >= 18) {
+			printf("usbhost decode descriptor device-id vid=0x%04x pid=0x%04x bcdDevice=0x%04x configs=%u\n",
+			       le16(&data[8]), le16(&data[10]), le16(&data[12]),
+			       data[17]);
+		}
+		return;
+	}
+
+	if (data[1] == 2 && len >= 9) {
+		printf("usbhost decode descriptor config total=%u interfaces=%u attributes=0x%02x maxpower=%umA\n",
+		       le16(&data[2]), data[4], data[7], data[8] * 2u);
+		return;
+	}
+
+	if (data[1] == 4 && len >= 9) {
+		printf("usbhost decode descriptor interface number=%u class=0x%02x subclass=0x%02x protocol=0x%02x endpoints=%u\n",
+		       data[2], data[5], data[6], data[7], data[4]);
+		if (data[5] == 3 && data[6] == 1 && data[7] == 1)
+			puts("usbhost decode descriptor boot-keyboard-interface yes");
+	}
+}
+
+static int decode_rx_hex(const char *hex)
+{
+	unsigned char bytes[RX_BYTES_MAX];
+	size_t len = 0;
+	size_t pid_index;
+	unsigned char pid;
+
+	if (!hex || !*hex) {
+		puts("usbhost decode no-rx-data");
+		return 1;
+	}
+	if (parse_hex_bytes(hex, bytes, sizeof(bytes), &len) < 0 || !len) {
+		fprintf(stderr, "fruitjam-usbhost: bad RX hex\n");
+		return 1;
+	}
+
+	pid_index = (len >= 2 && usb_pid_valid(bytes[1])) ? 1 : 0;
+	pid = bytes[pid_index];
+	if (!usb_pid_valid(pid)) {
+		printf("usbhost decode pid-invalid len=%zu byte0=0x%02x",
+		       len, bytes[0]);
+		if (len >= 2)
+			printf(" byte1=0x%02x", bytes[1]);
+		putchar('\n');
+		return 2;
+	}
+
+	printf("usbhost decode packet prefix-bytes=%zu pid=%s raw=0x%02x valid=yes packet-bytes=%zu\n",
+	       pid_index, usb_pid_name(pid), pid, len - pid_index);
+	if (usb_pid_is_data(pid)) {
+		size_t payload_with_crc = len - pid_index - 1;
+		size_t data_len = payload_with_crc >= 2 ?
+			payload_with_crc - 2 : payload_with_crc;
+
+		printf("usbhost decode data payload-bytes=%zu crc16=%s\n",
+		       data_len, payload_with_crc >= 2 ? "present" : "missing");
+		if (data_len)
+			print_descriptor_hint(&bytes[pid_index + 1], data_len);
+	}
+	return 0;
 }
 
 static int bridge_read_raw(char *buf, size_t len)
@@ -465,6 +630,8 @@ static int bridge_action(const char *command, const char *label)
 	}
 	read_status(&st);
 	print_human(&st);
+	if (st.last_rx_hex[0])
+		decode_rx_hex(st.last_rx_hex);
 	return st.power >= 0 ? 0 : 1;
 }
 
@@ -719,6 +886,12 @@ int main(int argc, char **argv)
 		read_status(&st);
 		print_json(&st);
 		return st.power >= 0 ? 0 : 1;
+	}
+	if (!strcmp(cmd, "decode")) {
+		if (argc > 2)
+			return decode_rx_hex(argv[2]);
+		read_status(&st);
+		return decode_rx_hex(st.last_rx_hex);
 	}
 	if (!strcmp(cmd, "wait")) {
 		if (parse_seconds(argc > 2 ? argv[2] : NULL, 5, &seconds) < 0) {

@@ -431,7 +431,9 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os \
 "$tmp/fruitjam-usbhost" wait 0 > "$tmp/fruitjam-usbhost-wait.txt"
 "$tmp/fruitjam-usbhost" monitor 0 > "$tmp/fruitjam-usbhost-monitor.txt"
 "$tmp/fruitjam-usbhost" reset 10 > "$tmp/fruitjam-usbhost-reset.txt"
-python3 - "$tmp/fruitjam-usbhost.txt" "$tmp/fruitjam-usbhost.json" "$tmp/fruitjam-usbhost-wait.txt" "$tmp/fruitjam-usbhost-monitor.txt" "$tmp/fruitjam-usbhost-reset.txt" "$gpio_root" <<'PY'
+"$tmp/fruitjam-usbhost" decode c312010002000000403412 > "$tmp/fruitjam-usbhost-decode-direct.txt"
+"$tmp/fruitjam-usbhost" decode f04b12010002000000403412 > "$tmp/fruitjam-usbhost-decode-bridge.txt"
+python3 - "$tmp/fruitjam-usbhost.txt" "$tmp/fruitjam-usbhost.json" "$tmp/fruitjam-usbhost-wait.txt" "$tmp/fruitjam-usbhost-monitor.txt" "$tmp/fruitjam-usbhost-reset.txt" "$gpio_root" "$tmp/fruitjam-usbhost-decode-direct.txt" "$tmp/fruitjam-usbhost-decode-bridge.txt" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -442,6 +444,8 @@ wait = Path(sys.argv[3]).read_text()
 monitor = Path(sys.argv[4]).read_text()
 reset = Path(sys.argv[5]).read_text()
 gpio_root = Path(sys.argv[6])
+decode_direct = Path(sys.argv[7]).read_text()
+decode_bridge = Path(sys.argv[8]).read_text()
 if "usbhost device full-speed-device" not in text:
     raise SystemExit("fruitjam-usbhost status did not classify full-speed device")
 if "pio-packet-io" not in text:
@@ -460,9 +464,16 @@ if not (gpio_root / "gpio1" / "direction").read_text().startswith("in"):
     raise SystemExit("fruitjam-usbhost reset did not release D+ to input")
 if not (gpio_root / "gpio2" / "direction").read_text().startswith("in"):
     raise SystemExit("fruitjam-usbhost reset did not release D- to input")
+if "pid=DATA0" not in decode_direct or "payload-bytes=8" not in decode_direct:
+    raise SystemExit("fruitjam-usbhost direct packet decode regressed")
+if "descriptor device-prefix" not in decode_direct or "maxpkt0=64" not in decode_direct:
+    raise SystemExit("fruitjam-usbhost device descriptor decode regressed")
+if "prefix-bytes=1" not in decode_bridge or "pid=DATA1" not in decode_bridge:
+    raise SystemExit("fruitjam-usbhost bridge-format packet decode regressed")
 PY
 echo "ok fruitjam-usbhost status"
 echo "ok fruitjam-usbhost json wait monitor reset"
+echo "ok fruitjam-usbhost rx decode"
 
 echo "== hid boot-keyboard decoder host behavior =="
 cc -Wall -Wextra -Wno-deprecated-declarations -Os \
@@ -891,6 +902,8 @@ if "in-token-gated" not in helper or "get-device-8-gated" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not expose gated RX diagnostics")
 if "pio_configured" not in helper or "last_tx_result" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not surface PIO TX counters")
+if "decode [RX-HEX]" not in helper or "descriptor device-prefix" not in helper:
+    raise SystemExit("fruitjam-usbhost helper missing RX descriptor decoder")
 for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirLift")):
     for needle in (
         "in-token",

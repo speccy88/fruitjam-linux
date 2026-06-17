@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import socket
 import sys
 import time
@@ -16,6 +17,7 @@ from typing import Callable, Protocol
 CONTROL_NOISE = b"\x10\x01\x01"
 DEFAULT_PORT = os.environ.get("FJ_CDC_PORT", "/dev/tty.usbmodem1101")
 DEFAULT_BAUD = int(os.environ.get("FJ_CDC_BAUD", "115200"))
+SHELL_PROBE_MARKER = "FJ_SHELL_READY"
 USB_KEYBOARD_SHELL_MARKER = "USBKBD_SMOKE"
 
 
@@ -67,22 +69,50 @@ def extract_payload(text: str, begin: str, end: str) -> str:
 
 
 class SerialShell:
-    def __init__(self, port: str, baud: int, verbose: bool = False):
+    def __init__(self, port: str, baud: int, open_timeout: float, verbose: bool = False):
         try:
             import serial
         except ImportError as exc:  # pragma: no cover - host dependency guard
             raise SystemExit("pyserial is required for CDC mode: python3 -m pip install pyserial") from exc
 
         self.verbose = verbose
-        self.serial = serial.Serial(
-            port,
-            baud,
-            timeout=0.1,
-            write_timeout=2,
-            dsrdtr=False,
-            rtscts=False,
-        )
+        self.serial = self._open_serial(serial, port, baud, open_timeout)
         self.counter = 0
+
+    @staticmethod
+    def _open_serial(serial_module, port: str, baud: int, open_timeout: float):
+        class SerialOpenTimeout(Exception):
+            pass
+
+        def on_alarm(_signum, _frame):
+            raise SerialOpenTimeout
+
+        old_handler = None
+        old_timer: tuple[float, float] | None = None
+        if hasattr(signal, "SIGALRM") and open_timeout > 0:
+            old_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, on_alarm)
+            old_timer = signal.setitimer(signal.ITIMER_REAL, open_timeout)
+        try:
+            serial_port = serial_module.Serial(
+                port,
+                baud,
+                timeout=0.1,
+                write_timeout=2,
+                dsrdtr=False,
+                rtscts=False,
+            )
+            serial_port.dtr = True
+            serial_port.rts = False
+            return serial_port
+        except SerialOpenTimeout as exc:
+            raise RuntimeError(f"serial open timed out after {open_timeout:.0f}s on {port}") from exc
+        except (OSError, serial_module.SerialException) as exc:
+            raise RuntimeError(f"serial open failed on {port}: {exc}") from exc
+        finally:
+            if old_handler is not None and old_timer is not None:
+                signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
+                signal.signal(signal.SIGALRM, old_handler)
 
     def close(self) -> None:
         self.serial.close()
@@ -108,7 +138,6 @@ class SerialShell:
 
         self.serial.reset_input_buffer()
         self.serial.write(wrapped.encode("utf-8") + b"\r")
-        self.serial.flush()
 
         deadline = time.monotonic() + timeout
         raw = bytearray()
@@ -216,7 +245,9 @@ class TelnetShell:
 class FakeShell:
     def run(self, command: str, timeout: float = 12.0) -> CommandResult:
         del timeout
-        if command == "fruitjam-usbhost status":
+        if command == f"echo {SHELL_PROBE_MARKER}":
+            output = SHELL_PROBE_MARKER
+        elif command == "fruitjam-usbhost status":
             output = "usbhost device full-speed-device\nusbhost next pio-packet-io first=boot-protocol-keyboard"
         elif command == "berry-run /root/berry/12-usbhost-keyboard.be":
             output = "12-usbhost-keyboard.be: ok"
@@ -292,6 +323,26 @@ def pass_if(
     if result.timed_out:
         return TestResult(name, "FAIL", f"timeout after {timeout:.0f}s", result.output)
     return TestResult(name, "FAIL", f"rc={result.rc} {first_line(result.output)}", result.output)
+
+
+def shell_preflight(shell: Shell, timeout: float) -> TestResult:
+    result = shell.run(f"echo {SHELL_PROBE_MARKER}", timeout=timeout)
+    ok = (
+        not result.timed_out and
+        result.rc == 0 and
+        clean_output(result) and
+        SHELL_PROBE_MARKER in result.output
+    )
+    if ok:
+        return TestResult("board shell preflight", "PASS", "command markers round-tripped", result.output)
+    if result.timed_out:
+        return TestResult("board shell preflight", "FAIL", f"timeout after {timeout:.0f}s", result.output)
+    return TestResult(
+        "board shell preflight",
+        "FAIL",
+        f"rc={result.rc} {first_line(result.output)}",
+        result.output,
+    )
 
 
 def usbhost_keyboard_tests(shell: Shell, seconds: int, require_input: bool) -> list[TestResult]:
@@ -390,9 +441,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transport", choices=("auto", "cdc", "telnet"), default="auto")
     parser.add_argument("--port", default=DEFAULT_PORT, help="CDC serial port")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="CDC serial baud")
+    parser.add_argument("--serial-open-timeout", type=float, default=5.0, help="seconds for opening/configuring the CDC port")
     parser.add_argument("--telnet-host", default=os.environ.get("FJ_TELNET_HOST"), help="AirLift telnet host/IP")
     parser.add_argument("--telnet-port", type=int, default=int(os.environ.get("FJ_TELNET_PORT", "23")))
     parser.add_argument("--seconds", type=int, default=int(os.environ.get("FJ_USB_KEYBOARD_SECONDS", "8")))
+    parser.add_argument("--shell-probe-timeout", type=float, default=5.0, help="seconds for the initial shell echo check")
+    parser.add_argument("--no-shell-probe", action="store_true", help="skip the initial board shell echo check")
     parser.add_argument("--require-input", action="store_true", help="fail unless typed text/events/shell input are captured")
     parser.add_argument("--self-test", action="store_true", help="run the smoke logic against an in-process fake shell")
     parser.add_argument("-v", "--verbose", action="store_true", help="show command output")
@@ -406,15 +460,26 @@ def make_shell(args: argparse.Namespace) -> Shell:
         if not args.telnet_host:
             raise SystemExit("--telnet-host is required for telnet transport")
         return TelnetShell(args.telnet_host, args.telnet_port, verbose=args.verbose)
-    return SerialShell(args.port, args.baud, verbose=args.verbose)
+    return SerialShell(args.port, args.baud, args.serial_open_timeout, verbose=args.verbose)
 
 
 def main() -> int:
     args = parse_args()
-    shell = make_shell(args)
     try:
-        results = usbhost_keyboard_tests(shell, args.seconds, args.require_input)
+        shell = make_shell(args)
+    except RuntimeError as exc:
+        return print_report([TestResult("board shell preflight", "FAIL", str(exc))], args.verbose)
+    try:
+        results: list[TestResult] = []
+        if not args.no_shell_probe:
+            results.append(shell_preflight(shell, args.shell_probe_timeout))
+            if results[-1].status == "FAIL":
+                return print_report(results, args.verbose)
+        results.extend(usbhost_keyboard_tests(shell, args.seconds, args.require_input))
         return print_report(results, args.verbose)
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 130
     finally:
         shell.close()
 

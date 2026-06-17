@@ -74,6 +74,8 @@ Validated on the Fruit Jam board:
 * `fruitjam-mem` and `free` provide a tiny no-fork memory, uptime, load, and
   commit-pressure summary from `/proc` without enabling heavier BusyBox procps
   applets.
+* `fruitjam-ps` and `ps` provide a tiny no-fork process list from `/proc` for
+  interactive inspection without re-enabling the larger BusyBox `ps` applet.
 * `fruitjam-services init` creates `/mnt/sd/www/index.html` with a small
   "Fruit Jam stuff" placeholder only when the SD card does not already have an
   index page. HTTP `/` serves that SD-card page; `/playground` serves the

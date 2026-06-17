@@ -192,7 +192,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | USB device console | RP2350 USB CDC, `/dev/ttyGS0` | Supported | Host sees `/dev/tty.usbmodem1101`; CDC shell is used by the smoke suite. | CDC console can be sensitive to repeated open/close churn. |
 | UART console header | GPIO8 TX, GPIO9 RX | Supported | Hardware UART shell/log path at 115200 8N1. | Keep as fallback when USB or graphics work changes. |
 | ROM BOOTSEL from Linux | RP2350 reboot command | Supported | `fruitjamctl bootsel` re-enters BOOTSEL and `picotool info -a` sees the ROM. | None. |
-| BusyBox userspace | `/bin`, `/usr/bin` | Supported | BusyBox tools plus `vi`, `hush`, web/network helpers, `free`/`fruitjam-mem`, and Fruit Jam tools. | Keep applets constrained for no-MMU allocation behavior. |
+| BusyBox userspace | `/bin`, `/usr/bin` | Supported | BusyBox tools plus `vi`, `hush`, web/network helpers, `free`/`fruitjam-mem`, tiny `ps`/`fruitjam-ps`, and Fruit Jam tools. | Keep applets constrained for no-MMU allocation behavior. |
 | Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, I2C scan/ping, USB-host status through the kernel bridge when present, USB HID report decode, USB keyboard command helpers, AirLift diagnostics/TCP helpers, MQTT command helpers, device presence, audio clock, RTTTL/WAV command helpers, `fruitjamctl` board-control commands, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
 | Onboard NeoPixels | GPIO32, five LEDs | Supported | PIO-backed `/dev/neopixels`; Berry and CGI can update pixels. | None for basic color writes. |
 | Buttons | GPIO0, GPIO4, GPIO5 | Supported | Sysfs GPIO input, `fruitjam-buttons`, button log, CGI status, synthetic test events. | Physical edge logging should get longer soak testing. |
@@ -239,6 +239,7 @@ process size and memory fragmentation matter.
 | `fruitjam-usbhost` | Report USB host power and D+/D- line state, preferring `/dev/fruitjam-usbhost` when present, with `json`, `wait`, `monitor`, `reset`, `decode`, `hid`, parameterized `kbd-init`/`kbd-poll`, `kbd-find`, `kbd-text`/`kbd-events`, and `kbd-shell`/`kbd-auto-shell` boot-keyboard commands. Berry exposes command builders and run wrappers for these keyboard probes. |
 | `fruitjam-hidkeys` | Decode USB HID boot-keyboard 8-byte reports into text/events, including DATA0/DATA1 `last_rx_hex` packets from the PIO bridge when they contain an 8-byte keyboard report. |
 | `fruitjam-mem`, `free` | Tiny no-fork memory, uptime, load, and commit-pressure summary from `/proc`. |
+| `fruitjam-ps`, `ps` | Tiny no-fork process list from `/proc`, with text and JSON output. |
 | `fruitjam-buttons` | Button daemon for GPIO0/GPIO4/GPIO5 with log, FIFO, SQLite, and MQTT hooks. |
 | `fruitjam-buttonlog` | Dump the fixed-schema button SQLite 3 log. |
 | `fruitjam-rtttl` | Play a small RTTTL tune through the TLV320 PIO I2S tone path. |
@@ -294,8 +295,10 @@ CDC shell or the AirLift telnet shell:
 ./scripts/usbhost-keyboard-smoke.py --transport telnet --telnet-host <board-ip> --require-input
 ```
 
-This proves the current narrow boot-protocol keyboard path: `kbd-find`, the
-Berry helper, live text/events, and a typed command in `kbd-auto-shell`.
+The runner first checks that command markers round-trip through the selected
+board shell, then proves the current narrow boot-protocol keyboard path:
+`kbd-find`, the Berry helper, live text/events, and a typed command in
+`kbd-auto-shell`.
 
 Recent release-prep verification on June 12, 2026:
 
@@ -313,7 +316,7 @@ and microphone-verified RTTTL/WAV audio on the flashed image.
 | --- | --- | --- |
 | USB CDC shell | PASS | `fruitjam-cdc-ok` over `/dev/tty.usbmodem1101`. |
 | Kernel boot | PASS | Linux 6.15.0 no-MMU Buildroot console responded. |
-| Tool inventory | PASS | `airliftctl`, `berry`, `fruitjamctl`, `fruitjam-i2c`, `fruitjam-rtttl`, `fruitjam-services`, `fruitjam-buttons`, `fruitjam-usbhost`, `fruitjam-hidkeys`, `mosquitto_pub`, `mosquitto_sub`, `fruitjam-mem`, `free`, `wget`, `telnet`, `nc`, `tftp`, and `vi` found in `PATH`. |
+| Tool inventory | PASS | `airliftctl`, `berry`, `fruitjamctl`, `fruitjam-i2c`, `fruitjam-rtttl`, `fruitjam-services`, `fruitjam-buttons`, `fruitjam-usbhost`, `fruitjam-hidkeys`, `mosquitto_pub`, `mosquitto_sub`, `fruitjam-mem`, `free`, `fruitjam-ps`, `ps`, `wget`, `telnet`, `nc`, `tftp`, and `vi` found in `PATH`. |
 | Berry expression | PASS | `berry -e 'print("berry-cdc-ok")'` printed `berry-cdc-ok`. |
 | Board status helper | PASS | `fruitjamctl status` reported LED, USB power, peripheral reset, and three buttons. |
 | Button helper | PASS | `fruitjam-buttons status` reported button1/button2/button3 released. |

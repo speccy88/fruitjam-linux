@@ -264,10 +264,11 @@ work.
 * Keep the next step hardware-side and minimal: run either the CDC smoke suite
   with `--usb-keyboard --usb-keyboard-require-input`, or the focused
   `scripts/usbhost-keyboard-smoke.py --transport cdc|telnet --require-input`
-  runner, so it proves `kbd-find`, `kbd-auto-text`, `kbd-auto-events`, and the
-  `kbd-auto-shell` helper with the keyboard currently plugged into the Fruit
-  Jam. After that proof, decide whether to keep this as an explicit helper or
-  integrate a broader console path.
+  runner. The focused runner first verifies the selected board shell, then
+  proves `kbd-find`, `kbd-auto-text`, `kbd-auto-events`, and the `kbd-auto-shell`
+  helper with the keyboard currently plugged into the Fruit Jam. After that
+  proof, decide whether to keep this as an explicit helper or integrate a
+  broader console path.
 * Do not include mouse, storage, arbitrary hub hotplug, or composite-device support in the first keyboard milestone.
 
 ## Milestone G: AirLift networking

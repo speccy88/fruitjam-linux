@@ -81,6 +81,9 @@ define FRUITJAM_UTILS_BUILD_CMDS
 		-Wall -Wextra -Os -o $(@D)/fruitjam-mem \
 		$(@D)/fruitjam-mem.c
 	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
+		-Wall -Wextra -Os -o $(@D)/fruitjam-ps \
+		$(@D)/fruitjam-ps.c
+	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
 		-Wall -Wextra -Os -o $(@D)/fruitjam-wget \
 		$(@D)/fruitjam-wget.c
 	$(TARGET_CC) $(FRUITJAM_UTILS_TINY_CFLAGS) $(FRUITJAM_UTILS_TINY_LDFLAGS) \
@@ -109,6 +112,7 @@ define FRUITJAM_UTILS_BUILD_CMDS
 			$(@D)/fruitjam-shell \
 			$(@D)/fruitjam-uart-login \
 			$(@D)/fruitjam-mem \
+			$(@D)/fruitjam-ps \
 			$(@D)/fruitjam-hidkeys \
 			$(@D)/fruitjam-web.cgi \
 			$(@D)/fruitjam-rm \
@@ -146,6 +150,8 @@ define FRUITJAM_UTILS_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-uart-login $(TARGET_DIR)/usr/bin/fruitjam-uart-login
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-mem $(TARGET_DIR)/usr/bin/fruitjam-mem
 	ln -sf fruitjam-mem $(TARGET_DIR)/usr/bin/free
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-ps $(TARGET_DIR)/usr/bin/fruitjam-ps
+	ln -sf fruitjam-ps $(TARGET_DIR)/usr/bin/ps
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-wget $(TARGET_DIR)/usr/bin/wget
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-httpd $(TARGET_DIR)/usr/sbin/fruitjam-httpd
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-telnetd $(TARGET_DIR)/usr/sbin/fruitjam-telnetd

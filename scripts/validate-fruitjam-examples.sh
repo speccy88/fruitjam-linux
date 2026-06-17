@@ -26,6 +26,7 @@ mosquitto_pub_src="$repo/package/fruitjam-utils/src/mosquitto_pub.c"
 mosquitto_sub_src="$repo/package/fruitjam-utils/src/mosquitto_sub.c"
 uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
+ps_src="$repo/package/fruitjam-utils/src/fruitjam-ps.c"
 cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
 usb_keyboard_smoke_src="$repo/scripts/usbhost-keyboard-smoke.py"
 mqtt_smoke_src="$repo/scripts/mqtt-smoke-test.py"
@@ -719,6 +720,42 @@ if data.get("uptime_seconds") != 12.34 or data.get("load_15m") != 0.03:
 PY
 echo "ok fruitjam-mem text"
 echo "ok fruitjam-mem json"
+
+echo "== process helper host behavior =="
+proc_root="$tmp/proc"
+mkdir -p "$proc_root/1" "$proc_root/42"
+printf '1 (init) S 0 1 1 0 -1 4194560 10 0 0 0 1 2 0 0 20 0 1 0 100 409600 12 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n' > "$proc_root/1/stat"
+printf '/sbin/init\0' > "$proc_root/1/cmdline"
+printf '42 (fruitjam shell) R 1 1 1 0 -1 4194560 20 0 0 0 3 4 0 0 20 0 1 0 200 819200 8 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0\n' > "$proc_root/42/stat"
+: > "$proc_root/42/cmdline"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-DPROC_ROOT="\"$proc_root\"" \
+	-o "$tmp/fruitjam-ps" "$ps_src"
+"$tmp/fruitjam-ps" > "$tmp/fruitjam-ps.txt"
+"$tmp/fruitjam-ps" json > "$tmp/fruitjam-ps.json"
+python3 - "$tmp/fruitjam-ps.txt" "$tmp/fruitjam-ps.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+data = json.loads(Path(sys.argv[2]).read_text())
+if "PID" not in text or "PPID" not in text or "COMMAND" not in text:
+    raise SystemExit("fruitjam-ps text header missing")
+if "/sbin/init" not in text or "[fruitjam shell]" not in text:
+    raise SystemExit("fruitjam-ps text process output missing")
+procs = {proc["pid"]: proc for proc in data.get("processes", [])}
+if procs.get(1, {}).get("command") != "/sbin/init":
+    raise SystemExit("fruitjam-ps json missing init command")
+if procs.get(42, {}).get("command") != "[fruitjam shell]":
+    raise SystemExit("fruitjam-ps json missing comm fallback")
+if procs.get(42, {}).get("state") != "R" or procs.get(42, {}).get("ppid") != 1:
+    raise SystemExit("fruitjam-ps json state/ppid regressed")
+if procs.get(1, {}).get("vsize_kb") != 400:
+    raise SystemExit("fruitjam-ps json vsize calculation regressed")
+PY
+echo "ok fruitjam-ps text"
+echo "ok fruitjam-ps json"
 
 echo "== usbhost helper host behavior =="
 gpio_root="$tmp/gpio"
@@ -1679,8 +1716,12 @@ grep -q -- '--usb-keyboard' "$cdc_smoke_src"
 grep -q -- 'usbhost_keyboard_tests' "$cdc_smoke_src"
 echo "ok cdc smoke usb keyboard guard"
 python3 -m py_compile "$usb_keyboard_smoke_src"
-"$usb_keyboard_smoke_src" --self-test --require-input >/dev/null
+usb_keyboard_smoke_out=$("$usb_keyboard_smoke_src" --self-test --require-input)
+printf '%s\n' "$usb_keyboard_smoke_out" | grep -q 'board shell preflight'
+printf '%s\n' "$usb_keyboard_smoke_out" | grep -q '7 passed, 0 failed'
 grep -q -- '--transport' "$usb_keyboard_smoke_src"
+grep -q -- '--shell-probe-timeout' "$usb_keyboard_smoke_src"
+grep -q -- '--serial-open-timeout' "$usb_keyboard_smoke_src"
 grep -q -- 'kbd-auto-shell' "$usb_keyboard_smoke_src"
 echo "ok focused usb keyboard smoke guard"
 python3 -m py_compile "$mqtt_smoke_src"
@@ -1858,6 +1899,8 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$uart_login_src
 echo "ok c syntax $uart_login_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$mem_src"
 echo "ok c syntax $mem_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$ps_src"
+echo "ok c syntax $ps_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$buttons_src"
 echo "ok c syntax $buttons_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$dvi_src"

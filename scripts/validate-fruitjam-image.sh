@@ -31,6 +31,7 @@ required = [
     "./root/berry/10-mqtt-subscribe.be",
     "./root/berry/11-i2c.be",
     "./root/berry/12-usbhost-keyboard.be",
+    "./root/berry/13-airlift.be",
     "./root/berry/run-all.be",
     "./root/berry/neopixel-rainbow-10s.be",
     "./root/rtttl/01-scale.rtttl",
@@ -112,6 +113,8 @@ with tarfile.open(rootfs) as tf:
         "i2c_ping_command",
         "usbhost_kbd_find_command",
         "usbhost_kbd_auto_shell_command",
+        "airlift_tcp_get_command",
+        "airlift_join_command",
     ):
         if needle not in fruitjam_be:
             raise SystemExit(f"fruitjam.be missing {needle!r}")
@@ -132,6 +135,11 @@ with tarfile.open(rootfs) as tf:
                    "usbhost_kbd_auto_events_command", "usbhost_kbd_auto_shell_command"):
         if needle not in usbkbd_example:
             raise SystemExit(f"12-usbhost-keyboard.be missing {needle!r}")
+    airlift_example = read_text(tf, "./root/berry/13-airlift.be")
+    for needle in ("airlift_command", "airlift_tcp_get_command",
+                   "airlift_join_command", "example.com"):
+        if needle not in airlift_example:
+            raise SystemExit(f"13-airlift.be missing {needle!r}")
 
     sh_run_all = read_text(tf, "./root/sh/run-all.sh")
     if "15-wav-analyze.sh" not in sh_run_all:

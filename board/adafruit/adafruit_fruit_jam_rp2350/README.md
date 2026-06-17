@@ -46,8 +46,8 @@ Validated on the Fruit Jam board:
 * Berry REPL expression evaluation.
 * `/root/berry/fruitjam.be` provides an importable Berry hardware helper module
   for GPIO/buttons, ADC, I2C scan/ping, USB-host status, USB HID report decode,
-  USB keyboard probe commands, MQTT command helpers, device presence, audio
-  clock, DVI command writes, and NeoPixels.
+  USB keyboard probe commands, AirLift diagnostics/TCP commands, MQTT command
+  helpers, device presence, audio clock, DVI command writes, and NeoPixels.
 * `/root/berry/neopixels.be` runs with `berry-run /root/berry/neopixels.be` and lights the
   five onboard NeoPixels.
 * BusyBox `vi` is enabled as `/bin/vi`.
@@ -205,7 +205,10 @@ polling now have a narrow live text/events/shell path for boot-protocol
 keyboards. The default target is address 1, configuration 1, interface 0, and
 endpoint 1; `fruitjam-usbhost` can pass explicit address/config/interface/endpoint
 values, or run the bounded `kbd-find`/`kbd-auto-*` scan, for keyboards that do
-not match that simplest layout.
+not match that simplest layout. Use
+`./scripts/cdc-smoke-test.py --usb-keyboard --usb-keyboard-require-input` from
+the repository root to prove the live keyboard text/events and helper shell path
+on flashed hardware.
 `fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events. It
 also accepts DATA0/DATA1 `last_rx_hex` packets from `fruitjam-usbhost` when the
 payload is an 8-byte keyboard report, so bridge captures can feed the same
@@ -402,6 +405,7 @@ berry-run /root/berry/09-mqtt-publish.be
 berry-run /root/berry/10-mqtt-subscribe.be
 berry-run /root/berry/11-i2c.be
 berry-run /root/berry/12-usbhost-keyboard.be
+berry-run /root/berry/13-airlift.be
 berry-run /root/berry/neopixels.be
 ```
 

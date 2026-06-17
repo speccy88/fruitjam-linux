@@ -102,6 +102,13 @@ assert(fruitjam.usbhost_kbd_shell_command(nil, 1, 1, 0, 2) ==
        "fruitjam-usbhost kbd-shell '0' '1' '1' '0' '2'")
 print("fake usb keyboard helpers: ok")
 
+assert(fruitjam.airlift_command("fw") == "airliftctl fw")
+assert(fruitjam.airlift_tcp_get_command("example.com", "/") ==
+       "airliftctl tcp-get 'example.com' '/'")
+assert(fruitjam.airlift_join_command("ssid name", "pass word") ==
+       "airliftctl join 'ssid name' 'pass word'")
+print("fake airlift helpers: ok")
+
 assert(fruitjam.audio_clock("start")["ok"])
 assert(fruitjam.read_text(fruitjam.paths["audio"]) == "start")
 assert(fruitjam.audio_clock("stop")["ok"])

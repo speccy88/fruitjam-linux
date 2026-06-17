@@ -192,7 +192,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | UART console header | GPIO8 TX, GPIO9 RX | Supported | Hardware UART shell/log path at 115200 8N1. | Keep as fallback when USB or graphics work changes. |
 | ROM BOOTSEL from Linux | RP2350 reboot command | Supported | `fruitjamctl bootsel` re-enters BOOTSEL and `picotool info -a` sees the ROM. | None. |
 | BusyBox userspace | `/bin`, `/usr/bin` | Supported | BusyBox tools plus `vi`, `hush`, web/network helpers, `free`/`fruitjam-mem`, and Fruit Jam tools. | Keep applets constrained for no-MMU allocation behavior. |
-| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, I2C scan/ping, USB-host status through the kernel bridge when present, USB HID report decode, USB keyboard command helpers, MQTT command helpers, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
+| Berry interpreter | `/usr/bin/berry`, `/usr/bin/berry-run`, `/root/berry/fruitjam.be` | Supported | `berry -e`, scripts, REPL, and an importable Fruit Jam hardware module for GPIO/buttons, ADC, I2C scan/ping, USB-host status through the kernel bridge when present, USB HID report decode, USB keyboard command helpers, AirLift diagnostics/TCP helpers, MQTT command helpers, device presence, audio clock, DVI command writes, and NeoPixels; `berry-run /root/berry/neopixels.be` drives LEDs with lower cache pressure for multi-script runs. The playground can also list and run regular `.be` files from `/mnt/sd/berry` as `SD:` entries. | Extend the Berry module as more kernel helpers land. |
 | Onboard NeoPixels | GPIO32, five LEDs | Supported | PIO-backed `/dev/neopixels`; Berry and CGI can update pixels. | None for basic color writes. |
 | Buttons | GPIO0, GPIO4, GPIO5 | Supported | Sysfs GPIO input, `fruitjam-buttons`, button log, CGI status, synthetic test events. | Physical edge logging should get longer soak testing. |
 | Red LED / IR pin | GPIO29 | Partial | LED control through sysfs/`fruitjamctl`; active-low output works. | IR receiver decoding is not implemented. |
@@ -205,7 +205,7 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | Telnet service | AirLift TCP/23; optional loopback TCP/23 | Supported | AirLift inbound shell and tiny `fruitjam-telnetd`/`fruitjam-shell`; telnet smoke tests pass. | Only one AirLift telnet session at a time. |
 | FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | Passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. | Upload completion can be slow over the current NINA raw socket path; active FTP remains a future objective. |
 | TFTP service | Optional loopback UDP/69 | Supported | BusyBox `tftpd` serves the TFTP area README when `fruitjam-services core` is started. | Not part of the default external AirLift service set. |
-| USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state, bus-reset timing, PIO2 packet I/O, descriptor/HID decode diagnostics, parameterized `kbd-init`/`kbd-poll` boot-keyboard probes, bounded `kbd-find` target auto-scan, `kbd-text`/`kbd-events` polling loops, and `kbd-shell`/`kbd-auto-shell` for a tiny USB-keyboard-driven command loop. This is not a hub/composite/general USB stack. | Hardware-smoke the USB keyboard shell path on the current board, then decide whether to keep it as an explicit helper or integrate a broader console path. |
+| USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state, bus-reset timing, PIO2 packet I/O, descriptor/HID decode diagnostics, parameterized `kbd-init`/`kbd-poll` boot-keyboard probes, bounded `kbd-find` target auto-scan, `kbd-text`/`kbd-events` polling loops, and `kbd-shell`/`kbd-auto-shell` for a tiny USB-keyboard-driven command loop. This is not a hub/composite/general USB stack. | Run `./scripts/cdc-smoke-test.py --usb-keyboard --usb-keyboard-require-input` on the current board, then decide whether to keep this as an explicit helper or integrate a broader console path. |
 | USB host 5V switch | GPIO11 | Partial | `fruitjamctl usb-power on/off` controls power enable. | Needs full USB host stack for devices. |
 | DVI / HSTX output | GPIO12-GPIO19, `/dev/fruitjam-dvi` | Partial | Tiny RGB332 HSTX DVI misc driver plus `fruitjam-dvi` text/dashboard/helper command output; hardware commands were verified on the flashed image. | Full fbdev/console is not implemented. |
 | I2S data path | GPIO24 DIN, GPIO25 MCLK | Partial | Tiny generated-tone path exists for RTTTL and simple WAV tone tests. | Add complete streamed PCM driver/path. |
@@ -278,10 +278,12 @@ chmod 600 .fruitjam.env
 
 Use `--audio` to include the short RTTTL speaker test. Use `--usb-keyboard`
 with a boot-protocol HID keyboard plugged into the Fruit Jam host port to run
-`kbd-find`, the Berry USB keyboard helper, and live `kbd-auto-text`/`kbd-auto-events`
-loops. Add `--usb-keyboard-require-input` when someone can press keys during
-the test and you want captured text/events to be required. Use `--skip-airlift`
-or `--skip-services` to narrow the suite during bring-up.
+`kbd-find`, the Berry USB keyboard helper, live `kbd-auto-text`/`kbd-auto-events`
+loops, and the `kbd-auto-shell` helper shell. Add
+`--usb-keyboard-require-input` when someone can press keys during the test and
+you want captured text/events plus a typed `echo USBKBD_SMOKE` shell command to
+be required. Use `--skip-airlift` or `--skip-services` to narrow the suite
+during bring-up.
 
 Recent release-prep verification on June 12, 2026:
 
@@ -534,6 +536,7 @@ UART, or telnet. They cover the features that have been brought up so far.
     berry -e 'print("hello fruit jam")'
     berry -e 'import math print(math.sqrt(81))'
     berry-run /root/berry/12-usbhost-keyboard.be
+    berry-run /root/berry/13-airlift.be
     berry-run /root/berry/neopixels.be
     berry
     ```

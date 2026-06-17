@@ -40,11 +40,13 @@ Files:
   10-mqtt-subscribe.be      Uses fruitjam MQTT helpers and writes /tmp/fruitjam-mqtt-sub.sh.
   11-i2c.be                 Uses fruitjam I2C helpers to scan and ping TLV320DAC3100.
   12-usbhost-keyboard.be    Uses fruitjam USB keyboard helpers for kbd-find and live smoke commands.
+  13-airlift.be             Uses fruitjam AirLift helpers for fw/status/ip/mac and TCP smoke commands.
   fruitjam.be              Importable helpers for GPIO, buttons, ADC, USB-host status,
                             HID decode, USB keyboard command build/run, I2C scan/ping,
-                            MQTT command build/run, audio clock, DVI command writes,
-                            device presence, and NeoPixels. USB-host status prefers the
-                            kernel bridge and falls back to GPIO line-state reads.
+                            AirLift diagnostics/TCP commands, MQTT command build/run,
+                            audio clock, DVI command writes, device presence, and
+                            NeoPixels. USB-host status prefers the kernel bridge and
+                            falls back to GPIO line-state reads.
   fruitjam_lib.be          Small importable Berry module used by the language tour.
   neopixels.be             Five-pixel static smoke pattern.
   neopixel-colors.be       RGB color cycle inspired by the Fruit Jam NeoPixel examples.

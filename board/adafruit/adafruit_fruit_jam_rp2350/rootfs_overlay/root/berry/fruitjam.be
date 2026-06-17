@@ -796,6 +796,36 @@ fruitjam.mqtt_subscribe_script = def(path)
     return {"ok": true, "path": path}
 end
 
+fruitjam.airlift_command = def(action)
+    return "airliftctl " + action
+end
+
+fruitjam.airlift_tcp_get_command = def(host, path)
+    var target = path
+    if target == nil || target == ""
+        target = "/"
+    end
+    return "airliftctl tcp-get " + fruitjam.shell_quote(host) +
+           " " + fruitjam.shell_quote(target)
+end
+
+fruitjam.airlift_join_command = def(ssid, password)
+    return "airliftctl join " + fruitjam.shell_quote(ssid) +
+           " " + fruitjam.shell_quote(password)
+end
+
+fruitjam.airlift = def(action)
+    var cmd = fruitjam.airlift_command(action)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.airlift_tcp_get = def(host, path)
+    var cmd = fruitjam.airlift_tcp_get_command(host, path)
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
 fruitjam.i2c_addr_text = def(addr)
     if type(addr) == "string"
         return addr

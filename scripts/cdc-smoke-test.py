@@ -24,6 +24,7 @@ PROMPT_RE = re.compile(rb"(?:^|\r|\n)/ # ")
 CONTROL_NOISE = b"\x10\x01\x01"
 INBOUND_UPLOAD_NAME = "airlift_upload_smoke.txt"
 INBOUND_UPLOAD_TEXT = "hello from Fruit Jam AirLift upload smoke\n"
+USB_KEYBOARD_SHELL_MARKER = "USBKBD_SMOKE"
 
 
 @dataclass
@@ -374,6 +375,30 @@ def usbhost_keyboard_tests(shell: CdcShell, args: argparse.Namespace) -> Iterabl
             "live event loop completed"
             if not require_input
             else "live event loop saw key events"
+        ),
+    )
+    if require_input:
+        print(
+            "USB keyboard shell test: type "
+            f"`echo {USB_KEYBOARD_SHELL_MARKER}` then Enter on the Fruit Jam USB keyboard.",
+            flush=True,
+        )
+    yield pass_if(
+        shell,
+        "usb keyboard shell",
+        f"fruitjam-usbhost kbd-auto-shell {seconds}",
+        lambda r: (
+            r.rc == 0
+            and clean_output(r)
+            and "USB keyboard shell" in r.output
+            and "usbkbd$" in r.output
+            and (not require_input or USB_KEYBOARD_SHELL_MARKER in r.output)
+        ),
+        timeout=seconds + 25,
+        detail=(
+            "keyboard shell loop completed"
+            if not require_input
+            else f"keyboard shell saw {USB_KEYBOARD_SHELL_MARKER}"
         ),
     )
 
@@ -958,12 +983,12 @@ def parse_args() -> argparse.Namespace:
         "--usb-keyboard-seconds",
         type=int,
         default=int(os.environ.get("FJ_USB_KEYBOARD_SECONDS", "8")),
-        help="seconds for live USB keyboard text/events loops",
+        help="seconds for live USB keyboard text/events/shell loops",
     )
     parser.add_argument(
         "--usb-keyboard-require-input",
         action="store_true",
-        help="fail live USB keyboard loops unless typed text or key events are captured",
+        help="fail live USB keyboard loops unless typed text, key events, and shell input are captured",
     )
     parser.add_argument("--skip-display", action="store_true", help="skip the bounded DVI dashboard render")
     parser.add_argument("--skip-airlift", action="store_true", help="skip AirLift and WiFi tests")

@@ -27,6 +27,7 @@ mosquitto_sub_src="$repo/package/fruitjam-utils/src/mosquitto_sub.c"
 uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
 ps_src="$repo/package/fruitjam-utils/src/fruitjam-ps.c"
+pgrep_src="$repo/package/fruitjam-utils/src/fruitjam-pgrep.c"
 cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
 usb_keyboard_smoke_src="$repo/scripts/usbhost-keyboard-smoke.py"
 mqtt_smoke_src="$repo/scripts/mqtt-smoke-test.py"
@@ -731,15 +732,32 @@ printf '42 (fruitjam shell) R 1 1 1 0 -1 4194560 20 0 0 0 3 4 0 0 20 0 1 0 200 8
 cc -Wall -Wextra -Wno-deprecated-declarations -Os \
 	-DPROC_ROOT="\"$proc_root\"" \
 	-o "$tmp/fruitjam-ps" "$ps_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os \
+	-DPROC_ROOT="\"$proc_root\"" -DFRUITJAM_PGREP_DRY_RUN \
+	-o "$tmp/fruitjam-pgrep" "$pgrep_src"
+ln -sf fruitjam-pgrep "$tmp/pgrep"
+ln -sf fruitjam-pgrep "$tmp/pkill"
 "$tmp/fruitjam-ps" > "$tmp/fruitjam-ps.txt"
 "$tmp/fruitjam-ps" json > "$tmp/fruitjam-ps.json"
-python3 - "$tmp/fruitjam-ps.txt" "$tmp/fruitjam-ps.json" <<'PY'
+"$tmp/fruitjam-pgrep" init > "$tmp/fruitjam-pgrep-init.txt"
+"$tmp/pgrep" -f /sbin/init > "$tmp/fruitjam-pgrep-full.txt"
+"$tmp/pgrep" -l shell > "$tmp/fruitjam-pgrep-list.txt"
+"$tmp/pkill" -9 -x "fruitjam shell" > "$tmp/fruitjam-pkill.txt"
+if "$tmp/pgrep" missing-process > "$tmp/fruitjam-pgrep-missing.txt"; then
+	echo "fruitjam-pgrep matched a missing process" >&2
+	exit 1
+fi
+python3 - "$tmp/fruitjam-ps.txt" "$tmp/fruitjam-ps.json" "$tmp/fruitjam-pgrep-init.txt" "$tmp/fruitjam-pgrep-full.txt" "$tmp/fruitjam-pgrep-list.txt" "$tmp/fruitjam-pkill.txt" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text()
 data = json.loads(Path(sys.argv[2]).read_text())
+pgrep_init = Path(sys.argv[3]).read_text().strip()
+pgrep_full = Path(sys.argv[4]).read_text().strip()
+pgrep_list = Path(sys.argv[5]).read_text().strip()
+pkill = Path(sys.argv[6]).read_text().strip()
 if "PID" not in text or "PPID" not in text or "COMMAND" not in text:
     raise SystemExit("fruitjam-ps text header missing")
 if "/sbin/init" not in text or "[fruitjam shell]" not in text:
@@ -753,9 +771,17 @@ if procs.get(42, {}).get("state") != "R" or procs.get(42, {}).get("ppid") != 1:
     raise SystemExit("fruitjam-ps json state/ppid regressed")
 if procs.get(1, {}).get("vsize_kb") != 400:
     raise SystemExit("fruitjam-ps json vsize calculation regressed")
+if pgrep_init != "1" or pgrep_full != "1":
+    raise SystemExit(f"fruitjam-pgrep did not find init: {pgrep_init!r} {pgrep_full!r}")
+if pgrep_list != "42 fruitjam shell":
+    raise SystemExit(f"fruitjam-pgrep -l did not print command: {pgrep_list!r}")
+if pkill != "42 9":
+    raise SystemExit(f"fruitjam-pkill dry run did not select signal target: {pkill!r}")
 PY
 echo "ok fruitjam-ps text"
 echo "ok fruitjam-ps json"
+echo "ok fruitjam-pgrep"
+echo "ok fruitjam-pkill"
 
 echo "== usbhost helper host behavior =="
 gpio_root="$tmp/gpio"
@@ -1901,6 +1927,8 @@ cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$mem_src"
 echo "ok c syntax $mem_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$ps_src"
 echo "ok c syntax $ps_src"
+cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$pgrep_src"
+echo "ok c syntax $pgrep_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$buttons_src"
 echo "ok c syntax $buttons_src"
 cc -Wall -Wextra -Wno-deprecated-declarations -Os -fsyntax-only "$dvi_src"

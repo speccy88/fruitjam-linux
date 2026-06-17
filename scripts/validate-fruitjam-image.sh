@@ -47,6 +47,9 @@ required = [
     "./usr/bin/fruitjam-wavplay",
     "./usr/bin/fruitjam-ps",
     "./usr/bin/ps",
+    "./usr/bin/fruitjam-pgrep",
+    "./usr/bin/pgrep",
+    "./usr/bin/pkill",
     "./usr/bin/mosquitto_pub",
     "./usr/bin/mosquitto_sub",
     "./usr/bin/wget",
@@ -209,6 +212,11 @@ with tarfile.open(rootfs) as tf:
     for needle in (b"fruitjam-ps", b"PID", b"PPID", b"vsize_kb", b"rss_kb"):
         if needle not in fruitjam_ps:
             raise SystemExit(f"fruitjam-ps missing marker {needle!r}")
+
+    fruitjam_pgrep = read_bytes(tf, "./usr/bin/fruitjam-pgrep")
+    for needle in (b"fruitjam-pgrep", b"pgrep", b"pkill", b"PATTERN"):
+        if needle not in fruitjam_pgrep:
+            raise SystemExit(f"fruitjam-pgrep missing marker {needle!r}")
 
     airliftctl = read_bytes(tf, "./usr/bin/airliftctl")
     for needle in (b"mqtt-sub", b"mqtt-pub", b"USERNAME PASSWORD"):

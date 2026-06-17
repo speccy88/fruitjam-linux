@@ -280,6 +280,13 @@ to build or run the same AirLift-aware commands with `mqtt_pub_command`,
 `09-mqtt-publish.be` and `10-mqtt-subscribe.be` examples generate
 environment-configurable wrapper scripts under `/tmp`.
 
+For an end-to-end broker smoke from the host, set `FJ_MQTT_HOST`,
+`FJ_MQTT_USERNAME`, and `FJ_MQTT_PASSWORD`, then run
+`scripts/mqtt-smoke-test.py --transport cdc` or
+`scripts/mqtt-smoke-test.py --transport telnet --telnet-host <board-ip>`.
+The helper scrubs the password from its output and proves target publish plus
+target subscribe through AirLift.
+
 ## I2C
 
 The image exposes GPIO20/GPIO21 as a Linux GPIO-backed I2C master:

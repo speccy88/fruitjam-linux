@@ -28,6 +28,7 @@ uart_login_src="$repo/package/fruitjam-utils/src/fruitjam-uart-login.c"
 mem_src="$repo/package/fruitjam-utils/src/fruitjam-mem.c"
 cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
 usb_keyboard_smoke_src="$repo/scripts/usbhost-keyboard-smoke.py"
+mqtt_smoke_src="$repo/scripts/mqtt-smoke-test.py"
 bootloader_clocks_src="$repo/package/pico2-bootloader/bootloader/src/clocks.h"
 kernel_usbhost_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0020-misc-add-fruitjam-usbhost-bridge-driver.patch"
 kernel_usbhost_pio_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0021-misc-stage-fruitjam-usbhost-pio2-engine.patch"
@@ -1682,6 +1683,17 @@ python3 -m py_compile "$usb_keyboard_smoke_src"
 grep -q -- '--transport' "$usb_keyboard_smoke_src"
 grep -q -- 'kbd-auto-shell' "$usb_keyboard_smoke_src"
 echo "ok focused usb keyboard smoke guard"
+python3 -m py_compile "$mqtt_smoke_src"
+mqtt_smoke_out=$("$mqtt_smoke_src" --self-test --host broker.local --username user --password validate-secret)
+printf '%s\n' "$mqtt_smoke_out" | grep -q 'target mqtt publish'
+printf '%s\n' "$mqtt_smoke_out" | grep -q 'target mqtt subscribe'
+if printf '%s\n' "$mqtt_smoke_out" | grep -q 'validate-secret'; then
+	echo "mqtt smoke leaked password in output" >&2
+	exit 1
+fi
+grep -q -- 'mosquitto_pub --airlift' "$mqtt_smoke_src"
+grep -q -- 'mosquitto_sub --airlift' "$mqtt_smoke_src"
+echo "ok focused mqtt smoke guard"
 grep -q 'ttyAMA0::respawn:/usr/bin/fruitjam-uart-login' "$inittab_src"
 if grep -q 'ttyAMA0::respawn:/usr/bin/hush' "$inittab_src"; then
 	echo "ttyAMA0 hush respawn loop was reintroduced" >&2

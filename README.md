@@ -600,6 +600,21 @@ UART, or telnet. They cover the features that have been brought up so far.
     and `mosquitto_sub` commands, then write environment-configurable scripts
     under `/tmp`.
 
+    For an end-to-end publish and subscribe smoke test, run the focused host
+    helper from the repo. It keeps the broker password out of command output:
+
+    ```sh
+    export FJ_MQTT_HOST=192.0.2.10
+    export FJ_MQTT_USERNAME=your-user
+    export FJ_MQTT_PASSWORD=your-password
+    ./scripts/mqtt-smoke-test.py --transport cdc --port /dev/tty.usbmodem1101
+    ./scripts/mqtt-smoke-test.py --transport telnet --telnet-host <board-ip>
+    ```
+
+    The smoke test proves both directions: target `mosquitto_pub --airlift`
+    received by a host-side subscriber, and target `mosquitto_sub --airlift`
+    receiving a host-side publish.
+
 25. Route button events to MQTT through the SD-card config:
 
     ```sh

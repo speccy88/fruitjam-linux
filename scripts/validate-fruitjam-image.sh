@@ -33,6 +33,7 @@ required = [
     "./root/berry/12-usbhost-keyboard.be",
     "./root/berry/13-airlift.be",
     "./root/berry/14-audio-wav.be",
+    "./root/berry/15-board-control.be",
     "./root/berry/run-all.be",
     "./root/berry/neopixel-rainbow-10s.be",
     "./root/rtttl/01-scale.rtttl",
@@ -121,6 +122,10 @@ with tarfile.open(rootfs) as tf:
         "rtttl_command",
         "wav_analyze_command",
         "wav_play_command",
+        "board_status_command",
+        "usb_power_command",
+        "periph_reset_command",
+        "bootsel_command",
     ):
         if needle not in fruitjam_be:
             raise SystemExit(f"fruitjam.be missing {needle!r}")
@@ -152,6 +157,12 @@ with tarfile.open(rootfs) as tf:
                    "fruitjam-scale.wav"):
         if needle not in audio_example:
             raise SystemExit(f"14-audio-wav.be missing {needle!r}")
+    ctl_example = read_text(tf, "./root/berry/15-board-control.be")
+    for needle in ("board_status_command", "led_command",
+                   "usb_power_command", "periph_reset_command",
+                   "bootsel_command"):
+        if needle not in ctl_example:
+            raise SystemExit(f"15-board-control.be missing {needle!r}")
 
     sh_run_all = read_text(tf, "./root/sh/run-all.sh")
     if "15-wav-analyze.sh" not in sh_run_all:

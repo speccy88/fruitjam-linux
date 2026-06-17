@@ -42,13 +42,14 @@ Files:
   12-usbhost-keyboard.be    Uses fruitjam USB keyboard helpers for kbd-find and live smoke commands.
   13-airlift.be             Uses fruitjam AirLift helpers for fw/status/ip/mac and TCP smoke commands.
   14-audio-wav.be           Uses fruitjam audio helpers for RTTTL tones and WAV analyze/play commands.
+  15-board-control.be       Uses fruitjamctl helpers for status, LED, USB power, reset, and BOOTSEL commands.
   fruitjam.be              Importable helpers for GPIO, buttons, ADC, USB-host status,
                             HID decode, USB keyboard command build/run, I2C scan/ping,
                             AirLift diagnostics/TCP commands, MQTT command build/run,
                             audio clock, RTTTL/WAV command build/run, DVI command
-                            writes, device presence, and NeoPixels. USB-host status
-                            prefers the kernel bridge and falls back to GPIO line-state
-                            reads.
+                            writes, board-control commands, device presence, and
+                            NeoPixels. USB-host status prefers the kernel bridge and
+                            falls back to GPIO line-state reads.
   fruitjam_lib.be          Small importable Berry module used by the language tour.
   neopixels.be             Five-pixel static smoke pattern.
   neopixel-colors.be       RGB color cycle inspired by the Fruit Jam NeoPixel examples.

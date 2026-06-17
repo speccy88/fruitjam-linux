@@ -265,6 +265,93 @@ fruitjam.buttons_status = def()
     return out
 end
 
+fruitjam.ctl_run = def(cmd)
+    if cmd == ""
+        return {"ok": false, "status": 2, "command": cmd, "error": "bad fruitjamctl command"}
+    end
+    var status = os.system(cmd)
+    return {"ok": status == 0, "status": status, "command": cmd}
+end
+
+fruitjam.ctl_arg_allowed = def(action, allowed)
+    for item : allowed
+        if action == item
+            return true
+        end
+    end
+    return false
+end
+
+fruitjam.ctl_no_arg_command = def(command)
+    return "fruitjamctl " + command
+end
+
+fruitjam.ctl_one_arg_command = def(command, action, allowed)
+    if !fruitjam.ctl_arg_allowed(action, allowed)
+        return ""
+    end
+    return "fruitjamctl " + command + " " + fruitjam.shell_quote(action)
+end
+
+fruitjam.board_init_command = def()
+    return fruitjam.ctl_no_arg_command("init")
+end
+
+fruitjam.board_status_command = def()
+    return fruitjam.ctl_no_arg_command("status")
+end
+
+fruitjam.board_buttons_command = def()
+    return fruitjam.ctl_no_arg_command("buttons")
+end
+
+fruitjam.led_command = def(action)
+    return fruitjam.ctl_one_arg_command("led", action, ["on", "off", "toggle"])
+end
+
+fruitjam.usb_power_command = def(action)
+    return fruitjam.ctl_one_arg_command("usb-power", action, ["on", "off"])
+end
+
+fruitjam.periph_reset_command = def(action)
+    return fruitjam.ctl_one_arg_command("periph-reset", action, ["assert", "deassert", "pulse"])
+end
+
+fruitjam.bootsel_command = def(delay_ms)
+    if delay_ms == nil || delay_ms == ""
+        return fruitjam.ctl_no_arg_command("bootsel")
+    end
+    return "fruitjamctl bootsel " + fruitjam.shell_quote(delay_ms)
+end
+
+fruitjam.board_init = def()
+    return fruitjam.ctl_run(fruitjam.board_init_command())
+end
+
+fruitjam.board_status = def()
+    return fruitjam.ctl_run(fruitjam.board_status_command())
+end
+
+fruitjam.board_buttons = def()
+    return fruitjam.ctl_run(fruitjam.board_buttons_command())
+end
+
+fruitjam.led = def(action)
+    return fruitjam.ctl_run(fruitjam.led_command(action))
+end
+
+fruitjam.usb_power = def(action)
+    return fruitjam.ctl_run(fruitjam.usb_power_command(action))
+end
+
+fruitjam.periph_reset = def(action)
+    return fruitjam.ctl_run(fruitjam.periph_reset_command(action))
+end
+
+fruitjam.bootsel = def(delay_ms)
+    return fruitjam.ctl_run(fruitjam.bootsel_command(delay_ms))
+end
+
 fruitjam.usbhost_device = def(power, dp, dm)
     if power < 0
         return "unknown"

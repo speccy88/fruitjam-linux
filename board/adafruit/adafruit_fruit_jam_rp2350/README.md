@@ -92,12 +92,17 @@ Validated on the Fruit Jam board:
   `fruitjam-services core`, and `wget -O - http://127.0.0.1/cgi-bin/env.cgi`
   returns `Fruit Jam CGI OK`.
 * AirLift telnet on TCP/23 spawns `fruitjam-shell` and successfully echoed
-  `TELNET_OK`; loopback telnet works after `fruitjam-services core`.
+  `TELNET_OK`; loopback telnet works after `fruitjam-services core`. AirLift
+  telnet sessions use a 60-second default idle timeout so stale clients release
+  the single shell bridge quickly, and a new connection can preempt a stale
+  idle session after 15 seconds.
 * Default AirLift startup is supervised by `fruitjam-services airlift-monitor`.
   If the inbound server exits after opening ESP32-C6 TCP listeners, the monitor
   reruns setup and starts it again. Stale monitor PID files are ignored, and a
-  missing inbound heartbeat for 60 seconds triggers a restart; `/tmp/airlift-start.log`
-  records the loop.
+  missing inbound heartbeat for 60 seconds triggers a restart. The inbound
+  server also recycles itself periodically and exits on listener accept failures
+  so the monitor can reopen NINA sockets; `/tmp/airlift-start.log` records the
+  loop.
 * microSD enumerates as `/dev/mmcblk0` and `/dev/mmcblk0p1`; `/mnt/sd` mounts
   as VFAT, accepts writes, unmounts, remounts, and preserves the test file.
 * `airliftctl` talks to the onboard ESP32-C6 AirLift over RP2350 PL022/spidev
@@ -205,24 +210,28 @@ fruitjamctl bootsel
 
 BusyBox init runs `fruitjamctl init` during boot to configure the three buttons
 with pull-ups, turn the red LED off after the bootloader handoff, deassert the
-shared TLV320/ESP32-C6 reset line, and enable USB host 5 V power. This does not
-make USB HID, I2S audio, or HSTX DVI complete Linux drivers; it is a bring-up
-bridge so hardware validation can proceed over UART and USB CDC.
+shared TLV320/ESP32-C6 reset line, and enable USB host 5 V power. USB HID,
+I2S audio, and HSTX DVI are still bring-up drivers, but USB host is now wired
+through the Linux HCD path rather than only direct probe helpers.
 `/dev/fruitjam-usbhost` owns the USB host power switch plus GPIO1/GPIO2
 line-state and reset timing in the kernel. `fruitjam-usbhost status`, `json`,
 `wait`, `monitor`, `reset`, `decode`, `hid`, `kbd-find`, `kbd-text`,
 `kbd-events`, and `kbd-shell`/`kbd-auto-shell` use that bridge when present and
-fall back to sysfs GPIO on older images. The bridge stages the 32-word PIO2 full-speed host
-program so USB packet work has a dedicated block that does not collide with PIO0
-NeoPixels or PIO1 audio. PIO token/data transactions and boot-keyboard report
+fall back to sysfs GPIO on older images. The bridge stages the 32-word PIO0 full-speed host
+program to match wili8jam; NeoPixels use PIO2 and audio uses PIO1. PIO token/data transactions and boot-keyboard report
 polling now have a narrow live text/events/shell path for boot-protocol
 keyboards. The default target is address 1, configuration 1, interface 0, and
 endpoint 1; `fruitjam-usbhost` can pass explicit address/config/interface/endpoint
 values, or run the bounded `kbd-find`/`kbd-auto-*` scan, for keyboards that do
-not match that simplest layout. Use
-`./scripts/cdc-smoke-test.py --usb-keyboard --usb-keyboard-require-input` from
-the repository root to prove the live keyboard text/events and helper shell path
-on flashed hardware.
+not match that simplest layout. The Linux HCD uses the wili8jam PIO0/SM0/SM1/
+SM2/DMA9/252 MHz settings, auto-registers after an 8 second boot service
+window, power-cycles host 5V before registration, waits 500 ms after port reset
+before EP0 enumeration for the CH334F hub, schedules an automatic power-cycle
+recovery after repeated EP0 failures, and leaves `fruitjam-usbhost hcd-start`
+available as an idempotent retry. Use
+`./scripts/usbhost-hcd-smoke.py` from the repository root to prove
+the live Logitech receiver, keyboard input node, Xbox360 receiver, and xpad/
+joydev path on flashed hardware.
 `fruitjam-hidkeys` decodes boot-protocol keyboard reports into text/events. It
 also accepts DATA0/DATA1 `last_rx_hex` packets from `fruitjam-usbhost` when the
 payload is an 8-byte keyboard report, so bridge captures can feed the same
@@ -231,6 +240,20 @@ tested key translation path.
 The `bootsel` command requests a restart into the RP2350 ROM BOOTSEL loader. It
 has been verified on Fruit Jam hardware by running `fruitjamctl bootsel` from the
 Linux console and confirming `picotool info -a` reports `boot type: bootsel`.
+
+From the repository root, `scripts/fruitjam-recover-flash.py` automates the
+host-side recovery sequence and flashes `buildroot-output-docker-images/flash-image.uf2`
+after BOOTSEL is visible. It tries AirLift HTTP, AirLift telnet, a
+DTR/RTS-disabled hardware UART shell if one is available, and USB CDC recovery.
+On macOS, the CDC pass tries the selected `/dev/cu.usbmodem*` node and its
+`/dev/tty.usbmodem*` counterpart unless `--no-tty-counterpart` is passed:
+
+```sh
+FJ_HTTP_HOST=<board-ip> FJ_TELNET_HOST=<board-ip> ./scripts/fruitjam-recover-flash.py -v
+```
+
+To force the hardware UART route, use `--uart-port /dev/cu.usbserial-P97cvdxp`
+or set `FJ_UART_PORT=/dev/cu.usbserial-P97cvdxp`.
 
 ## Sysfs GPIO
 
@@ -457,16 +480,16 @@ test
 * HSTX DVI has a tiny `/dev/fruitjam-dvi` RGB332 frame helper for bounded
   dashboard/text/test frames. Full fbdev/console support is not implemented.
 * USB host 5 V power, D+/D- reset/line-state ownership, PIO packet I/O,
-  parameterized boot-keyboard init/poll, bounded keyboard target auto-scan,
-  text/events polling, and a tiny USB-keyboard-driven shell now live behind the
-  `/dev/fruitjam-usbhost` kernel bridge. Hub, mass-storage, and general Linux
-  input support are not implemented; composite keyboards may work only when the
-  boot-keyboard interface and interrupt endpoint are within the small scan
-  window.
+  parameterized boot-keyboard probes, bounded keyboard target auto-scan,
+  text/events polling, a tiny USB-keyboard-driven shell, and the Linux
+  HCD/HID/xpad path now live behind the `/dev/fruitjam-usbhost` kernel bridge.
+  Hub, HID keyboard, evdev/joydev, and Xbox/xpad support are configured, but
+  the current image still needs fresh Logitech receiver plus Xbox360 gamepad
+  hardware verification.
 * Buttons, GPIO29, microSD block access, button SQLite logging, GPIO20/GPIO21
   I2C, AirLift userspace socket access, first-step TLV320 RTTTL audio, and the
   narrow USB boot-keyboard probe work, but WiFi/AirLift Linux netdev support,
-  full PCM/I2S audio, full DVI console, and general USB host input still need
-  real Linux support.
+  full PCM/I2S audio, full DVI console, and fully verified general USB host
+  input still need more hardware testing.
 * RP2350 atomics are only safe in internal SRAM; see `docs/risks.md` before moving
   lock-heavy structures or userspace runtimes into PSRAM.

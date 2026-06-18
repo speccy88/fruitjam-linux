@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000108 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 11:45:00 +0000
+Subject: [PATCH] misc: keep Fruit Jam HCD handshake scan passive
+
+Pico-PIO-USB's RX path uses IRQ4 as the live NRZI decoder trigger. The HCD
+setup-handshake scanner added in the previous patch cleared RX_ALL while
+waiting, which can clear DECODER_TRIGGER in the middle of a packet and perturb
+the exact handshake/data stream being measured.
+
+The receive window is already cleared before the scanner starts. Make the scan
+loop passive: drain RX FIFO bytes, observe IRQ state for quiet/timeout
+bookkeeping, and leave RX_START/RX_EOP/DECODER_TRIGGER ownership to the PIO
+program until the scanner disables RX at the end.
+---
+ drivers/misc/fruitjam_usbhost.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3162,8 +3162,6 @@ static int fj_usbhost_pio_wait_handshake_scan(struct fruitjam_usbhost *uh,
+ 		}
+ 
+ 		irq = readl(uh->pio + FJ_PIO_IRQ);
+-		if (irq & FJ_PIO_IRQ_RX_ALL)
+-			writel(FJ_PIO_IRQ_RX_ALL, uh->pio + FJ_PIO_IRQ);
+ 		if (len != before || (irq & (FJ_PIO_IRQ_RX_EOP |
+ 					     FJ_PIO_IRQ_RX_START |
+ 					     FJ_PIO_IRQ_DECODER_TRIGGER))) {
+-- 
+2.39.5

@@ -1,0 +1,582 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 23:25:00 -0400
+Subject: [PATCH] misc: register Fruit Jam usbhost as a Linux HCD
+
+The Fruit Jam bridge has enough PIO packet primitives for the Linux USB core
+to start driving real enumeration instead of only ad hoc misc-device probes.
+Register a small USB 1.1 root hub and route synchronous control and interrupt
+IN URBs through the existing PIO transaction helpers.
+
+This is intentionally narrow: control IN/no-data and interrupt IN are the
+paths needed for the first hub/HID keyboard/gamepad bring-up. Bulk, iso, and
+interrupt OUT remain unsupported until the basic control path is verified on
+hardware.
+---
+ drivers/misc/Kconfig            |   2 +-
+ drivers/misc/fruitjam_usbhost.c | 356 ++++++++++++++++++++++++++++++++
+ 2 files changed, 357 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 111111111111..222222222222 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -112,7 +112,7 @@ config FRUITJAM_DVI
+ 
+ config FRUITJAM_USBHOST_BRIDGE
+ 	tristate "Adafruit Fruit Jam RP2350 PIO USB host bridge"
+-	depends on OF && HAS_IOMEM
++	depends on OF && HAS_IOMEM && USB
+ 	help
+ 	  Say Y here to expose /dev/fruitjam-usbhost, a tiny board bridge
+ 	  for the Fruit Jam RP2350B GPIO1/GPIO2 PIO USB host data pins and
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -20,5 +20,7 @@
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
++#include <linux/usb.h>
++#include <linux/usb/hcd.h>
+ 
+ #include <asm/page.h>
+ 
+@@ -50,6 +52,10 @@
+ #define FJ_USBHOST_TX_TIMEOUT_US	2000u
+ #define FJ_USBHOST_RX_TIMEOUT_US	2000u
+ #define FJ_USBHOST_FIFO_TIMEOUT_US	1000u
++#define FJ_USBHOST_HCD_MAXPACKET	8u
++#define FJ_USBHOST_HCD_POWER_BUDGET	500u
++#define FJ_USBHOST_HCD_CONTROL_ATTEMPTS 8u
++#define FJ_USBHOST_HCD_IN_NAK_ATTEMPTS 16u
+ #define FJ_USBHOST_TX_ENCODED_MAX	96u
+ #define FJ_USBHOST_RX_BYTES_MAX		32u
+ #define FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 2u
+@@ -263,6 +267,9 @@ struct fruitjam_usbhost {
+ 	u32 last_pio_irq;
+ 	int last_tx_result;
+ 	int last_rx_result;
++	struct usb_hcd *hcd;
++	u32 hcd_port_status;
++	u16 hcd_frame;
+ 	u8 last_rx_bytes[FJ_USBHOST_RX_BYTES_MAX];
+ 	u8 tx_dma_buf[FJ_USBHOST_TX_ENCODED_MAX];
+ 	bool pio_ready;
+@@ -1675,6 +1682,30 @@ static int fj_usbhost_pio_send_data0_cpu(struct fruitjam_usbhost *uh,
+ 					    encoded_len);
+ }
+ 
++static int fj_usbhost_pio_send_data_packet(struct fruitjam_usbhost *uh,
++					   u8 pid, const u8 *payload,
++					   u8 payload_len, u8 *encoded_len)
++{
++	u8 packet[68];
++	u16 crc;
++
++	if (payload_len > 64)
++		return -EINVAL;
++	if (payload_len && !payload)
++		return -EINVAL;
++
++	packet[0] = FJ_USB_SYNC;
++	packet[1] = pid;
++	if (payload_len)
++		memcpy(packet + 2, payload, payload_len);
++	crc = fj_usbhost_crc16_data(payload, payload_len);
++	packet[2 + payload_len] = crc & 0xff;
++	packet[3 + payload_len] = crc >> 8;
++
++	return fj_usbhost_pio_tx_packet(uh, packet, payload_len + 4,
++					encoded_len);
++}
++
+ static int fj_usbhost_pio_send_setup_data0_combo(struct fruitjam_usbhost *uh,
+ 						 const u8 *payload,
+ 						 u8 payload_len,
+@@ -3191,6 +3220,440 @@ static int fj_usbhost_pio_keyboard_init_poll(struct fruitjam_usbhost *uh,
+ 	return ret ? ret : fj_usbhost_pio_keyboard_poll(uh, addr, ep);
+ }
+ 
++static void fj_usbhost_pio_release(struct fruitjam_usbhost *uh);
++static void fj_usbhost_reset_bus(struct fruitjam_usbhost *uh, u32 reset_ms);
++
++static int fj_usbhost_pio_control_status_out(struct fruitjam_usbhost *uh,
++					     u8 addr)
++{
++	u16 token = addr & 0x7f;
++	u8 out_packet[4] = { FJ_USB_SYNC, FJ_USB_PID_OUT, 0, 0 };
++	u8 data_packet[4] = { FJ_USB_SYNC, FJ_USB_PID_DATA1, 0, 0 };
++	u8 encoded_len = 0;
++	int ret;
++
++	out_packet[2] = token & 0xff;
++	out_packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
++			((token >> 8) & 0x1f);
++
++	ret = fj_usbhost_pio_tx_two_packets_dma_arm_rx_after_first_eop(
++		uh, out_packet, sizeof(out_packet),
++		data_packet, sizeof(data_packet), &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_receive_raw(uh, false);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++	return 0;
++}
++
++static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
++				       u8 addr, const u8 *setup,
++				       u8 *buf, u16 len, u32 *actual)
++{
++	u8 encoded_len;
++	u8 expected_pid;
++	u32 copied;
++	u32 attempt;
++	int last_ret = -ETIMEDOUT;
++	int ret;
++
++	if (len && !buf)
++		return -EINVAL;
++
++	for (attempt = 0; attempt < FJ_USBHOST_HCD_CONTROL_ATTEMPTS;
++	     attempt++) {
++		bool setup_seen = false;
++
++		encoded_len = 0;
++		expected_pid = FJ_USB_PID_DATA1;
++		copied = 0;
++
++		ret = fj_usbhost_pio_require_configured(uh);
++		if (ret)
++			return ret;
++		if (attempt) {
++			ret = fj_usbhost_pio_sof_burst(uh, 1);
++			if (ret)
++				return ret;
++		}
++
++		fj_usbhost_pio_disable_receive(uh);
++		ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
++			uh, addr, setup, 8, &encoded_len);
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		if (ret)
++			return ret;
++		ret = fj_usbhost_pio_receive_raw(uh, false);
++		if (!ret && uh->last_rx_pid == FJ_USB_PID_ACK) {
++			setup_seen = true;
++		} else if (!ret) {
++			fj_usbhost_pio_record_rx(uh, -EPROTO,
++						 uh->last_rx_len);
++			ret = -EPROTO;
++		}
++		if (ret) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "hcd-control-read setup addr=%u len=%u attempt=%u ret=%d pid=0x%02x",
++				  addr, len, attempt + 1, ret,
++				  uh->last_rx_pid);
++			last_ret = ret;
++		}
++
++		for (;;) {
++			u32 payload_len;
++			u32 nak_attempt;
++
++			fj_usbhost_pio_prepare_receive_after_tx(uh);
++			ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN,
++							addr, 0,
++							&encoded_len);
++			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++			if (ret)
++				return ret;
++
++			for (nak_attempt = 0;
++			     nak_attempt < FJ_USBHOST_HCD_IN_NAK_ATTEMPTS;
++			     nak_attempt++) {
++				ret = fj_usbhost_pio_receive_raw(uh, true);
++				if (!ret && uh->last_rx_pid != FJ_USB_PID_NAK)
++					break;
++				last_ret = ret ? ret : -EAGAIN;
++				ret = fj_usbhost_pio_sof_burst(uh, 1);
++				if (ret)
++					return ret;
++				fj_usbhost_pio_prepare_receive_after_tx(uh);
++				ret = fj_usbhost_pio_send_token(
++					uh, FJ_USB_PID_IN, addr, 0,
++					&encoded_len);
++				fj_usbhost_pio_record_tx(uh, ret,
++							 encoded_len);
++				if (ret)
++					return ret;
++			}
++			if (ret) {
++				scnprintf(uh->last_probe_summary,
++					  sizeof(uh->last_probe_summary),
++					  "hcd-control-read data addr=%u len=%u attempt=%u ret=%d pid=0x%02x setup-ack=%u",
++					  addr, len, attempt + 1, ret,
++					  uh->last_rx_pid,
++					  setup_seen ? 1 : 0);
++				last_ret = ret;
++				break;
++			}
++			if (uh->last_rx_pid == FJ_USB_PID_STALL)
++				return -EPIPE;
++			if (uh->last_rx_pid != expected_pid ||
++			    !fj_usbhost_pio_rx_data_crc_ok(uh,
++							   uh->last_rx_len)) {
++				fj_usbhost_pio_record_rx(uh, -EPROTO,
++							 uh->last_rx_len);
++				last_ret = -EPROTO;
++				break;
++			}
++			payload_len = uh->last_rx_len - 4;
++			if (payload_len > len - copied)
++				payload_len = len - copied;
++			memcpy(buf + copied, uh->last_rx_bytes + 2,
++			       payload_len);
++			copied += payload_len;
++			expected_pid = expected_pid == FJ_USB_PID_DATA1 ?
++				       FJ_USB_PID_DATA0 : FJ_USB_PID_DATA1;
++			if (copied >= len ||
++			    payload_len < FJ_USBHOST_HCD_MAXPACKET) {
++				ret = fj_usbhost_pio_control_status_out(uh,
++									addr);
++				if (!ret) {
++					*actual = copied;
++					scnprintf(
++						uh->last_probe_summary,
++						sizeof(uh->last_probe_summary),
++						"hcd-control-read ok addr=%u requested=%u actual=%u attempt=%u setup-ack=%u",
++						addr, len, copied,
++						attempt + 1,
++						setup_seen ? 1 : 0);
++				}
++				return ret;
++			}
++		}
++	}
++
++	return last_ret;
++}
++
++static int fj_usbhost_hcd_interrupt_in(struct fruitjam_usbhost *uh,
++				       u8 addr, u8 ep, u8 *buf,
++				       u16 len, u32 *actual)
++{
++	u8 encoded_len = 0;
++	u32 payload_len;
++	int ret;
++
++	if (len && !buf)
++		return -EINVAL;
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, addr, ep,
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid == FJ_USB_PID_NAK)
++		return -EAGAIN;
++	if (uh->last_rx_pid == FJ_USB_PID_STALL)
++		return -EPIPE;
++	if ((uh->last_rx_pid != FJ_USB_PID_DATA0 &&
++	     uh->last_rx_pid != FJ_USB_PID_DATA1) ||
++	    !fj_usbhost_pio_rx_data_crc_ok(uh, uh->last_rx_len)) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++	payload_len = uh->last_rx_len - 4;
++	if (payload_len > len)
++		payload_len = len;
++	memcpy(buf, uh->last_rx_bytes + 2, payload_len);
++	*actual = payload_len;
++	return 0;
++}
++
++static struct fruitjam_usbhost *fj_usbhost_hcd_to_uh(struct usb_hcd *hcd)
++{
++	return *(struct fruitjam_usbhost **)hcd->hcd_priv;
++}
++
++static void fj_usbhost_hcd_hub_descriptor(struct usb_hub_descriptor *desc)
++{
++	memset(desc, 0, sizeof(*desc));
++	desc->bDescriptorType = USB_DT_HUB;
++	desc->bDescLength = 9;
++	desc->wHubCharacteristics = cpu_to_le16(HUB_CHAR_INDV_PORT_LPSM |
++						HUB_CHAR_COMMON_OCPM);
++	desc->bNbrPorts = 1;
++}
++
++static void fj_usbhost_hcd_refresh_port(struct fruitjam_usbhost *uh)
++{
++	bool power = fj_gpio_out_get(uh, uh->power_gpio);
++	bool dp, dm;
++	u32 old = uh->hcd_port_status;
++	u32 status = old & 0xffff0000;
++
++	fj_gpio_wire_pair_get(uh, &dp, &dm);
++	if (power)
++		status |= USB_PORT_STAT_POWER;
++	if (power && dp != dm) {
++		status |= USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE;
++		if (!dp && dm)
++			status |= USB_PORT_STAT_LOW_SPEED;
++	}
++	if ((old ^ status) & USB_PORT_STAT_CONNECTION)
++		status |= USB_PORT_STAT_C_CONNECTION << 16;
++	uh->hcd_port_status = status;
++}
++
++static int fj_usbhost_hcd_start(struct usb_hcd *hcd)
++{
++	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
++
++	hcd->power_budget = FJ_USBHOST_HCD_POWER_BUDGET;
++	hcd->state = HC_STATE_RUNNING;
++	hcd->uses_new_polling = 1;
++	mutex_lock(&uh->lock);
++	fj_usbhost_hcd_refresh_port(uh);
++	mutex_unlock(&uh->lock);
++	return 0;
++}
++
++static void fj_usbhost_hcd_stop(struct usb_hcd *hcd)
++{
++	hcd->state = HC_STATE_HALT;
++}
++
++static int fj_usbhost_hcd_get_frame_number(struct usb_hcd *hcd)
++{
++	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
++
++	return uh->hcd_frame++ & 0x7ff;
++}
++
++static int fj_usbhost_hcd_hub_status_data(struct usb_hcd *hcd, char *buf)
++{
++	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
++	int ret = 0;
++
++	mutex_lock(&uh->lock);
++	fj_usbhost_hcd_refresh_port(uh);
++	buf[0] = 0;
++	if (uh->hcd_port_status >> 16) {
++		buf[0] = BIT(1);
++		ret = 1;
++	}
++	mutex_unlock(&uh->lock);
++	return ret;
++}
++
++static int fj_usbhost_hcd_hub_control(struct usb_hcd *hcd, u16 type_req,
++				      u16 value, u16 index, char *buf,
++				      u16 length)
++{
++	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
++	int ret = 0;
++
++	mutex_lock(&uh->lock);
++	fj_usbhost_hcd_refresh_port(uh);
++	switch (type_req) {
++	case ClearHubFeature:
++		break;
++	case ClearPortFeature:
++		if (index != 1) {
++			ret = -EPIPE;
++			break;
++		}
++		if (value >= USB_PORT_FEAT_C_CONNECTION &&
++		    value <= USB_PORT_FEAT_C_PORT_CONFIG_ERROR)
++			uh->hcd_port_status &= ~(BIT(value - 16) << 16);
++		else if (value == USB_PORT_FEAT_POWER) {
++			fj_usbhost_pio_release(uh);
++			fj_gpio_output(uh, uh->power_gpio, false);
++			uh->hcd_port_status &= ~USB_PORT_STAT_POWER;
++		}
++		break;
++	case GetHubDescriptor:
++		fj_usbhost_hcd_hub_descriptor((struct usb_hub_descriptor *)buf);
++		break;
++	case GetHubStatus:
++		*(__le32 *)buf = cpu_to_le32(0);
++		break;
++	case GetPortStatus:
++		if (index != 1) {
++			ret = -EPIPE;
++			break;
++		}
++		((__le16 *)buf)[0] = cpu_to_le16(uh->hcd_port_status);
++		((__le16 *)buf)[1] =
++			cpu_to_le16(uh->hcd_port_status >> 16);
++		break;
++	case SetPortFeature:
++		if (index != 1) {
++			ret = -EPIPE;
++			break;
++		}
++		if (value == USB_PORT_FEAT_POWER) {
++			fj_gpio_output(uh, uh->power_gpio, true);
++			if (uh->pio_ready)
++				fj_usbhost_pio_configure_sms(uh);
++			uh->hcd_port_status |= USB_PORT_STAT_POWER;
++		} else if (value == USB_PORT_FEAT_RESET) {
++			fj_usbhost_reset_bus(uh, FJ_USBHOST_DEFAULT_RESET_MS);
++			uh->hcd_port_status |=
++				USB_PORT_STAT_ENABLE |
++				(USB_PORT_STAT_C_RESET << 16);
++		} else {
++			ret = -EPIPE;
++		}
++		break;
++	default:
++		ret = -EPIPE;
++		break;
++	}
++	mutex_unlock(&uh->lock);
++	return ret;
++}
++
++static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
++{
++	u8 addr = usb_pipedevice(urb->pipe);
++	u8 ep = usb_pipeendpoint(urb->pipe);
++	u32 actual = 0;
++	int ret;
++
++	urb->actual_length = 0;
++	if (usb_pipecontrol(urb->pipe)) {
++		struct usb_ctrlrequest *setup;
++		u16 len;
++
++		if (!urb->setup_packet)
++			return -EINVAL;
++		setup = (struct usb_ctrlrequest *)urb->setup_packet;
++		len = le16_to_cpu(setup->wLength);
++		if (!len)
++			ret = fj_usbhost_pio_control_no_data(
++				uh, addr, setup->bRequestType,
++				setup->bRequest, le16_to_cpu(setup->wValue),
++				le16_to_cpu(setup->wIndex), "hcd-control");
++		else if (setup->bRequestType & USB_DIR_IN)
++			ret = fj_usbhost_hcd_control_read(
++				uh, addr, urb->setup_packet,
++				urb->transfer_buffer, len, &actual);
++		else
++			ret = -EOPNOTSUPP;
++	} else if (usb_pipeint(urb->pipe) && usb_pipein(urb->pipe)) {
++		ret = fj_usbhost_hcd_interrupt_in(
++			uh, addr, ep, urb->transfer_buffer,
++			urb->transfer_buffer_length, &actual);
++	} else {
++		ret = -EOPNOTSUPP;
++	}
++	if (!ret)
++		urb->actual_length = actual;
++	return ret;
++}
++
++static int fj_usbhost_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
++				      gfp_t mem_flags)
++{
++	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
++	int ret;
++
++	ret = usb_hcd_link_urb_to_ep(hcd, urb);
++	if (ret)
++		return ret;
++	mutex_lock(&uh->lock);
++	ret = fj_usbhost_hcd_do_urb(uh, urb);
++	mutex_unlock(&uh->lock);
++	usb_hcd_unlink_urb_from_ep(hcd, urb);
++	usb_hcd_giveback_urb(hcd, urb, ret);
++	return 0;
++}
++
++static int fj_usbhost_hcd_urb_dequeue(struct usb_hcd *hcd, struct urb *urb,
++				      int status)
++{
++	return usb_hcd_check_unlink_urb(hcd, urb, status);
++}
++
++static void fj_usbhost_hcd_endpoint_disable(struct usb_hcd *hcd,
++					    struct usb_host_endpoint *ep)
++{
++}
++
++static const struct hc_driver fj_usbhost_hc_driver = {
++	.description = "fruitjam-usbhost",
++	.product_desc = "Fruit Jam RP2350 PIO USB host",
++	.hcd_priv_size = sizeof(struct fruitjam_usbhost *),
++	.flags = HCD_USB11,
++	.start = fj_usbhost_hcd_start,
++	.stop = fj_usbhost_hcd_stop,
++	.get_frame_number = fj_usbhost_hcd_get_frame_number,
++	.urb_enqueue = fj_usbhost_hcd_urb_enqueue,
++	.urb_dequeue = fj_usbhost_hcd_urb_dequeue,
++	.endpoint_disable = fj_usbhost_hcd_endpoint_disable,
++	.hub_status_data = fj_usbhost_hcd_hub_status_data,
++	.hub_control = fj_usbhost_hcd_hub_control,
++};
++
+ static int fj_usbhost_pio_hub_port_no_data(struct fruitjam_usbhost *uh,
+ 					   u8 request, u16 feature,
+ 					   u8 port, const char *name)
+@@ -4701,6 +5016,7 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ {
+ 	struct fruitjam_usbhost *uh;
+ 	int ret;
++	struct usb_hcd *hcd;
+ 
+ 	uh = devm_kzalloc(&pdev->dev, sizeof(*uh), GFP_KERNEL);
+ 	if (!uh)
+@@ -4772,6 +5088,22 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	ret = misc_register(&uh->miscdev);
+ 	if (ret)
+ 		return ret;
++	hcd = usb_create_hcd(&fj_usbhost_hc_driver, &pdev->dev,
++			     dev_name(&pdev->dev));
++	if (!hcd) {
++		dev_warn(&pdev->dev, "USB host HCD allocation failed\n");
++	} else {
++		*(struct fruitjam_usbhost **)hcd->hcd_priv = uh;
++		uh->hcd = hcd;
++		ret = usb_add_hcd(hcd, 0, 0);
++		if (ret) {
++			dev_warn(&pdev->dev,
++				 "USB host HCD registration failed: %d\n",
++				 ret);
++			usb_put_hcd(hcd);
++			uh->hcd = NULL;
++		}
++	}
+ 
+ 	dev_info(&pdev->dev,
+ 		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u clk_sys_hz=%u dma=%u ch=%u\n",
+@@ -4787,6 +5118,11 @@ static void fj_usbhost_remove(struct platform_device *pdev)
+ {
+ 	struct fruitjam_usbhost *uh = platform_get_drvdata(pdev);
+ 
++	if (uh->hcd) {
++		usb_remove_hcd(uh->hcd);
++		usb_put_hcd(uh->hcd);
++		uh->hcd = NULL;
++	}
+ 	misc_deregister(&uh->miscdev);
+ }
+ 
+-- 
+2.39.5

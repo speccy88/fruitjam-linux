@@ -53,6 +53,8 @@
 #endif
 
 #define WATCHDOG_RESCUE_MAGIC	0x6ab73121u
+#define WATCHDOG_BOOTSEL_VECTOR_MAGIC	0xb007c0d3u
+#define WATCHDOG_BOOTSEL_TYPE		2u
 
 #define LED_PIN			PICO2_BOOTLOADER_LED_PIN
 #define RP2350_XIP_CSI_PIN	PICO2_BOOTLOADER_PSRAM_CS_PIN
@@ -101,6 +103,8 @@ int main(void) {
 
 	set_reset(RESETS_PLL_USB, 0);
 	set_reset(RESETS_PLL_SYS, 0);
+	set_vreg_1v30();
+	delay(1000000);
 	set_usb_pll();
 	set_sys_pll();
 
@@ -306,6 +310,8 @@ static void jump_to_kernel(void *ram_addr, const void *data_addr) {
 #define WATCHDOG_LOAD_REG		1
 #define WATCHDOG_REASON_REG		2
 #define WATCHDOG_SCRATCH4_REG		7
+#define WATCHDOG_SCRATCH6_REG		9
+#define WATCHDOG_SCRATCH7_REG		10
 #define WATCHDOG_CTRL_ENABLE		BIT(30)
 #define WATCHDOG_CTRL_PAUSE_MASK	(BIT(24) | BIT(25) | BIT(26))
 #define WATCHDOG_LOAD_MAX		0x00ffffffu
@@ -338,6 +344,14 @@ static int watchdog_rescue_fired(void)
 {
 	return WATCHDOG_BASE[WATCHDOG_REASON_REG] &&
 	       WATCHDOG_BASE[WATCHDOG_SCRATCH4_REG] == WATCHDOG_RESCUE_MAGIC;
+}
+
+static int watchdog_bootsel_vector_fired(void)
+{
+	return WATCHDOG_BASE[WATCHDOG_REASON_REG] &&
+	       WATCHDOG_BASE[WATCHDOG_SCRATCH4_REG] == WATCHDOG_BOOTSEL_VECTOR_MAGIC &&
+	       WATCHDOG_BASE[WATCHDOG_SCRATCH6_REG] == WATCHDOG_BOOTSEL_TYPE &&
+	       WATCHDOG_BASE[WATCHDOG_SCRATCH7_REG] == WATCHDOG_BOOTSEL_VECTOR_MAGIC;
 }
 
 static void watchdog_start_tick(void)
@@ -388,8 +402,14 @@ static void bootrom_reboot_bootsel(void)
 
 static void rescue_watchdog_check(void)
 {
-	if (watchdog_rescue_fired()) {
-		puts("Linux rescue watchdog fired; entering BOOTSEL.\n");
+	int rescue_fired = watchdog_rescue_fired();
+	int bootsel_fell_through = watchdog_bootsel_vector_fired();
+
+	if (rescue_fired || bootsel_fell_through) {
+		if (rescue_fired)
+			puts("Linux rescue watchdog fired; entering BOOTSEL.\n");
+		else
+			puts("BOOTSEL watchdog vector reached bootloader; entering BOOTSEL.\n");
 		watchdog_disable_rescue();
 		bootrom_reboot_bootsel();
 	}
@@ -429,6 +449,14 @@ static int watchdog_rescue_fired(void)
 	       watchdog_hw->scratch[4] == WATCHDOG_RESCUE_MAGIC;
 }
 
+static int watchdog_bootsel_vector_fired(void)
+{
+	return watchdog_hw->reason &&
+	       watchdog_hw->scratch[4] == WATCHDOG_BOOTSEL_VECTOR_MAGIC &&
+	       watchdog_hw->scratch[6] == WATCHDOG_BOOTSEL_TYPE &&
+	       watchdog_hw->scratch[7] == WATCHDOG_BOOTSEL_VECTOR_MAGIC;
+}
+
 static void bootrom_reboot_bootsel(void)
 {
 	reset_usb_boot(0, 0);
@@ -436,8 +464,14 @@ static void bootrom_reboot_bootsel(void)
 
 static void rescue_watchdog_check(void)
 {
-	if (watchdog_rescue_fired()) {
-		puts("Linux rescue watchdog fired; entering BOOTSEL.\n");
+	int rescue_fired = watchdog_rescue_fired();
+	int bootsel_fell_through = watchdog_bootsel_vector_fired();
+
+	if (rescue_fired || bootsel_fell_through) {
+		if (rescue_fired)
+			puts("Linux rescue watchdog fired; entering BOOTSEL.\n");
+		else
+			puts("BOOTSEL watchdog vector reached bootloader; entering BOOTSEL.\n");
 		watchdog_disable_rescue();
 		bootrom_reboot_bootsel();
 	}

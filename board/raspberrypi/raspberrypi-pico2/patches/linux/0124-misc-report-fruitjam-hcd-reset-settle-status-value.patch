@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 18:40:00 -0400
+Subject: [PATCH] misc: report Fruit Jam HCD reset settle status value
+
+After adding the `hcd_port_reset_settle_ms` status line, pass the configured
+value to the bridge status formatter so userspace and HTTP JSON report the
+actual timing rather than shifting later fields.
+---
+ drivers/misc/fruitjam_usbhost.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -5867,6 +5867,7 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 			 uh->hcd_registered ? 1 : 0,
+ 			 uh->hcd_manual_start ? 1 : 0, uh->hcd_faulted ? 1 : 0,
+ 			 uh->hcd_ep0_failures, uh->hcd_start_delay_ms,
++			 uh->hcd_port_reset_settle_ms,
+ 			 uh->hcd_sof_enabled ? 1 : 0, uh->pio_configured,
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+ 			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->clk_sys_hz,
+-- 
+2.39.5

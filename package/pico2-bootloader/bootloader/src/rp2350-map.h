@@ -12,6 +12,7 @@
 #define RESETS_BASE			((volatile uint32_t *) 0x40020000)
 #define IO_BANK0_BASE			((volatile uint32_t *) 0x40028000)
 #define PADS_BANK0_BASE			((volatile uint32_t *) 0x40038000)
+#define POWMAN_BASE			((volatile uint32_t *) 0x40100000)
 #define TICK_BASE			((volatile uint32_t *) 0x40108000)
 
 #define SIO_BASE			((volatile uint32_t *) 0xD0000000)

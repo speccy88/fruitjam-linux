@@ -26,6 +26,15 @@
 #ifndef BRIDGE_DEV
 #define BRIDGE_DEV "/dev/fruitjam-usbhost"
 #endif
+#ifndef USB_SYSFS_ROOT
+#define USB_SYSFS_ROOT "/sys/bus/usb/devices"
+#endif
+#ifndef DEV_INPUT_ROOT
+#define DEV_INPUT_ROOT "/dev/input"
+#endif
+#ifndef PROC_INPUT_DEVICES
+#define PROC_INPUT_DEVICES "/proc/bus/input/devices"
+#endif
 
 #define GPIO_DP 1u
 #define GPIO_DM 2u
@@ -37,10 +46,15 @@
 #define DEFAULT_RESET_MS 50u
 #define MAX_RESET_MS 1000u
 #define POST_RESET_US 100000u
+#define HCD_START_POWER_OFF_US 250000u
+#define HCD_START_POWER_ON_US 750000u
+#define HCD_START_POST_RESET_US 250000u
 #define GPIO_PATH_MAX 192
-#define BRIDGE_BUF_MAX 1024
-#define RX_HEX_MAX 65
-#define RX_BYTES_MAX 32
+#define BRIDGE_BUF_MAX 4096
+#define RX_HEX_MAX 145
+#define PROBE_SUMMARY_MAX 160
+#define USB_SYSFS_FIELD_MAX 128
+#define RX_BYTES_MAX 72
 #define HID_REPORT_LEN 8
 #define HID_KEY_SLOTS 6
 #define HID_MOD_LSHIFT 0x02u
@@ -50,6 +64,8 @@
 #define KBD_CONFIG_DEFAULT 1u
 #define KBD_IFACE_DEFAULT 0u
 #define KBD_EP_DEFAULT 1u
+#define HUB_KBD_PORT_DEFAULT 1u
+#define HUB_KBD_ADDR_DEFAULT 2u
 #define KBD_SCAN_CONFIG_MAX 2u
 #define KBD_SCAN_IFACE_MAX 3u
 #define KBD_SCAN_EP_MAX 4u
@@ -67,16 +83,58 @@ struct usbhost_status {
 	int dm;
 	int pio_ready;
 	int pio_configured;
+	int hcd_registered;
+	int hcd_manual_start;
+	int hcd_faulted;
+	int hcd_ep0_failures;
+	int hcd_delay_ms;
+	int hcd_port_reset_settle_ms;
+	int hcd_port_reset_sof_frames;
+	int hcd_data_ack_tail_drain_us;
+	int hcd_sof;
+	int pio_index;
+	int sm_tx;
+	int sm_rx;
+	int sm_eop;
+	int clk_sys_hz;
+	int tx_clkdiv;
+	int rx_clkdiv;
+	int eop_clkdiv;
 	int packets;
 	int tx_errors;
 	int last_tx_result;
 	int last_tx_len;
+	int dma;
+	int tx_dma_channel;
+	int tx_dma_packets;
+	int last_dma_result;
+	int last_dma_ctrl;
 	int rx_attempts;
 	int rx_errors;
 	int last_rx_result;
 	int last_rx_len;
 	int last_rx_pid;
+	int last_rx_irq;
+	int last_rx_flevel;
+	int last_pio_fstat;
+	int last_pio_fdebug;
+	int last_pio_irq;
+	int pio_ctrl;
+	int dp_ctrl;
+	int dm_ctrl;
+	int dp_pad;
+	int dm_pad;
+	int tx_addr;
+	int rx_addr;
+	int eop_addr;
+	int tx_execctrl;
+	int rx_execctrl;
+	int eop_execctrl;
+	int tx_pinctrl;
+	int rx_pinctrl;
+	int eop_pinctrl;
 	char last_rx_hex[RX_HEX_MAX];
+	char probe_summary[PROBE_SUMMARY_MAX];
 	const char *device;
 	int present;
 	bool kernel_bridge;
@@ -87,13 +145,14 @@ static const char *sysfs_stack_text =
 static const char *kernel_stack_text =
 	"kernel bridge line-state; PIO USB host/HID report polling not implemented yet";
 static const char *kernel_pio_stack_text =
-	"kernel bridge line-state; PIO2 host program staged; boot-keyboard init/poll/text/event path available";
+	"kernel bridge line-state; PIO host program staged; Linux HCD plus boot-keyboard probes available";
 
 struct hid_live_state {
 	unsigned char prev[HID_KEY_SLOTS];
 };
 
 struct keyboard_target {
+	unsigned int port;
 	unsigned int addr;
 	unsigned int config;
 	unsigned int iface;
@@ -114,7 +173,7 @@ static void print_human(const struct usbhost_status *st);
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-usbhost {status|json|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|pio-init|tx-test|self-rx|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|kbd-init [addr config iface]|kbd-poll [addr ep]|kbd-init-poll [addr config iface ep]|kbd-find|kbd-text [seconds [addr config iface ep]]|kbd-events [seconds [addr config iface ep]]|kbd-monitor [seconds [addr config iface ep]]|kbd-shell [seconds [addr config iface ep]]|kbd-auto-text [seconds]|kbd-auto-events [seconds]|kbd-auto-monitor [seconds]|kbd-auto-shell [seconds]|wait [seconds]|monitor [seconds]}\n");
+		"usage: fruitjam-usbhost {status|json|snapshot|usb-devices|dev-input|input-registry|decode [RX-HEX]|hid [RX-HEX|REPORT-HEX]|on|off|reset [ms]|hcd-start|hcd-clear-fault|pio-init|clk-sys-hz HZ|tx-test|tx-test-cpu|self-rx|self-rx-cpu|sof-burst|in-token|setup-token-self-rx|setup-data-self-rx|setup-data-self-rx-noeop|setup-data-self-rx-cpu|setup-data-self-rx-drain|data-len-sweep|get-device-8|in-token-gated|get-device-8-gated|get-device-8-gated-cpu|get-device-8-combo|get-device-8-combo-skipack|get-device-8-gap [gap_bytes]|get-device-8-frame-retry [attempts]|get-device-8-fast|get-device-8-tight|get-device-8-burst|get-device-8-stream|reset-get-device-8|reset-get-device-8-gated|reset-get-device-8-combo|reset-get-device-8-combo-skipack|reset-get-device-8-gap [gap_bytes]|reset-get-device-8-frame-retry [attempts]|reset-get-device-8-fast|reset-get-device-8-tight|reset-get-device-8-burst|reset-get-device-8-stream|hub-set-address-capture|hub-set-address-noreset [sof_frames]|hub-set-address-skipack [sof_frames]|hub-set-address-upstream [sof_frames]|hub-kbd-init [port addr config iface]|hub-kbd-init-poll [port addr config iface ep]|kbd-init [addr config iface]|kbd-poll [addr ep]|kbd-init-poll [addr config iface ep]|kbd-find|kbd-text [seconds [addr config iface ep]]|kbd-events [seconds [addr config iface ep]]|kbd-monitor [seconds [addr config iface ep]]|kbd-shell [seconds [addr config iface ep]]|kbd-auto-text [seconds]|kbd-auto-events [seconds]|kbd-auto-monitor [seconds]|kbd-auto-shell [seconds]|wait [seconds]|monitor [seconds]}\n");
 }
 
 static int write_file(const char *path, const char *text)
@@ -888,6 +947,43 @@ static int bridge_read_status(struct usbhost_status *st)
 		st->pio_ready = 0;
 	if (bridge_parse_int(text, "pio_configured", &st->pio_configured) < 0)
 		st->pio_configured = 0;
+	if (bridge_parse_int(text, "hcd_registered", &st->hcd_registered) < 0)
+		st->hcd_registered = 0;
+	if (bridge_parse_int(text, "hcd_manual_start", &st->hcd_manual_start) < 0)
+		st->hcd_manual_start = 0;
+	if (bridge_parse_int(text, "hcd_faulted", &st->hcd_faulted) < 0)
+		st->hcd_faulted = 0;
+	if (bridge_parse_int(text, "hcd_ep0_failures", &st->hcd_ep0_failures) < 0)
+		st->hcd_ep0_failures = 0;
+	if (bridge_parse_int(text, "hcd_delay_ms", &st->hcd_delay_ms) < 0)
+		st->hcd_delay_ms = 0;
+	if (bridge_parse_int(text, "hcd_port_reset_settle_ms",
+			     &st->hcd_port_reset_settle_ms) < 0)
+		st->hcd_port_reset_settle_ms = 0;
+	if (bridge_parse_int(text, "hcd_port_reset_sof_frames",
+			     &st->hcd_port_reset_sof_frames) < 0)
+		st->hcd_port_reset_sof_frames = 0;
+	if (bridge_parse_int(text, "hcd_data_ack_tail_drain_us",
+			     &st->hcd_data_ack_tail_drain_us) < 0)
+		st->hcd_data_ack_tail_drain_us = 0;
+	if (bridge_parse_int(text, "hcd_sof", &st->hcd_sof) < 0)
+		st->hcd_sof = 0;
+	if (bridge_parse_int(text, "pio", &st->pio_index) < 0)
+		st->pio_index = 0;
+	if (bridge_parse_int(text, "tx_sm", &st->sm_tx) < 0)
+		st->sm_tx = 0;
+	if (bridge_parse_int(text, "rx_sm", &st->sm_rx) < 0)
+		st->sm_rx = 0;
+	if (bridge_parse_int(text, "eop_sm", &st->sm_eop) < 0)
+		st->sm_eop = 0;
+	if (bridge_parse_int(text, "clk_sys_hz", &st->clk_sys_hz) < 0)
+		st->clk_sys_hz = 0;
+	if (bridge_parse_int(text, "tx_clkdiv", &st->tx_clkdiv) < 0)
+		st->tx_clkdiv = 0;
+	if (bridge_parse_int(text, "rx_clkdiv", &st->rx_clkdiv) < 0)
+		st->rx_clkdiv = 0;
+	if (bridge_parse_int(text, "eop_clkdiv", &st->eop_clkdiv) < 0)
+		st->eop_clkdiv = 0;
 	if (bridge_parse_int(text, "packets", &st->packets) < 0)
 		st->packets = 0;
 	if (bridge_parse_int(text, "tx_errors", &st->tx_errors) < 0)
@@ -896,6 +992,16 @@ static int bridge_read_status(struct usbhost_status *st)
 		st->last_tx_result = 0;
 	if (bridge_parse_int(text, "last_tx_len", &st->last_tx_len) < 0)
 		st->last_tx_len = 0;
+	if (bridge_parse_int(text, "tx_dma", &st->dma) < 0)
+		st->dma = 0;
+	if (bridge_parse_int(text, "tx_dma_channel", &st->tx_dma_channel) < 0)
+		st->tx_dma_channel = 0;
+	if (bridge_parse_int(text, "tx_dma_packets", &st->tx_dma_packets) < 0)
+		st->tx_dma_packets = 0;
+	if (bridge_parse_int(text, "last_dma_result", &st->last_dma_result) < 0)
+		st->last_dma_result = 0;
+	if (bridge_parse_int(text, "last_dma_ctrl", &st->last_dma_ctrl) < 0)
+		st->last_dma_ctrl = 0;
 	if (bridge_parse_int(text, "rx_attempts", &st->rx_attempts) < 0)
 		st->rx_attempts = 0;
 	if (bridge_parse_int(text, "rx_errors", &st->rx_errors) < 0)
@@ -906,9 +1012,50 @@ static int bridge_read_status(struct usbhost_status *st)
 		st->last_rx_len = 0;
 	if (bridge_parse_int(text, "last_rx_pid", &st->last_rx_pid) < 0)
 		st->last_rx_pid = 0;
+	if (bridge_parse_int(text, "last_rx_irq", &st->last_rx_irq) < 0)
+		st->last_rx_irq = 0;
+	if (bridge_parse_int(text, "last_rx_flevel", &st->last_rx_flevel) < 0)
+		st->last_rx_flevel = 0;
+	if (bridge_parse_int(text, "pio_fstat", &st->last_pio_fstat) < 0)
+		st->last_pio_fstat = 0;
+	if (bridge_parse_int(text, "pio_fdebug", &st->last_pio_fdebug) < 0)
+		st->last_pio_fdebug = 0;
+	if (bridge_parse_int(text, "pio_irq", &st->last_pio_irq) < 0)
+		st->last_pio_irq = 0;
+	if (bridge_parse_int(text, "pio_ctrl", &st->pio_ctrl) < 0)
+		st->pio_ctrl = 0;
+	if (bridge_parse_int(text, "dp_ctrl", &st->dp_ctrl) < 0)
+		st->dp_ctrl = 0;
+	if (bridge_parse_int(text, "dm_ctrl", &st->dm_ctrl) < 0)
+		st->dm_ctrl = 0;
+	if (bridge_parse_int(text, "dp_pad", &st->dp_pad) < 0)
+		st->dp_pad = 0;
+	if (bridge_parse_int(text, "dm_pad", &st->dm_pad) < 0)
+		st->dm_pad = 0;
+	if (bridge_parse_int(text, "tx_addr", &st->tx_addr) < 0)
+		st->tx_addr = 0;
+	if (bridge_parse_int(text, "rx_addr", &st->rx_addr) < 0)
+		st->rx_addr = 0;
+	if (bridge_parse_int(text, "eop_addr", &st->eop_addr) < 0)
+		st->eop_addr = 0;
+	if (bridge_parse_int(text, "tx_execctrl", &st->tx_execctrl) < 0)
+		st->tx_execctrl = 0;
+	if (bridge_parse_int(text, "rx_execctrl", &st->rx_execctrl) < 0)
+		st->rx_execctrl = 0;
+	if (bridge_parse_int(text, "eop_execctrl", &st->eop_execctrl) < 0)
+		st->eop_execctrl = 0;
+	if (bridge_parse_int(text, "tx_pinctrl", &st->tx_pinctrl) < 0)
+		st->tx_pinctrl = 0;
+	if (bridge_parse_int(text, "rx_pinctrl", &st->rx_pinctrl) < 0)
+		st->rx_pinctrl = 0;
+	if (bridge_parse_int(text, "eop_pinctrl", &st->eop_pinctrl) < 0)
+		st->eop_pinctrl = 0;
 	if (bridge_parse_string(text, "last_rx_hex", st->last_rx_hex,
 				sizeof(st->last_rx_hex)) < 0)
 		st->last_rx_hex[0] = '\0';
+	if (bridge_parse_string(text, "probe_summary", st->probe_summary,
+				sizeof(st->probe_summary)) < 0)
+		st->probe_summary[0] = '\0';
 	st->kernel_bridge = true;
 	return 0;
 }
@@ -929,10 +1076,40 @@ static int bridge_write_command(const char *command)
 
 static void keyboard_target_default(struct keyboard_target *target)
 {
+	target->port = HUB_KBD_PORT_DEFAULT;
 	target->addr = KBD_ADDR_DEFAULT;
 	target->config = KBD_CONFIG_DEFAULT;
 	target->iface = KBD_IFACE_DEFAULT;
 	target->ep = KBD_EP_DEFAULT;
+}
+
+static void hub_keyboard_target_default(struct keyboard_target *target)
+{
+	target->port = HUB_KBD_PORT_DEFAULT;
+	target->addr = HUB_KBD_ADDR_DEFAULT;
+	target->config = KBD_CONFIG_DEFAULT;
+	target->iface = KBD_IFACE_DEFAULT;
+	target->ep = KBD_EP_DEFAULT;
+}
+
+static int hub_keyboard_init_command(const struct keyboard_target *target,
+				     char *buf, size_t len)
+{
+	int ret = snprintf(buf, len, "hub-kbd-init %u %u %u %u",
+			   target->port, target->addr, target->config,
+			   target->iface);
+
+	return ret > 0 && (size_t)ret < len ? 0 : -1;
+}
+
+static int hub_keyboard_init_poll_command(const struct keyboard_target *target,
+					  char *buf, size_t len)
+{
+	int ret = snprintf(buf, len, "hub-kbd-init-poll %u %u %u %u %u",
+			   target->port, target->addr, target->config,
+			   target->iface, target->ep);
+
+	return ret > 0 && (size_t)ret < len ? 0 : -1;
 }
 
 static int keyboard_init_command(const struct keyboard_target *target,
@@ -1126,6 +1303,8 @@ static int keyboard_poll_once(const struct keyboard_target *target,
 
 static void read_status(struct usbhost_status *st)
 {
+	memset(st, 0, sizeof(*st));
+
 	if (bridge_read_status(st) == 0)
 		return;
 
@@ -1138,16 +1317,58 @@ static void read_status(struct usbhost_status *st)
 		 !strcmp(st->device, "low-speed-device"));
 	st->pio_ready = 0;
 	st->pio_configured = 0;
+	st->hcd_registered = 0;
+	st->hcd_manual_start = 0;
+	st->hcd_faulted = 0;
+	st->hcd_ep0_failures = 0;
+	st->hcd_delay_ms = 0;
+	st->hcd_port_reset_settle_ms = 0;
+	st->hcd_port_reset_sof_frames = 0;
+	st->hcd_data_ack_tail_drain_us = 0;
+	st->hcd_sof = 0;
+	st->pio_index = 0;
+	st->sm_tx = 0;
+	st->sm_rx = 0;
+	st->sm_eop = 0;
+	st->clk_sys_hz = 0;
+	st->tx_clkdiv = 0;
+	st->rx_clkdiv = 0;
+	st->eop_clkdiv = 0;
 	st->packets = 0;
 	st->tx_errors = 0;
 	st->last_tx_result = 0;
 	st->last_tx_len = 0;
+	st->dma = 0;
+	st->tx_dma_channel = 0;
+	st->tx_dma_packets = 0;
+	st->last_dma_result = 0;
+	st->last_dma_ctrl = 0;
 	st->rx_attempts = 0;
 	st->rx_errors = 0;
 	st->last_rx_result = 0;
 	st->last_rx_len = 0;
 	st->last_rx_pid = 0;
 	st->last_rx_hex[0] = '\0';
+	st->probe_summary[0] = '\0';
+	st->last_rx_irq = 0;
+	st->last_rx_flevel = 0;
+	st->last_pio_fstat = 0;
+	st->last_pio_fdebug = 0;
+	st->last_pio_irq = 0;
+	st->pio_ctrl = 0;
+	st->dp_ctrl = 0;
+	st->dm_ctrl = 0;
+	st->dp_pad = 0;
+	st->dm_pad = 0;
+	st->tx_addr = 0;
+	st->rx_addr = 0;
+	st->eop_addr = 0;
+	st->tx_execctrl = 0;
+	st->rx_execctrl = 0;
+	st->eop_execctrl = 0;
+	st->tx_pinctrl = 0;
+	st->rx_pinctrl = 0;
+	st->eop_pinctrl = 0;
 	st->kernel_bridge = false;
 }
 
@@ -1174,12 +1395,41 @@ static void print_human(const struct usbhost_status *st)
 		printf("usbhost pio-ready %s\n", st->pio_ready > 0 ? "yes" : "no");
 		printf("usbhost pio-configured %s\n",
 		       st->pio_configured > 0 ? "yes" : "no");
+		printf("usbhost hcd registered %d manual-start %d faulted %d ep0-failures %d delay-ms %d reset-settle-ms %d reset-sof-frames %d data-ack-tail-drain-us %d sof %d\n",
+		       st->hcd_registered, st->hcd_manual_start,
+		       st->hcd_faulted, st->hcd_ep0_failures,
+		       st->hcd_delay_ms, st->hcd_port_reset_settle_ms,
+		       st->hcd_port_reset_sof_frames,
+		       st->hcd_data_ack_tail_drain_us, st->hcd_sof);
+		printf("usbhost pio-debug index %d sm-tx %d sm-rx %d sm-eop %d clk-sys-hz %d\n",
+		       st->pio_index, st->sm_tx, st->sm_rx, st->sm_eop,
+		       st->clk_sys_hz);
+		printf("usbhost pio-clkdiv tx 0x%08x rx 0x%08x eop 0x%08x\n",
+		       st->tx_clkdiv, st->rx_clkdiv, st->eop_clkdiv);
 		printf("usbhost packets %d tx-errors %d last-tx-result %d len %d\n",
 		       st->packets, st->tx_errors, st->last_tx_result,
 		       st->last_tx_len);
+		printf("usbhost dma present %d channel %d packets %d last-result %d ctrl 0x%08x\n",
+		       st->dma, st->tx_dma_channel, st->tx_dma_packets,
+		       st->last_dma_result, st->last_dma_ctrl);
 		printf("usbhost rx-attempts %d rx-errors %d last-rx-result %d pid 0x%02x len %d\n",
 		       st->rx_attempts, st->rx_errors, st->last_rx_result,
 		       st->last_rx_pid, st->last_rx_len);
+		if (st->probe_summary[0])
+			printf("usbhost probe-summary %s\n", st->probe_summary);
+		printf("usbhost pio-regs fstat 0x%08x fdebug 0x%08x irq 0x%08x ctrl 0x%08x\n",
+		       st->last_pio_fstat, st->last_pio_fdebug,
+		       st->last_pio_irq, st->pio_ctrl);
+		printf("usbhost rx-regs irq 0x%08x flevel 0x%08x\n",
+		       st->last_rx_irq, st->last_rx_flevel);
+		printf("usbhost gpio-regs dp-ctrl 0x%08x dm-ctrl 0x%08x dp-pad 0x%08x dm-pad 0x%08x\n",
+		       st->dp_ctrl, st->dm_ctrl, st->dp_pad, st->dm_pad);
+		printf("usbhost sm-addr tx %d rx %d eop %d\n",
+		       st->tx_addr, st->rx_addr, st->eop_addr);
+		printf("usbhost sm-execctrl tx 0x%08x rx 0x%08x eop 0x%08x\n",
+		       st->tx_execctrl, st->rx_execctrl, st->eop_execctrl);
+		printf("usbhost sm-pinctrl tx 0x%08x rx 0x%08x eop 0x%08x\n",
+		       st->tx_pinctrl, st->rx_pinctrl, st->eop_pinctrl);
 		if (st->last_rx_hex[0])
 			printf("usbhost last-rx-hex %s\n", st->last_rx_hex);
 	}
@@ -1200,17 +1450,176 @@ static void print_json(const struct usbhost_status *st)
 	       sysfs_stack_text);
 	printf("\"pio_ready\":%s,", st->pio_ready > 0 ? "true" : "false");
 	printf("\"pio_configured\":%s,", st->pio_configured > 0 ? "true" : "false");
+	printf("\"hcd_registered\":%s,\"hcd_manual_start\":%s,\"hcd_faulted\":%s,",
+	       st->hcd_registered > 0 ? "true" : "false",
+	       st->hcd_manual_start > 0 ? "true" : "false",
+	       st->hcd_faulted > 0 ? "true" : "false");
+	printf("\"hcd_ep0_failures\":%d,\"hcd_delay_ms\":%d,",
+	       st->hcd_ep0_failures, st->hcd_delay_ms);
+	printf("\"hcd_port_reset_settle_ms\":%d,\"hcd_port_reset_sof_frames\":%d,",
+	       st->hcd_port_reset_settle_ms, st->hcd_port_reset_sof_frames);
+	printf("\"hcd_data_ack_tail_drain_us\":%d,",
+	       st->hcd_data_ack_tail_drain_us);
+	printf("\"hcd_sof\":%s,",
+	       st->hcd_sof > 0 ? "true" : "false");
+	printf("\"pio_index\":%d,\"sm_tx\":%d,\"sm_rx\":%d,\"sm_eop\":%d,",
+	       st->pio_index, st->sm_tx, st->sm_rx, st->sm_eop);
+	printf("\"clk_sys_hz\":%d,\"tx_clkdiv\":%d,\"rx_clkdiv\":%d,\"eop_clkdiv\":%d,",
+	       st->clk_sys_hz, st->tx_clkdiv, st->rx_clkdiv, st->eop_clkdiv);
 	printf("\"packets\":%d,\"tx_errors\":%d,", st->packets, st->tx_errors);
 	printf("\"last_tx_result\":%d,\"last_tx_len\":%d,",
 	       st->last_tx_result, st->last_tx_len);
+	printf("\"dma\":%d,\"tx_dma_channel\":%d,\"tx_dma_packets\":%d,",
+	       st->dma, st->tx_dma_channel, st->tx_dma_packets);
+	printf("\"last_dma_result\":%d,\"last_dma_ctrl\":%d,",
+	       st->last_dma_result, st->last_dma_ctrl);
 	printf("\"rx_attempts\":%d,\"rx_errors\":%d,",
 	       st->rx_attempts, st->rx_errors);
 	printf("\"last_rx_result\":%d,\"last_rx_len\":%d,",
 	       st->last_rx_result, st->last_rx_len);
 	printf("\"last_rx_pid\":%d,\"last_rx_hex\":\"%s\",",
 	       st->last_rx_pid, st->last_rx_hex);
+	printf("\"probe_summary\":\"%s\",", st->probe_summary);
+	printf("\"last_rx_irq\":%d,\"last_rx_flevel\":%d,",
+	       st->last_rx_irq, st->last_rx_flevel);
+	printf("\"last_pio_fstat\":%d,\"last_pio_fdebug\":%d,\"last_pio_irq\":%d,\"pio_ctrl\":%d,",
+	       st->last_pio_fstat, st->last_pio_fdebug,
+	       st->last_pio_irq, st->pio_ctrl);
+	printf("\"dp_ctrl\":%d,\"dm_ctrl\":%d,\"dp_pad\":%d,\"dm_pad\":%d,",
+	       st->dp_ctrl, st->dm_ctrl, st->dp_pad, st->dm_pad);
+	printf("\"tx_addr\":%d,\"rx_addr\":%d,\"eop_addr\":%d,",
+	       st->tx_addr, st->rx_addr, st->eop_addr);
+	printf("\"tx_execctrl\":%d,\"rx_execctrl\":%d,\"eop_execctrl\":%d,",
+	       st->tx_execctrl, st->rx_execctrl, st->eop_execctrl);
+	printf("\"tx_pinctrl\":%d,\"rx_pinctrl\":%d,\"eop_pinctrl\":%d,",
+	       st->tx_pinctrl, st->rx_pinctrl, st->eop_pinctrl);
 	printf("\"next\":\"pio-packet-io\",");
 	printf("\"first_milestone\":\"boot-protocol-keyboard\"}\n");
+}
+
+static int read_child_file(const char *dir, const char *name,
+			   const char *leaf, char *buf, size_t len)
+{
+	char path[GPIO_PATH_MAX];
+	int ret;
+
+	ret = snprintf(path, sizeof(path), "%s/%s/%s", dir, name, leaf);
+	if (ret <= 0 || (size_t)ret >= sizeof(path) ||
+	    read_file(path, buf, len) < 0) {
+		snprintf(buf, len, "-");
+		return -1;
+	}
+	return 0;
+}
+
+static int print_usb_devices(void)
+{
+	DIR *dh = opendir(USB_SYSFS_ROOT);
+	struct dirent *de;
+	int count = 0;
+
+	puts("usbhost usb-devices begin");
+	if (!dh) {
+		printf("usbhost usb-devices error %s\n", strerror(errno));
+		puts("usbhost usb-devices end");
+		return 1;
+	}
+
+	while ((de = readdir(dh))) {
+		char vid[USB_SYSFS_FIELD_MAX];
+		char pid[USB_SYSFS_FIELD_MAX];
+		char manufacturer[USB_SYSFS_FIELD_MAX];
+		char product[USB_SYSFS_FIELD_MAX];
+		char speed[USB_SYSFS_FIELD_MAX];
+		char maxchild[USB_SYSFS_FIELD_MAX];
+
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		read_child_file(USB_SYSFS_ROOT, de->d_name, "idVendor",
+				vid, sizeof(vid));
+		read_child_file(USB_SYSFS_ROOT, de->d_name, "idProduct",
+				pid, sizeof(pid));
+		read_child_file(USB_SYSFS_ROOT, de->d_name, "manufacturer",
+				manufacturer, sizeof(manufacturer));
+		read_child_file(USB_SYSFS_ROOT, de->d_name, "product",
+				product, sizeof(product));
+		read_child_file(USB_SYSFS_ROOT, de->d_name, "speed",
+				speed, sizeof(speed));
+		read_child_file(USB_SYSFS_ROOT, de->d_name, "maxchild",
+				maxchild, sizeof(maxchild));
+		printf("usbdev %s %s:%s manufacturer=%s product=%s speed=%s maxchild=%s\n",
+		       de->d_name, vid, pid, manufacturer, product, speed,
+		       maxchild);
+		count++;
+	}
+	closedir(dh);
+	printf("usbhost usb-devices count %d\n", count);
+	puts("usbhost usb-devices end");
+	return 0;
+}
+
+static int print_dev_input(void)
+{
+	DIR *dh = opendir(DEV_INPUT_ROOT);
+	struct dirent *de;
+	int count = 0;
+
+	puts("usbhost dev-input begin");
+	if (!dh) {
+		printf("usbhost dev-input error %s\n", strerror(errno));
+		puts("usbhost dev-input end");
+		return 1;
+	}
+
+	while ((de = readdir(dh))) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+			continue;
+		printf("inputdev %s\n", de->d_name);
+		count++;
+	}
+	closedir(dh);
+	printf("usbhost dev-input count %d\n", count);
+	puts("usbhost dev-input end");
+	return 0;
+}
+
+static int print_input_registry(void)
+{
+	char buf[256];
+	ssize_t ret;
+	int fd;
+
+	puts("usbhost input-registry begin");
+	fd = open(PROC_INPUT_DEVICES, O_RDONLY);
+	if (fd < 0) {
+		printf("usbhost input-registry error %s\n", strerror(errno));
+		puts("usbhost input-registry end");
+		return 1;
+	}
+	while ((ret = read(fd, buf, sizeof(buf))) > 0)
+		(void)write(STDOUT_FILENO, buf, (size_t)ret);
+	close(fd);
+	if (ret < 0) {
+		printf("usbhost input-registry read-error %s\n",
+		       strerror(errno));
+		puts("usbhost input-registry end");
+		return 1;
+	}
+	puts("usbhost input-registry end");
+	return 0;
+}
+
+static int print_snapshot(void)
+{
+	struct usbhost_status st;
+	int ret = 0;
+
+	read_status(&st);
+	print_human(&st);
+	ret |= print_usb_devices();
+	ret |= print_dev_input();
+	ret |= print_input_registry();
+	return ret;
 }
 
 static int bridge_action(const char *command, const char *label)
@@ -1236,6 +1645,51 @@ static int bridge_action(const char *command, const char *label)
 	if (st.last_rx_hex[0])
 		decode_rx_hex(st.last_rx_hex);
 	return st.power >= 0 ? 0 : 1;
+}
+
+static int bridge_hcd_start(void)
+{
+	struct usbhost_status st;
+	int saved_errno;
+
+	if (access(BRIDGE_DEV, W_OK) != 0) {
+		fprintf(stderr, "fruitjam-usbhost: HCD start requires %s\n",
+			BRIDGE_DEV);
+		return 1;
+	}
+
+	read_status(&st);
+	if (st.kernel_bridge && st.hcd_manual_start && !st.hcd_registered) {
+		if (bridge_write_command("off") < 0) {
+			saved_errno = errno;
+			fprintf(stderr, "fruitjam-usbhost: bridge HCD start power-off failed: %s\n",
+				strerror(saved_errno));
+			read_status(&st);
+			print_human(&st);
+			return 1;
+		}
+		usleep(HCD_START_POWER_OFF_US);
+		if (bridge_write_command("on") < 0) {
+			saved_errno = errno;
+			fprintf(stderr, "fruitjam-usbhost: bridge HCD start power-on failed: %s\n",
+				strerror(saved_errno));
+			read_status(&st);
+			print_human(&st);
+			return 1;
+		}
+		usleep(HCD_START_POWER_ON_US);
+		if (bridge_write_command("reset 100") < 0) {
+			saved_errno = errno;
+			fprintf(stderr, "fruitjam-usbhost: bridge HCD start bus-reset failed: %s\n",
+				strerror(saved_errno));
+			read_status(&st);
+			print_human(&st);
+			return 1;
+		}
+		usleep(HCD_START_POST_RESET_US);
+	}
+
+	return bridge_action("hcd-start", "HCD start");
 }
 
 static int parse_seconds(const char *s, unsigned int default_value,
@@ -1326,6 +1780,35 @@ static int parse_keyboard_full_args(int argc, char **argv, int start,
 		parse_uint_range(argv[start + 1], 1, 255, &target->config) ||
 		parse_uint_range(argv[start + 2], 0, 255, &target->iface) ||
 		parse_uint_range(argv[start + 3], 1, 15, &target->ep);
+}
+
+static int parse_hub_keyboard_init_args(int argc, char **argv, int start,
+					struct keyboard_target *target)
+{
+	hub_keyboard_target_default(target);
+	if (argc == start)
+		return 0;
+	if (argc - start != 4)
+		return -1;
+	return parse_uint_range(argv[start], 1, 4, &target->port) ||
+		parse_uint_range(argv[start + 1], 2, 127, &target->addr) ||
+		parse_uint_range(argv[start + 2], 1, 255, &target->config) ||
+		parse_uint_range(argv[start + 3], 0, 255, &target->iface);
+}
+
+static int parse_hub_keyboard_full_args(int argc, char **argv, int start,
+					struct keyboard_target *target)
+{
+	hub_keyboard_target_default(target);
+	if (argc == start)
+		return 0;
+	if (argc - start != 5)
+		return -1;
+	return parse_uint_range(argv[start], 1, 4, &target->port) ||
+		parse_uint_range(argv[start + 1], 2, 127, &target->addr) ||
+		parse_uint_range(argv[start + 2], 1, 255, &target->config) ||
+		parse_uint_range(argv[start + 3], 0, 255, &target->iface) ||
+		parse_uint_range(argv[start + 4], 1, 15, &target->ep);
 }
 
 static int bus_reset(unsigned int reset_ms)
@@ -2023,12 +2506,28 @@ int main(int argc, char **argv)
 		print_human(&st);
 		return st.power >= 0 ? 0 : 1;
 	}
+	if (!strcmp(cmd, "hcd-clear-fault"))
+		return bridge_action("hcd-clear-fault", "HCD clear fault");
+	if (!strcmp(cmd, "hcd-start"))
+		return bridge_hcd_start();
 	if (!strcmp(cmd, "pio-init"))
 		return bridge_action("pio-init", "PIO init");
+	if (!strcmp(cmd, "clk-sys-hz")) {
+		if (argc != 3) {
+			usage(stderr);
+			return 1;
+		}
+		snprintf(command, sizeof(command), "clk-sys-hz %s", argv[2]);
+		return bridge_action(command, "PIO clk_sys retune");
+	}
 	if (!strcmp(cmd, "tx-test"))
 		return bridge_action("tx-test", "PIO TX test");
+	if (!strcmp(cmd, "tx-test-cpu"))
+		return bridge_action("tx-test-cpu", "PIO CPU-TX test");
 	if (!strcmp(cmd, "self-rx"))
 		return bridge_action("self-rx", "PIO self-RX probe");
+	if (!strcmp(cmd, "self-rx-cpu"))
+		return bridge_action("self-rx-cpu", "PIO CPU-TX self-RX probe");
 	if (!strcmp(cmd, "sof-burst"))
 		return bridge_action("sof-burst", "PIO SOF burst");
 	if (!strcmp(cmd, "in-token"))
@@ -2067,6 +2566,33 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "get-device-8-combo-skipack"))
 		return bridge_action("get-device-8-combo-skipack",
 				     "PIO combined SETUP skip-ACK GET_DESCRIPTOR probe");
+	if (!strcmp(cmd, "get-device-8-gap")) {
+		if (argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		if (argc == 3)
+			snprintf(command, sizeof(command), "get-device-8-gap %s",
+				 argv[2]);
+		else
+			snprintf(command, sizeof(command), "get-device-8-gap");
+		return bridge_action(command,
+				     "PIO SETUP gap skip-ACK GET_DESCRIPTOR probe");
+	}
+	if (!strcmp(cmd, "get-device-8-frame-retry")) {
+		if (argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		if (argc == 3)
+			snprintf(command, sizeof(command),
+				 "get-device-8-frame-retry %s", argv[2]);
+		else
+			snprintf(command, sizeof(command),
+				 "get-device-8-frame-retry");
+		return bridge_action(command,
+				     "PIO framed retry GET_DESCRIPTOR probe");
+	}
 	if (!strcmp(cmd, "get-device-8-fast"))
 		return bridge_action("get-device-8-fast",
 				     "PIO fast gated GET_DESCRIPTOR probe");
@@ -2091,6 +2617,35 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "reset-get-device-8-combo-skipack"))
 		return bridge_action("reset-get-device-8-combo-skipack",
 				     "PIO reset/SOF combined SETUP skip-ACK GET_DESCRIPTOR probe");
+	if (!strcmp(cmd, "reset-get-device-8-gap")) {
+		if (argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		if (argc == 3)
+			snprintf(command, sizeof(command),
+				 "reset-get-device-8-gap %s", argv[2]);
+		else
+			snprintf(command, sizeof(command),
+				 "reset-get-device-8-gap");
+		return bridge_action(command,
+				     "PIO reset/SOF SETUP gap skip-ACK GET_DESCRIPTOR probe");
+	}
+	if (!strcmp(cmd, "reset-get-device-8-frame-retry")) {
+		if (argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		if (argc == 3)
+			snprintf(command, sizeof(command),
+				 "reset-get-device-8-frame-retry %s",
+				 argv[2]);
+		else
+			snprintf(command, sizeof(command),
+				 "reset-get-device-8-frame-retry");
+		return bridge_action(command,
+				     "PIO reset/SOF framed retry GET_DESCRIPTOR probe");
+	}
 	if (!strcmp(cmd, "reset-get-device-8-fast"))
 		return bridge_action("reset-get-device-8-fast",
 				     "PIO reset/SOF fast gated GET_DESCRIPTOR probe");
@@ -2103,6 +2658,62 @@ int main(int argc, char **argv)
 	if (!strcmp(cmd, "reset-get-device-8-stream"))
 		return bridge_action("reset-get-device-8-stream",
 				     "PIO reset/SOF streamed SETUP/IN GET_DESCRIPTOR probe");
+	if (!strcmp(cmd, "hub-set-address-capture"))
+		return bridge_action("hub-set-address-capture",
+				     "PIO hub SET_ADDRESS capture probe");
+	if (!strcmp(cmd, "hub-set-address-noreset")) {
+		if (argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		snprintf(command, sizeof(command), argc == 3 ?
+			 "hub-set-address-noreset %s" :
+			 "hub-set-address-noreset", argc == 3 ? argv[2] : "");
+		return bridge_action(command,
+				     "PIO hub SET_ADDRESS no-reset probe");
+	}
+	if (!strcmp(cmd, "hub-set-address-skipack")) {
+		if (argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		snprintf(command, sizeof(command), argc == 3 ?
+			 "hub-set-address-skipack %s" :
+			 "hub-set-address-skipack", argc == 3 ? argv[2] : "");
+		return bridge_action(command,
+				     "PIO hub SET_ADDRESS skip-ACK probe");
+	}
+	if (!strcmp(cmd, "hub-set-address-upstream")) {
+		if (argc > 3) {
+			usage(stderr);
+			return 1;
+		}
+		snprintf(command, sizeof(command), argc == 3 ?
+			 "hub-set-address-upstream %s" :
+			 "hub-set-address-upstream", argc == 3 ? argv[2] : "");
+		return bridge_action(command,
+				     "PIO hub SET_ADDRESS upstream-style probe");
+	}
+	if (!strcmp(cmd, "hub-kbd-init")) {
+		if (parse_hub_keyboard_init_args(argc, argv, 2, &target) < 0 ||
+		    hub_keyboard_init_command(&target, command,
+					      sizeof(command)) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return bridge_action(command,
+				     "PIO hub downstream boot-keyboard init probe");
+	}
+	if (!strcmp(cmd, "hub-kbd-init-poll")) {
+		if (parse_hub_keyboard_full_args(argc, argv, 2, &target) < 0 ||
+		    hub_keyboard_init_poll_command(&target, command,
+						   sizeof(command)) < 0) {
+			usage(stderr);
+			return 1;
+		}
+		return bridge_action(command,
+				     "PIO hub downstream boot-keyboard init and poll probe");
+	}
 	if (!strcmp(cmd, "kbd-init")) {
 		if (parse_keyboard_init_args(argc, argv, 2, &target) < 0 ||
 		    keyboard_init_command(&target, command, sizeof(command)) < 0) {
@@ -2219,6 +2830,14 @@ int main(int argc, char **argv)
 		print_json(&st);
 		return st.power >= 0 ? 0 : 1;
 	}
+	if (!strcmp(cmd, "snapshot"))
+		return print_snapshot();
+	if (!strcmp(cmd, "usb-devices"))
+		return print_usb_devices();
+	if (!strcmp(cmd, "dev-input"))
+		return print_dev_input();
+	if (!strcmp(cmd, "input-registry"))
+		return print_input_registry();
 	if (!strcmp(cmd, "decode")) {
 		if (argc > 2)
 			return decode_rx_hex(argv[2]);

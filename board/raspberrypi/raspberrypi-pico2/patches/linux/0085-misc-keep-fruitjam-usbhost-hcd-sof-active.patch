@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000085 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 02:10:00 -0400
+Subject: [PATCH] misc: keep Fruit Jam usbhost HCD SOF active
+
+The known-working wili8jam stack drives Pico-PIO-USB from TinyUSB's host frame
+loop: while a root-port device is connected, each 1 ms frame emits SOF (or a
+low-speed keepalive) before endpoint transactions are serviced.
+
+The first Linux HCD bridge only emitted SOFs during synchronous URB handling and
+short reset/probe bursts. Keep a tiny kernel thread running while the HCD is
+active so a powered, connected root port continues to see host frames between
+Linux USB core requests. The thread uses the existing bridge mutex and skips a
+frame when a synchronous control/interrupt transaction owns the PIO engine.
+---
+ drivers/misc/fruitjam_usbhost.c | 82 ++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -16,6 +16,7 @@
+ #include <linux/fs.h>
+ #include <linux/io.h>
+ #include <linux/kernel.h>
++#include <linux/kthread.h>
+ #include <linux/math64.h>
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+@@ -23,6 +24,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/property.h>
++#include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/uaccess.h>
+@@ -56,6 +58,7 @@
+ #define FJ_USBHOST_HCD_POWER_BUDGET	500u
+ #define FJ_USBHOST_HCD_CONTROL_ATTEMPTS 8u
+ #define FJ_USBHOST_HCD_IN_NAK_ATTEMPTS 16u
++#define FJ_USBHOST_HCD_IDLE_SLEEP_MS	20u
+ #define FJ_USBHOST_TX_ENCODED_MAX	96u
+ #define FJ_USBHOST_RX_BYTES_MAX		72u
+ #define FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 2u
+@@ -280,8 +283,10 @@
+ 	int last_tx_result;
+ 	int last_rx_result;
+ 	struct usb_hcd *hcd;
++	struct task_struct *hcd_sof_task;
+ 	u32 hcd_port_status;
+ 	u16 hcd_frame;
++	bool hcd_sof_enabled;
+ 	u8 last_rx_bytes[FJ_USBHOST_RX_BYTES_MAX];
+ 	u8 tx_dma_buf[FJ_USBHOST_TX_ENCODED_MAX];
+ 	bool pio_ready;
+@@ -3255,6 +3260,10 @@
+ 
+ static void fj_usbhost_pio_release(struct fruitjam_usbhost *uh);
+ static void fj_usbhost_reset_bus(struct fruitjam_usbhost *uh, u32 reset_ms);
++static int fj_usbhost_pio_send_sof(struct fruitjam_usbhost *uh, u16 frame,
++				   u8 *encoded_len);
++static int fj_usbhost_pio_send_keepalive(struct fruitjam_usbhost *uh,
++					 u8 *encoded_len);
+ 
+ static int fj_usbhost_pio_control_status_out(struct fruitjam_usbhost *uh,
+ 					     u8 addr)
+@@ -3511,6 +3520,74 @@
+ 	if ((old ^ status) & USB_PORT_STAT_CONNECTION)
+ 		status |= USB_PORT_STAT_C_CONNECTION << 16;
+ 	uh->hcd_port_status = status;
++}
++
++static bool fj_usbhost_hcd_sof_active(struct fruitjam_usbhost *uh)
++{
++	return uh->hcd_sof_enabled && uh->pio_configured &&
++	       (uh->hcd_port_status & USB_PORT_STAT_POWER) &&
++	       (uh->hcd_port_status & USB_PORT_STAT_CONNECTION);
++}
++
++static int fj_usbhost_hcd_sof_thread(void *data)
++{
++	struct fruitjam_usbhost *uh = data;
++
++	while (!kthread_should_stop()) {
++		bool active = false;
++
++		if (mutex_trylock(&uh->lock)) {
++			fj_usbhost_hcd_refresh_port(uh);
++			active = fj_usbhost_hcd_sof_active(uh);
++			if (active) {
++				u8 encoded_len = 0;
++				int ret;
++
++				if (uh->low_speed)
++					ret = fj_usbhost_pio_send_keepalive(
++						uh, &encoded_len);
++				else
++					ret = fj_usbhost_pio_send_sof(
++						uh, uh->hcd_frame++ & 0x7ff,
++						&encoded_len);
++				fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++			}
++			mutex_unlock(&uh->lock);
++		} else {
++			active = uh->hcd_sof_enabled;
++		}
++
++		if (active)
++			usleep_range(1000, 1100);
++		else
++			msleep(FJ_USBHOST_HCD_IDLE_SLEEP_MS);
++	}
++
++	return 0;
++}
++
++static void fj_usbhost_hcd_sof_start(struct fruitjam_usbhost *uh)
++{
++	if (uh->hcd_sof_task)
++		return;
++
++	uh->hcd_sof_task = kthread_run(fj_usbhost_hcd_sof_thread, uh,
++				       "fj-usb-sof");
++	if (IS_ERR(uh->hcd_sof_task)) {
++		dev_warn(uh->dev, "USB host SOF thread start failed: %ld\n",
++			 PTR_ERR(uh->hcd_sof_task));
++		uh->hcd_sof_task = NULL;
++	}
++}
++
++static void fj_usbhost_hcd_sof_stop(struct fruitjam_usbhost *uh)
++{
++	struct task_struct *task = uh->hcd_sof_task;
++
++	uh->hcd_sof_enabled = false;
++	uh->hcd_sof_task = NULL;
++	if (task)
++		kthread_stop(task);
+ }
+ 
+ static int fj_usbhost_hcd_start(struct usb_hcd *hcd)
+@@ -3521,14 +3598,19 @@
+ 	hcd->state = HC_STATE_RUNNING;
+ 	hcd->uses_new_polling = 1;
+ 	mutex_lock(&uh->lock);
++	uh->hcd_sof_enabled = true;
+ 	fj_usbhost_hcd_refresh_port(uh);
+ 	mutex_unlock(&uh->lock);
++	fj_usbhost_hcd_sof_start(uh);
+ 	return 0;
+ }
+ 
+ static void fj_usbhost_hcd_stop(struct usb_hcd *hcd)
+ {
++	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
++
+ 	hcd->state = HC_STATE_HALT;
++	fj_usbhost_hcd_sof_stop(uh);
+ }
+ 
+ static int fj_usbhost_hcd_get_frame_number(struct usb_hcd *hcd)
+@@ -5209,6 +5291,7 @@
+ 			dev_warn(&pdev->dev,
+ 				 "USB host HCD registration failed: %d\n",
+ 				 ret);
++			fj_usbhost_hcd_sof_stop(uh);
+ 			usb_put_hcd(hcd);
+ 			uh->hcd = NULL;
+ 		}
+@@ -5226,6 +5309,8 @@
+ {
+ 	struct fruitjam_usbhost *uh = platform_get_drvdata(pdev);
+ 
++	fj_usbhost_hcd_sof_stop(uh);
++
+ 	if (uh->hcd) {
+ 		usb_remove_hcd(uh->hcd);
+ 		usb_put_hcd(uh->hcd);
+-- 
+2.39.5

@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 02:45:00 -0400
+Subject: [PATCH] misc: use upstream-style Fruit Jam HCD status OUT
+
+Pico-PIO-USB handles OUT transactions by preparing RX, sending the OUT token,
+sending the DATA packet, then starting RX and waiting for the handshake. The
+HCD control-read path still used the local gated ACK-arm helper for its status
+OUT stage.
+
+Try the upstream-style status OUT first and keep the gated ACK-arm path as a
+fallback. This keeps the post-DATA status stage aligned with the working
+wili8jam/Pico-PIO-USB transaction order once setup and IN data make progress.
+---
+ drivers/misc/fruitjam_usbhost.c | 58 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3323,6 +3323,35 @@ static int fj_usbhost_pio_send_keepalive(struct fruitjam_usbhost *uh,
+ 
+ static int fj_usbhost_pio_control_status_out(struct fruitjam_usbhost *uh,
+ 					     u8 addr)
++{
++	u8 encoded_len = 0;
++	int ret;
++
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_OUT, addr, 0,
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_send_data_packet(uh, FJ_USB_PID_DATA1, NULL, 0,
++					      &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_start_receive(uh);
++	ret = fj_usbhost_pio_wait_handshake_fast(uh);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++	return 0;
++}
++
++static int fj_usbhost_pio_control_status_out_arm_gap(struct fruitjam_usbhost *uh,
++						     u8 addr)
+ {
+ 	u16 token = addr & 0x7f;
+ 	u8 out_packet[4] = { FJ_USB_SYNC, FJ_USB_PID_OUT, 0, 0 };
+@@ -3349,6 +3378,27 @@ static int fj_usbhost_pio_control_status_out(struct fruitjam_usbhost *uh,
+ 		return -EPROTO;
+ 	}
+ 	return 0;
++}
++
++static int fj_usbhost_hcd_control_status_out(struct fruitjam_usbhost *uh,
++					     u8 addr)
++{
++	int upstream_ret;
++	int ret;
++
++	upstream_ret = fj_usbhost_pio_control_status_out(uh, addr);
++	if (!upstream_ret)
++		return 0;
++
++	fj_usbhost_pio_disable_receive(uh);
++	ret = fj_usbhost_pio_control_status_out_arm_gap(uh, addr);
++	if (ret)
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "hcd-control-status-out failed upstream-ret=%d fallback-ret=%d pid=0x%02x rx-len=%u",
++			  upstream_ret, ret, uh->last_rx_pid,
++			  uh->last_rx_len);
++	return ret;
+ }
+ 
+ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+@@ -3505,8 +3555,8 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 				if (ret)
+ 					return ret;
+ 
+-				ret = fj_usbhost_pio_control_status_out(uh,
+-									addr);
++				ret = fj_usbhost_hcd_control_status_out(uh,
++								       addr);
+ 				if (!ret) {
+ 					*actual = copied;
+ 					scnprintf(
+-- 
+2.39.5

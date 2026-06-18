@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 19:35:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost setup gap probe
+
+The separate Linux SETUP-token and DATA0 sends can leave a much larger
+inter-packet gap than the known-good Pico-PIO-USB path, while the existing
+combo probe streams the packets back-to-back.  Add a diagnostic middle path
+that streams SETUP and DATA0 in one DMA transaction with a configurable number
+of full-speed idle bytes between them, then skips the setup ACK and probes the
+following IN stage.
+
+This keeps the experiment isolated from the existing probes while allowing the
+host/device turnaround window to be swept from userspace.
+---
+ drivers/misc/fruitjam_usbhost.c | 142 +++++++++++++++++++++++++++++++++
+ 1 file changed, 142 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -58,6 +58,10 @@
+ #define FJ_USBHOST_RESET_RECOVERY_FRAMES 25u
+ #define FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US 1000u
+ #define FJ_USBHOST_HANDSHAKE_START_TIMEOUT_US 20u
++#define FJ_USBHOST_SETUP_GAP_DEFAULT_BYTES 2u
++#define FJ_USBHOST_SETUP_GAP_MAX_BYTES 16u
++#define FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE 0xffu
++#define FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE 0x55u
+ #define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+@@ -2899,6 +2903,118 @@ static int fj_usbhost_pio_get_device8_combo_skipack(struct fruitjam_usbhost *uh)
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_send_setup_data0_gap_dma_addr(
++	struct fruitjam_usbhost *uh, u8 addr, const u8 *payload,
++	u8 payload_len, u32 gap_bytes, u8 *encoded_len)
++{
++	u16 token = addr & 0x7f;
++	u8 setup_packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SETUP, 0, 0 };
++	u8 data_packet[16];
++	u8 encoded_a[FJ_USBHOST_TX_ENCODED_MAX];
++	u8 encoded_b[FJ_USBHOST_TX_ENCODED_MAX];
++	u8 encoded[FJ_USBHOST_TX_ENCODED_MAX];
++	u8 len_a;
++	u8 len_b;
++	u8 idle_byte;
++	u16 crc;
++	int ret;
++
++	if (payload_len > 8)
++		return -EINVAL;
++	if (!gap_bytes)
++		gap_bytes = FJ_USBHOST_SETUP_GAP_DEFAULT_BYTES;
++	if (gap_bytes > FJ_USBHOST_SETUP_GAP_MAX_BYTES)
++		return -EINVAL;
++
++	setup_packet[2] = token & 0xff;
++	setup_packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
++			  ((token >> 8) & 0x1f);
++
++	data_packet[0] = FJ_USB_SYNC;
++	data_packet[1] = FJ_USB_PID_DATA0;
++	memcpy(data_packet + 2, payload, payload_len);
++	crc = fj_usbhost_crc16_data(payload, payload_len);
++	data_packet[2 + payload_len] = crc & 0xff;
++	data_packet[3 + payload_len] = crc >> 8;
++
++	len_a = fj_usbhost_encode_tx(setup_packet, sizeof(setup_packet),
++				     encoded_a);
++	len_b = fj_usbhost_encode_tx(data_packet, payload_len + 4,
++				     encoded_b);
++	if (len_a > sizeof(encoded) || len_b > sizeof(encoded) ||
++	    len_a + gap_bytes + len_b > sizeof(encoded))
++		return -EOVERFLOW;
++
++	idle_byte = uh->low_speed ? FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE :
++				    FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE;
++	memcpy(encoded, encoded_a, len_a);
++	memset(encoded + len_a, idle_byte, gap_bytes);
++	memcpy(encoded + len_a + gap_bytes, encoded_b, len_b);
++	*encoded_len = len_a + gap_bytes + len_b;
++
++	ret = fj_usbhost_pio_tx_encoded(uh, encoded, *encoded_len);
++	if (ret)
++		return ret;
++	return fj_usbhost_pio_wait_tx_stream_idle(uh);
++}
++
++static int fj_usbhost_pio_get_device8_gap(struct fruitjam_usbhost *uh,
++					  u32 gap_bytes)
++{
++	static const u8 get_device8_setup[8] = {
++		0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	if (!gap_bytes)
++		gap_bytes = FJ_USBHOST_SETUP_GAP_DEFAULT_BYTES;
++	if (gap_bytes > FJ_USBHOST_SETUP_GAP_MAX_BYTES)
++		return -EINVAL;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	fj_usbhost_pio_disable_receive(uh);
++	ret = fj_usbhost_pio_send_setup_data0_gap_dma_addr(
++		uh, 0, get_device8_setup, sizeof(get_device8_setup),
++		gap_bytes, &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "setup-gap gap-bytes=%u setup-tx-len=%u",
++		  gap_bytes, encoded_len);
++
++	ret = fj_usbhost_pio_sof_burst(uh, 1);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_prepare_receive_after_tx(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	if (!ret)
++		scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++			  "setup-gap descriptor-rx-len=%u pid=0x%02x",
++			  uh->last_rx_len, uh->last_rx_pid);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_rx_result = ret;
++	uh->last_rx_len = 0;
++	uh->last_rx_pid = 0;
++	uh->rx_errors++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh);
+ 
+ static int fj_usbhost_pio_control_status_in(struct fruitjam_usbhost *uh,
+@@ -3767,6 +3875,14 @@ static int fj_usbhost_pio_get_device8_active_combo_skipack(struct fruitjam_usbho
+ 	return ret ? ret : fj_usbhost_pio_get_device8_combo_skipack(uh);
+ }
+ 
++static int fj_usbhost_pio_get_device8_active_gap(struct fruitjam_usbhost *uh,
++						 u32 gap_bytes)
++{
++	int ret = fj_usbhost_pio_reset_active(uh);
++
++	return ret ? ret : fj_usbhost_pio_get_device8_gap(uh, gap_bytes);
++}
++
+ static int fj_usbhost_pio_get_device8_active_fast(struct fruitjam_usbhost *uh)
+ {
+ 	int ret = fj_usbhost_pio_reset_active(uh);
+@@ -4186,6 +4301,7 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 	u8 hub_port;
+ 	u32 sof_frames;
+ 	int ret = 0;
++	u32 gap_bytes;
+ 
+ 	if (!count)
+ 		return 0;
+@@ -4252,4 +4368,12 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_combo_skipack(uh);
++	} else if (!strncmp(cmd, "get-device-8-gap", 16) &&
++		   (cmd[16] == '\0' || cmd[16] == ' ' ||
++		    cmd[16] == '\t')) {
++		ret = fj_usbhost_parse_optional_u32(
++			cmd + 16, FJ_USBHOST_SETUP_GAP_MAX_BYTES,
++			&gap_bytes);
++		if (!ret)
++			ret = fj_usbhost_pio_get_device8_gap(uh, gap_bytes);
+ 	} else if (!strcmp(cmd, "get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_fast(uh);
+ 	} else if (!strcmp(cmd, "get-device-8-tight")) {
+@@ -4269,6 +4394,15 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_active_combo(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-combo-skipack")) {
+ 		ret = fj_usbhost_pio_get_device8_active_combo_skipack(uh);
++	} else if (!strncmp(cmd, "reset-get-device-8-gap", 22) &&
++		   (cmd[22] == '\0' || cmd[22] == ' ' ||
++		    cmd[22] == '\t')) {
++		ret = fj_usbhost_parse_optional_u32(
++			cmd + 22, FJ_USBHOST_SETUP_GAP_MAX_BYTES,
++			&gap_bytes);
++		if (!ret)
++			ret = fj_usbhost_pio_get_device8_active_gap(
++				uh, gap_bytes);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-fast")) {
+ 		ret = fj_usbhost_pio_get_device8_active_fast(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-tight")) {
+-- 
+2.39.5

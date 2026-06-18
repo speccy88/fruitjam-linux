@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 21:45:00 -0400
+Subject: [PATCH] misc: keep Fruit Jam USB host status nonblocking
+
+Fruit Jam service health depends on status paths staying cheap even while USB
+host enumeration is unhealthy. The AirLift CGI status endpoint reads
+/dev/fruitjam-usbhost, but that read used a blocking mutex_lock(). If usbcore
+is inside a slow EP0 transaction or recovery path, a CGI status request can sit
+behind the HCD mutex long enough to make the HTTP control path look dead.
+
+Use mutex_trylock() for read-side status. When the HCD owns the lock, return a
+small best-effort busy snapshot instead of touching PIO registers. That keeps
+host diagnostics and recovery commands responsive while preserving the full
+status output whenever the bridge is idle.
+---
+ drivers/misc/fruitjam_usbhost.c | 60 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -6002,9 +6002,66 @@
+ 	if (!tmp)
+ 		return -ENOMEM;
+ 
+-	mutex_lock(&uh->lock);
+-	len = fj_usbhost_format_status(uh, tmp, 2048);
+-	mutex_unlock(&uh->lock);
++	if (mutex_trylock(&uh->lock)) {
++		len = fj_usbhost_format_status(uh, tmp, 2048);
++		mutex_unlock(&uh->lock);
++	} else {
++		len = scnprintf(
++			tmp, 2048,
++			"power -1\n"
++			"dp -1\n"
++			"dm -1\n"
++			"device busy\n"
++			"present 0\n"
++			"hid 0\n"
++			"driver kernel-line-state\n"
++			"bridge pio-packet-io-busy\n"
++			"pio %u\n"
++			"pio_ready %u\n"
++			"hcd_registered %u\n"
++			"hcd_manual_start %u\n"
++			"hcd_faulted %u\n"
++			"hcd_ep0_failures %u\n"
++			"hcd_delay_ms %u\n"
++			"hcd_port_reset_settle_ms %u\n"
++			"hcd_port_reset_sof_frames %u\n"
++			"hcd_sof %u\n"
++			"pio_configured %u\n"
++			"pio_program %s\n"
++			"tx_sm %u\nrx_sm %u\neop_sm %u\n"
++			"clk_sys_hz %u\n"
++			"packets %u\n"
++			"tx_errors %u\n"
++			"last_tx_result %d\n"
++			"last_tx_len %u\n"
++			"tx_dma %u\n"
++			"tx_dma_channel %u\n"
++			"tx_dma_packets %u\n"
++			"last_dma_result %d\n"
++			"rx_attempts %u\n"
++			"rx_errors %u\n"
++			"last_rx_result %d\n"
++			"last_rx_len %u\n"
++			"last_rx_pid 0x%02x\n"
++			"last_rx_hex \n"
++			"probe_summary status-busy lock-held\n"
++			"first_milestone boot-protocol-keyboard\n"
++			"reports 0\n"
++			"last_reset_ms %u\n",
++			uh->pio_index, uh->pio_ready, uh->hcd_registered ? 1 : 0,
++			uh->hcd_manual_start ? 1 : 0, uh->hcd_faulted ? 1 : 0,
++			uh->hcd_ep0_failures, uh->hcd_start_delay_ms,
++			uh->hcd_port_reset_settle_ms,
++			uh->hcd_port_reset_sof_frames,
++			uh->hcd_sof_enabled ? 1 : 0, uh->pio_configured,
++			uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
++			uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->clk_sys_hz,
++			uh->packets, uh->tx_errors, uh->last_tx_result,
++			uh->last_tx_len, uh->dma ? 1 : 0, uh->tx_dma_channel,
++			uh->tx_dma_packets, uh->last_dma_result,
++			uh->rx_attempts, uh->rx_errors, uh->last_rx_result,
++			uh->last_rx_len, uh->last_rx_pid, uh->last_reset_ms);
++	}
+ 
+ 	ret = simple_read_from_buffer(buf, count, ppos, tmp, len);
+ 	kfree(tmp);
+-- 
+2.39.5

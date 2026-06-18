@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 14:45:00 +0000
+Subject: [PATCH] misc: wait after Fruit Jam usbhost reset release
+
+The active USB host probes released reset and then waited only 100 us before
+reconfiguring PIO, sending SOFs, and starting control transfers.  Full-speed
+devices, especially the onboard hub at the Fruit Jam root port, need normal
+USB reset recovery time before they are required to answer endpoint-zero
+traffic.
+
+Add an explicit 25 ms reset-recovery delay after releasing SE0.  This keeps
+the small diagnostic stack simple while avoiding setup transactions that begin
+before the root hub has finished reset recovery.
+---
+ drivers/misc/fruitjam_usbhost.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -54,6 +54,7 @@
+ #define FJ_USBHOST_DMA_TIMEOUT_US	2000u
+ #define FJ_USBHOST_SOF_BURST_FRAMES	20u
+ #define FJ_USBHOST_ACTIVE_RESET_MS	50u
++#define FJ_USBHOST_RESET_RECOVERY_MS	25u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_EP	1u
+@@ -3252,7 +3253,8 @@ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh)
+ 	fj_usbhost_bus_reset_override(uh, true);
+ 	msleep(FJ_USBHOST_ACTIVE_RESET_MS);
+ 	fj_usbhost_bus_reset_override(uh, false);
+-	udelay(100);
++	msleep(FJ_USBHOST_RESET_RECOVERY_MS);
++
+ 	ret = fj_usbhost_pio_configure_sms(uh);
+ 	if (ret)
+ 		return ret;
+-- 
+2.39.5

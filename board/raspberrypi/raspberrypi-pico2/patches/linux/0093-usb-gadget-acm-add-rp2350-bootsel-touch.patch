@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Wed, 17 Jun 2026 23:59:00 -0400
+Subject: [PATCH] usb: gadget: acm: add RP2350 1200-baud BOOTSEL touch
+
+The Fruit Jam recovery workflow must not depend on the physical BOOTSEL
+button. Support the common microcontroller convention of rebooting into the
+ROM loader when the host selects 1200 baud on the CDC ACM port.
+
+Schedule the restart from a delayed work item so the USB control request can
+complete before Linux disconnects the gadget.
+---
+ drivers/usb/gadget/function/f_acm.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/usb/gadget/function/f_acm.c b/drivers/usb/gadget/function/f_acm.c
+index 120febd2599a..9b826846a23c 100644
+--- a/drivers/usb/gadget/function/f_acm.c
++++ b/drivers/usb/gadget/function/f_acm.c
+@@ -15,8 +15,11 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/device.h>
+ #include <linux/err.h>
++#include <linux/jiffies.h>
++#include <linux/reboot.h>
++#include <linux/workqueue.h>
+ 
+ #include "u_serial.h"
+ 
+ 
+@@ -66,8 +69,34 @@ static inline struct f_acm *port_to_acm(struct gserial *p)
+ {
+ 	return container_of(p, struct f_acm, port);
+ }
+ 
++#define ACM_RP2350_BOOTSEL_BAUD		1200u
++#define ACM_RP2350_BOOTSEL_DELAY_MS	250u
++
++static void acm_rp2350_bootsel_work(struct work_struct *work)
++{
++	kernel_restart("bootsel");
++}
++
++static DECLARE_DELAYED_WORK(acm_rp2350_bootsel_restart_work,
++			    acm_rp2350_bootsel_work);
++
++static void acm_maybe_schedule_rp2350_bootsel(struct f_acm *acm)
++{
++	u32 baud = le32_to_cpu(acm->port_line_coding.dwDTERate);
++
++	if (baud != ACM_RP2350_BOOTSEL_BAUD)
++		return;
++
++	/*
++	 * Let the control transfer finish before the gadget disconnects.
++	 * Repeated touches only keep the same pending restart alive.
++	 */
++	mod_delayed_work(system_wq, &acm_rp2350_bootsel_restart_work,
++			 msecs_to_jiffies(ACM_RP2350_BOOTSEL_DELAY_MS));
++}
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /* notification endpoint uses smallish and infrequent fixed-size messages */
+ 
+@@ -320,8 +347,9 @@ static void acm_complete_set_line_coding(struct usb_ep *ep,
+ 		 * the order of 9600-8-N-1 ... most of which means
+ 		 * nothing unless we control a real RS232 line.
+ 		 */
+ 		acm->port_line_coding = *value;
++		acm_maybe_schedule_rp2350_bootsel(acm);
+ 	}
+ }
+ 
+ static int acm_send_break(struct gserial *port, int duration);
+@@ -380,8 +408,9 @@ static int acm_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
+ 		 * host sets the USB_CDC_CTRL_DTR bit; and when it clears
+ 		 * that bit, we should return to that no-flow state.
+ 		 */
+ 		acm->port_handshake_bits = w_value;
++		acm_maybe_schedule_rp2350_bootsel(acm);
+ 		break;
+ 
+ 	case ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8)
+ 			| USB_CDC_REQ_SEND_BREAK:
+-- 
+2.39.5

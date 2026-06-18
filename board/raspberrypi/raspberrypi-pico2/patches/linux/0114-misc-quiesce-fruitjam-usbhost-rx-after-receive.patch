@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 15:20:00 -0400
+Subject: [PATCH] misc: quiesce Fruit Jam USB host RX after receive
+
+Pico-PIO-USB/wili8jam disables the RX state machine and clears its receive
+slots after each setup, IN, and OUT transaction. The Fruit Jam Linux bridge
+already disables RX after receive helpers, but it leaves cleanup mostly to the
+next prepare path. Because this driver has a separate EOP state machine and is
+retrying fragile EP0 control transactions, make the transaction tail explicit:
+record the diagnostic RX state first, then quiesce RX/EOP and clear any stale
+FIFO/IRQ state before the next token.
+
+This keeps last_rx_* evidence available while matching the known-working
+transaction hygiene more closely.
+---
+ drivers/misc/fruitjam_usbhost.c | 42 +++++++++++++++++++++++++---------
+ 1 file changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -649,6 +649,22 @@ static void fj_usbhost_pio_disable_receive(struct fruitjam_usbhost *uh)
+	fj_usbhost_pio_clear_rx_irq(uh);
+ }
+ 
++static void fj_usbhost_pio_record_rx(struct fruitjam_usbhost *uh, int ret,
++				     u32 len);
++
++static void fj_usbhost_pio_finish_receive(struct fruitjam_usbhost *uh,
++					  int ret, u32 len)
++{
++	/*
++	 * Preserve the receive diagnostics first.  Then match Pico-PIO-USB's
++	 * transaction tail by leaving RX idle with no stale FIFO/IRQ state for
++	 * the next SETUP/IN/OUT retry.
++	 */
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_record_rx(uh, ret, len);
++	fj_usbhost_pio_disable_receive(uh);
++}
++
+ static void fj_usbhost_pio_prepare_receive_after_tx(struct fruitjam_usbhost *uh)
+ {
+ 	void __iomem *rx_sm = fj_usbhost_pio_sm(uh, uh->sm_rx);
+@@ -2298,8 +2311,7 @@ static int fj_usbhost_pio_wait_handshake_fast(struct fruitjam_usbhost *uh)
+ 	}
+ 
+ out:
+-	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+-	fj_usbhost_pio_record_rx(uh, ret, len);
++	fj_usbhost_pio_finish_receive(uh, ret, len);
+ 	return ret;
+ #undef FJ_USBHOST_DRAIN_HANDSHAKE_FIFO
+ }
+@@ -2426,8 +2438,7 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ 	    (uh->last_rx_bytes[1] == FJ_USB_PID_DATA0 ||
+ 	     uh->last_rx_bytes[1] == FJ_USB_PID_DATA1))
+ 		ret = -ETIMEDOUT;
+-	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+-	fj_usbhost_pio_record_rx(uh, ret, len);
++	fj_usbhost_pio_finish_receive(uh, ret, len);
+ 	return ret;
+ #undef FJ_USBHOST_DRAIN_RX_FIFO
+ }
+@@ -2479,8 +2490,7 @@ static int fj_usbhost_pio_receive_raw_noeop_stop(struct fruitjam_usbhost *uh)
+ 		ret = 0;
+ 
+ out:
+-	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+-	fj_usbhost_pio_record_rx(uh, ret, len);
++	fj_usbhost_pio_finish_receive(uh, ret, len);
+ 	return ret;
+ #undef FJ_USBHOST_DRAIN_RX_FIFO
+ }
+@@ -2523,8 +2533,7 @@ static int fj_usbhost_pio_receive_capture(struct fruitjam_usbhost *uh,
+ 		udelay(1);
+ 	}
+ 
+-	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+-	fj_usbhost_pio_record_rx(uh, ret, len);
++	fj_usbhost_pio_finish_receive(uh, ret, len);
+ 	return ret;
+ }
+ 
+@@ -3216,8 +3225,7 @@ static int fj_usbhost_pio_wait_handshake_pico(struct fruitjam_usbhost *uh)
+ 		ret = -EPROTO;
+ 
+ out:
+-	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+-	fj_usbhost_pio_record_rx(uh, ret, len);
++	fj_usbhost_pio_finish_receive(uh, ret, len);
+ 	return ret;
+ }
+ 
+@@ -3288,9 +3296,8 @@ static int fj_usbhost_pio_wait_handshake_scan(struct fruitjam_usbhost *uh,
+ 	}
+ 
+ out:
+-	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+-	fj_usbhost_pio_record_rx(uh, ret, len);
+-	if (!ret)
++	fj_usbhost_pio_finish_receive(uh, ret, len);
++	if (!ret)
+ 		uh->last_rx_pid = pid;
+ 	return ret;
+ }
+-- 
+2.39.5

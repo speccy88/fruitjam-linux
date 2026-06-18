@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 21:05:00 -0400
+Subject: [PATCH] misc: send Fruit Jam HCD SOF after reset settle
+
+The working wili8jam/Pico-PIO-USB host path runs enumeration from the 1 kHz
+host frame loop: reset release is followed by ordinary full-speed SOF cadence
+before the next control stage is attempted. The Linux HCD has a background SOF
+thread, but hub_control() holds the bridge mutex while deciding when reset is
+complete, so scheduler timing can still leave the CH334F path with only a weak
+guarantee that frames were emitted immediately before usbcore starts EP0.
+
+After the CH334F reset-settle sleep, send an explicit bounded burst of SOF
+frames before reporting C_RESET to usbcore. Keep the count board-configurable
+and visible in status output so live logs prove the exact reset-to-EP0 cadence.
+---
+ drivers/misc/fruitjam_usbhost.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -63,6 +63,7 @@
+ #define FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT 0u
+ #define FJ_USBHOST_HCD_EP0_FAULT_LIMIT 4u
+ #define FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS_DEFAULT 500u
++#define FJ_USBHOST_HCD_PORT_RESET_SOF_FRAMES_DEFAULT 25u
+ #define FJ_USBHOST_HCD_PRESTART_POWER_OFF_MS 250u
+ #define FJ_USBHOST_HCD_PRESTART_POWER_ON_MS 750u
+ #define FJ_USBHOST_HCD_PRESTART_RESET_MS 100u
+@@ -311,6 +312,7 @@
+ 	u32 hcd_port_status;
+ 	u32 hcd_start_delay_ms;
+ 	u32 hcd_port_reset_settle_ms;
++	u32 hcd_port_reset_sof_frames;
+ 	bool hcd_manual_start;
+ 	u32 hcd_ep0_failures;
+ 	u32 hcd_fault_recoveries;
+@@ -4673,6 +4675,8 @@
+ 
+ static void fj_usbhost_hcd_port_reset_settle(struct fruitjam_usbhost *uh)
+ {
++	int sof_ret = 0;
++
+ 	/*
+ 	 * Called with uh->lock held.  Releasing it here lets the SOF worker keep
+ 	 * the full-speed bus alive while the external hub/device settles.
+@@ -4687,10 +4691,20 @@
+ 	msleep(uh->hcd_port_reset_settle_ms);
+ 	mutex_lock(&uh->lock);
+ 
++	if (uh->hcd_port_reset_sof_frames)
++		sof_ret = fj_usbhost_pio_sof_burst(
++			uh, uh->hcd_port_reset_sof_frames);
+ 	fj_usbhost_hcd_refresh_port(uh);
+-	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+-		  "hcd-port-reset-settle-ms=%u done",
+-		  uh->hcd_port_reset_settle_ms);
++	if (sof_ret)
++		scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++			  "hcd-port-reset-settle-ms=%u sof-frames=%u ret=%d",
++			  uh->hcd_port_reset_settle_ms,
++			  uh->hcd_port_reset_sof_frames, sof_ret);
++	else
++		scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++			  "hcd-port-reset-settle-ms=%u sof-frames=%u done",
++			  uh->hcd_port_reset_settle_ms,
++			  uh->hcd_port_reset_sof_frames);
+ }
+ 
+ static int fj_usbhost_hcd_hub_control(struct usb_hcd *hcd, u16 type_req,
+@@ -5900,6 +5914,7 @@
+ 			 "hcd_ep0_failures %u\n"
+ 			 "hcd_delay_ms %u\n"
+ 			 "hcd_port_reset_settle_ms %u\n"
++			 "hcd_port_reset_sof_frames %u\n"
+ 			 "hcd_sof %u\n"
+ 			 "pio_configured %u\n"
+ 			 "pio_program %s\n"
+@@ -5954,6 +5969,7 @@
+ 			 uh->hcd_manual_start ? 1 : 0, uh->hcd_faulted ? 1 : 0,
+ 			 uh->hcd_ep0_failures, uh->hcd_start_delay_ms,
+ 			 uh->hcd_port_reset_settle_ms,
++			 uh->hcd_port_reset_sof_frames,
+ 			 uh->hcd_sof_enabled ? 1 : 0, uh->pio_configured,
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+ 			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->clk_sys_hz,
+@@ -6497,6 +6513,8 @@
+ 	uh->tx_dma_channel = FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT;
+ 	uh->hcd_start_delay_ms = FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT;
+ 	uh->hcd_port_reset_settle_ms = FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS_DEFAULT;
++	uh->hcd_port_reset_sof_frames =
++		FJ_USBHOST_HCD_PORT_RESET_SOF_FRAMES_DEFAULT;
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dp-gpio", &uh->dp_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dm-gpio", &uh->dm_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,power-gpio", &uh->power_gpio);
+@@ -6509,6 +6527,8 @@
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,hcd-start-delay-ms", &uh->hcd_start_delay_ms);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,hcd-port-reset-settle-ms",
+ 				 &uh->hcd_port_reset_settle_ms);
++	device_property_read_u32(&pdev->dev, "raspberrypi,hcd-port-reset-sof-frames",
++				 &uh->hcd_port_reset_sof_frames);
+ 	uh->hcd_manual_start = device_property_read_bool(&pdev->dev,
+ 							 "raspberrypi,hcd-manual-start");
+ 
+-- 
+2.39.5

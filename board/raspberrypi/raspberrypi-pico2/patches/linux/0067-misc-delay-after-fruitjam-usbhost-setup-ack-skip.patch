@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 15:15:00 +0000
+Subject: [PATCH] misc: delay after Fruit Jam usbhost setup ACK skip
+
+The Linux-side no-data and skip-ACK control paths stream the SETUP token and
+DATA0 packet with valid host timing, but intentionally do not wait for the
+device's ACK handshake because that turnaround is too tight for the current
+CPU-observed diagnostic path.
+
+Do not immediately start the next IN/status token after that DATA0 EOP.  Leave
+a short inter-stage gap so the device can finish its ACK handshake and advance
+the control transfer state before the host asks for the next stage.
+---
+ drivers/misc/fruitjam_usbhost.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -55,6 +55,7 @@
+ #define FJ_USBHOST_SOF_BURST_FRAMES	20u
+ #define FJ_USBHOST_ACTIVE_RESET_MS	50u
+ #define FJ_USBHOST_RESET_RECOVERY_MS	25u
++#define FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US 1000u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_EP	1u
+@@ -2445,6 +2446,9 @@ static int fj_usbhost_pio_get_device8_combo_skipack(struct fruitjam_usbhost *uh)
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+ 		  "combo-dma-skipack setup-tx-len=%u", encoded_len);
+ 
++	usleep_range(FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US,
++		     FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US + 100u);
++
+ 	fj_usbhost_pio_prepare_receive_after_tx(uh);
+ 	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
+ 	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+@@ -2535,6 +2539,9 @@ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+ 		  "%s setup-dma-tx-len=%u", name, encoded_len);
+ 
++	usleep_range(FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US,
++		     FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US + 100u);
++
+ 	ret = fj_usbhost_pio_control_status_in(uh, addr);
+ 	if (!ret)
+ 		scnprintf(uh->last_probe_summary,
+-- 
+2.39.5

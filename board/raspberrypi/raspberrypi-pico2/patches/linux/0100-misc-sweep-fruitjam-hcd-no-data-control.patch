@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 04:20:00 -0400
+Subject: [PATCH] misc: sweep Fruit Jam HCD no-data control setup timing
+
+wili8jam/Pico-PIO-USB handles endpoint-zero transactions by preparing RX,
+sending SETUP, sending DATA0, then starting/waiting for the handshake.  The HCD
+control-read and control-write paths already try that sequence first and then
+sweep the local ACK-arm timing fallback.
+
+Apply the same strategy to no-data control requests such as SET_ADDRESS,
+SET_CONFIGURATION, SET_PROTOCOL, and SET_IDLE.  Those are the next enumeration
+requests a hub, keyboard, or gamepad reaches after the first descriptor read, so
+keeping them on the older single fixed arm-gap path would make the HCD fail at
+the next endpoint-zero stage.
+---
+ drivers/misc/fruitjam_usbhost.c | 72 +++++++++++++++++++++++++--------
+ 1 file changed, 56 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3202,7 +3202,9 @@ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 	};
+ 	u8 encoded_len = 0;
+ 	u8 arm_gap = FJ_USBHOST_HCD_ACK_ARM_GAP_DEFAULT_BYTES;
++	u32 attempt;
++	int last_ret = -ETIMEDOUT;
+ 	int ret;
+ 
+ 	ret = fj_usbhost_pio_require_configured(uh);
+ 	if (ret)
+@@ -3213,31 +3215,74 @@ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 
+-	fj_usbhost_pio_disable_receive(uh);
+-	ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
+-		uh, addr, setup, sizeof(setup), arm_gap, &encoded_len);
+-	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+-	if (ret)
+-		return ret;
++	for (attempt = 0; attempt < FJ_USBHOST_HCD_CONTROL_ATTEMPTS;
++	     attempt++) {
++		bool upstream_mode = attempt == 0;
++		u32 gap_attempt = upstream_mode ? 0 : attempt - 1;
++		const char *mode = upstream_mode ? "mode=upstream" :
++						 "mode=arm-gap";
++		u8 report_gap;
+ 
+-	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+-		  "%s setup-arm-ack gap=%u tx-len=%u", name, arm_gap, encoded_len);
++		encoded_len = 0;
++		arm_gap = fj_usbhost_hcd_ack_arm_gap_for_attempt(gap_attempt);
++		report_gap = upstream_mode ? 0 : arm_gap;
+ 
+-	ret = fj_usbhost_pio_receive_raw(uh, false);
+-	if (ret)
+-		return ret;
+-	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
+-		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
+-		return -EPROTO;
+-	}
++		ret = fj_usbhost_pio_sof_burst(uh, 1);
++		if (ret)
++			return ret;
+ 
+-	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+-		  "%s setup-ack-ok gap=%u tx-len=%u", name, arm_gap, encoded_len);
++		if (upstream_mode) {
++			ret = fj_usbhost_pio_send_setup_data0_upstream_addr(
++				uh, addr, setup, sizeof(setup), &encoded_len);
++		} else {
++			fj_usbhost_pio_disable_receive(uh);
++			ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
++				uh, addr, setup, sizeof(setup), arm_gap,
++				&encoded_len);
++		}
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		if (ret)
++			return ret;
+ 
+-	ret = fj_usbhost_pio_control_status_in(uh, addr);
+-	if (!ret)
+-		scnprintf(uh->last_probe_summary,
+-			  sizeof(uh->last_probe_summary),
+-			  "%s status-in-ok addr=%u", name, addr);
+-	return ret;
++		ret = upstream_mode ?
++		      fj_usbhost_pio_wait_handshake_fast(uh) :
++		      fj_usbhost_pio_receive_raw(uh, false);
++		if (!ret && uh->last_rx_pid != FJ_USB_PID_ACK) {
++			fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++			ret = -EPROTO;
++		}
++		if (ret) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "%s setup-fail %s addr=%u request=0x%02x attempt=%u gap=%u tx-len=%u ret=%d pid=0x%02x rx-len=%u",
++				  name, mode, addr, request, attempt + 1,
++				  report_gap, encoded_len, ret,
++				  uh->last_rx_pid, uh->last_rx_len);
++			last_ret = ret;
++			continue;
++		}
++
++		scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++			  "%s setup-ack-ok %s addr=%u request=0x%02x attempt=%u gap=%u tx-len=%u",
++			  name, mode, addr, request, attempt + 1, report_gap,
++			  encoded_len);
++
++		ret = fj_usbhost_pio_control_status_in_upstream(uh, addr);
++		if (ret)
++			ret = fj_usbhost_pio_control_status_in(uh, addr);
++		if (!ret) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "%s status-in-ok %s addr=%u request=0x%02x attempt=%u gap=%u",
++				  name, mode, addr, request, attempt + 1,
++				  report_gap);
++			return 0;
++		}
++		last_ret = ret;
++	}
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "%s no-data failed modes=upstream,arm-gap gaps=4,2,1,0,8,12,16,6 last-ret=%d pid=0x%02x rx-len=%u",
++		  name, last_ret, uh->last_rx_pid, uh->last_rx_len);
++	return last_ret;
+ 
+ out_error:
+ 	uh->last_tx_result = ret;
+-- 
+2.39.5

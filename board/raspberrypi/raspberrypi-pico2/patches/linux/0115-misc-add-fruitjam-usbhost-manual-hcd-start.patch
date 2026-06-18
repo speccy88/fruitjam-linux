@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 16:45:00 -0400
+Subject: [PATCH] misc: add Fruit Jam USB host manual HCD start
+
+The delayed HCD registration window protects early CDC/telnet/http startup, but
+it still eventually lets usbcore begin enumeration on its own. While downstream
+EP0 is still fragile, that can strand the no-MMU image before a recovery shell
+is usable.
+
+Add a DTS-controlled manual-start mode. The misc bridge still probes, configures
+PIO, and exposes status/control immediately, but usb_add_hcd() is held until
+userspace writes "hcd-start". The command calls usb_add_hcd() after dropping the
+driver mutex because the HCD start callback takes the same lock.
+---
+ drivers/misc/fruitjam_usbhost.c | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -303,6 +303,7 @@ struct fruitjam_usbhost {
+ 	struct delayed_work hcd_register_work;
+ 	u32 hcd_port_status;
+ 	u32 hcd_start_delay_ms;
++	bool hcd_manual_start;
+ 	u32 hcd_ep0_failures;
+ 	u16 hcd_frame;
+ 	bool hcd_sof_enabled;
+@@ -5752,6 +5753,7 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 			 "pio %u\n"
+ 			 "pio_ready %u\n"
+ 			 "hcd_registered %u\n"
++			 "hcd_manual_start %u\n"
+ 			 "hcd_faulted %u\n"
+ 			 "hcd_ep0_failures %u\n"
+ 			 "hcd_delay_ms %u\n"
+@@ -5805,7 +5807,8 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 			 uh->pio_ready ? "pio-packet-io-program-loaded" :
+ 					 "pio-packet-io-pending",
+ 			 uh->pio_index, uh->pio_ready,
+-			 uh->hcd_registered ? 1 : 0, uh->hcd_faulted ? 1 : 0,
++			 uh->hcd_registered ? 1 : 0,
++			 uh->hcd_manual_start ? 1 : 0, uh->hcd_faulted ? 1 : 0,
+ 			 uh->hcd_ep0_failures, uh->hcd_start_delay_ms,
+ 			 uh->hcd_sof_enabled ? 1 : 0, uh->pio_configured,
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+@@ -6056,6 +6059,7 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 	int ret = 0;
+ 	u32 gap_bytes;
+ 	u32 frame_retries;
++	bool start_hcd = false;
+ 
+ 	if (!count)
+ 		return 0;
+@@ -6080,6 +6084,19 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		scnprintf(uh->last_probe_summary,
+ 			  sizeof(uh->last_probe_summary),
+ 			  "hcd-clear-fault");
++	} else if (!strcmp(cmd, "hcd-start")) {
++		fj_usbhost_hcd_clear_fault_locked(uh);
++		if (uh->hcd_registered) {
++			uh->hcd_sof_enabled = true;
++			fj_usbhost_hcd_refresh_port(uh);
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "hcd-start already-registered");
++		} else {
++			start_hcd = true;
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary), "hcd-start");
++		}
+ 	} else if (!strncmp(cmd, "reset", 5) &&
+ 		   (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t')) {
+ 		ret = fj_usbhost_parse_reset_ms(cmd + 5, &reset_ms);
+@@ -6275,6 +6291,10 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = -EINVAL;
+ 	}
+ 	mutex_unlock(&uh->lock);
++	if (start_hcd && !ret) {
++		cancel_delayed_work_sync(&uh->hcd_register_work);
++		ret = fj_usbhost_register_hcd(uh);
++	}
+ 
+ 	return ret ? ret : count;
+ }
+@@ -6333,6 +6353,8 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,tx-dma-channel", &uh->tx_dma_channel);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,clk-sys-hz", &uh->clk_sys_hz);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,hcd-start-delay-ms", &uh->hcd_start_delay_ms);
++	uh->hcd_manual_start = device_property_read_bool(&pdev->dev,
++							 "raspberrypi,hcd-manual-start");
+ 
+ 	uh->sio = fj_ioremap_byname(pdev, "sio");
+ 	if (IS_ERR(uh->sio))
+@@ -6385,7 +6407,9 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	} else {
+ 		*(struct fruitjam_usbhost **)hcd->hcd_priv = uh;
+ 		uh->hcd = hcd;
+-		if (uh->hcd_start_delay_ms)
++		if (uh->hcd_manual_start)
++			dev_info(&pdev->dev, "USB host HCD waiting for hcd-start\n");
++		else if (uh->hcd_start_delay_ms)
+ 			schedule_delayed_work(
+ 				&uh->hcd_register_work,
+ 				msecs_to_jiffies(uh->hcd_start_delay_ms));
+-- 
+2.39.5

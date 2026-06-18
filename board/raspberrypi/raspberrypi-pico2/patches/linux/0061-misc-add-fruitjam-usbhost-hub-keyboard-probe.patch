@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 12:00:00 +0000
+Subject: [PATCH] misc: add Fruit Jam usbhost hub keyboard probe
+
+Fruit Jam's Type-A connectors sit behind the onboard hub, so a keyboard or
+receiver plugged into USB-A is not the root device.  Add a deliberately narrow
+hub-aware probe for the Logitech receiver bring-up path:
+
+  hub-kbd-init PORT ADDR CONFIG IFACE
+  hub-kbd-init-poll PORT ADDR CONFIG IFACE EP
+
+The probe enumerates the root hub at address 1, powers the hub ports, resets
+the selected downstream port, assigns the downstream boot-keyboard receiver
+address 2 by default, configures it, switches the selected interface to boot
+protocol, and optionally polls the interrupt IN endpoint.
+
+This is still not a generic USB stack.  It is a bounded bridge command for
+the onboard hub plus one full-speed downstream boot-keyboard target.
+---
+ drivers/misc/fruitjam_usbhost.c | 183 ++++++++++++++++++++++++++++++++
+ 1 file changed, 183 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -60,6 +60,17 @@
+ #define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_EP	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_IFACE	0u
++#define FJ_USBHOST_HUB_ADDR		1u
++#define FJ_USBHOST_HUB_KBD_ADDR		2u
++#define FJ_USBHOST_HUB_KBD_PORT		1u
++#define FJ_USBHOST_HUB_PORTS_MAX	4u
++#define FJ_USBHOST_HUB_POWER_DELAY_MS	100u
++#define FJ_USBHOST_HUB_RESET_DELAY_MS	60u
++#define FJ_USB_REQ_CLEAR_FEATURE	0x01u
++#define FJ_USB_REQ_SET_FEATURE		0x03u
++#define FJ_USB_PORT_FEAT_RESET		4u
++#define FJ_USB_PORT_FEAT_POWER		8u
++#define FJ_USB_PORT_FEAT_C_RESET	20u
+ 
+ #define FJ_PIO_SM_ADDR			0x0c
+ #define FJ_RESET_DMA			2u
+@@ -2585,6 +2596,114 @@ static int fj_usbhost_pio_keyboard_init_poll(struct fruitjam_usbhost *uh,
+ 	return ret ? ret : fj_usbhost_pio_keyboard_poll(uh, addr, ep);
+ }
+ 
++static int fj_usbhost_pio_hub_port_no_data(struct fruitjam_usbhost *uh,
++					   u8 request, u16 feature,
++					   u8 port, const char *name)
++{
++	return fj_usbhost_pio_control_no_data(uh, FJ_USBHOST_HUB_ADDR,
++					      0x23, request, feature, port,
++					      name);
++}
++
++static int fj_usbhost_pio_hub_power_ports(struct fruitjam_usbhost *uh)
++{
++	u8 port;
++	int ret;
++
++	for (port = 1; port <= FJ_USBHOST_HUB_PORTS_MAX; port++) {
++		ret = fj_usbhost_pio_hub_port_no_data(
++			uh, FJ_USB_REQ_SET_FEATURE, FJ_USB_PORT_FEAT_POWER,
++			port, "hub-port-power");
++		if (ret)
++			return ret;
++	}
++	msleep(FJ_USBHOST_HUB_POWER_DELAY_MS);
++	return 0;
++}
++
++static int fj_usbhost_pio_hub_reset_port(struct fruitjam_usbhost *uh, u8 port)
++{
++	int ret;
++
++	ret = fj_usbhost_pio_hub_port_no_data(
++		uh, FJ_USB_REQ_SET_FEATURE, FJ_USB_PORT_FEAT_RESET, port,
++		"hub-port-reset");
++	if (ret)
++		return ret;
++	msleep(FJ_USBHOST_HUB_RESET_DELAY_MS);
++
++	return fj_usbhost_pio_hub_port_no_data(
++		uh, FJ_USB_REQ_CLEAR_FEATURE, FJ_USB_PORT_FEAT_C_RESET,
++		port, "hub-port-clear-reset");
++}
++
++static int fj_usbhost_pio_hub_keyboard_init(struct fruitjam_usbhost *uh,
++					    u8 port, u8 addr, u8 config,
++					    u8 iface)
++{
++	int ret;
++
++	ret = fj_usbhost_pio_reset_active(uh);
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, 0, 0x00, 0x05, FJ_USBHOST_HUB_ADDR, 0,
++		"hub-set-address");
++	if (ret)
++		return ret;
++	msleep(10);
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, FJ_USBHOST_HUB_ADDR, 0x00, 0x09, 1, 0,
++		"hub-set-config");
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_hub_power_ports(uh);
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_hub_reset_port(uh, port);
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, 0, 0x00, 0x05, addr, 0, "hub-kbd-set-address");
++	if (ret)
++		return ret;
++	msleep(10);
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, addr, 0x00, 0x09, config, 0, "hub-kbd-set-config");
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, addr, 0x21, 0x0b, 0, iface, "hub-kbd-set-boot-protocol");
++	if (ret)
++		return ret;
++
++	ret = fj_usbhost_pio_control_no_data(
++		uh, addr, 0x21, 0x0a, 0, iface, "hub-kbd-set-idle");
++	if (!ret)
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "hub-kbd-init port=%u addr=%u config=%u iface=%u",
++			  port, addr, config, iface);
++	return ret;
++}
++
++static int fj_usbhost_pio_hub_keyboard_init_poll(struct fruitjam_usbhost *uh,
++						 u8 port, u8 addr, u8 config,
++						 u8 iface, u8 ep)
++{
++	int ret = fj_usbhost_pio_hub_keyboard_init(uh, port, addr, config,
++						   iface);
++
++	return ret ? ret : fj_usbhost_pio_keyboard_poll(uh, addr, ep);
++}
++
+ static int fj_usbhost_pio_in_token_gated(struct fruitjam_usbhost *uh)
+ {
+ 	u8 encoded_len = 0;
+@@ -3308,6 +3401,49 @@ static int fj_usbhost_parse_kbd_init_poll(char *text, u8 *addr, u8 *config,
+ 		return -EINVAL;
+ 	return arg && *strim(arg) ? -EINVAL : 0;
+ }
++
++static int fj_usbhost_parse_hub_kbd_init(char *text, u8 *port, u8 *addr,
++					 u8 *config, u8 *iface)
++{
++	char *arg = strim(text);
++
++	*port = FJ_USBHOST_HUB_KBD_PORT;
++	*addr = FJ_USBHOST_HUB_KBD_ADDR;
++	*config = FJ_USBHOST_BOOT_KEYBOARD_CONFIG;
++	*iface = FJ_USBHOST_BOOT_KEYBOARD_IFACE;
++	if (!*arg)
++		return 0;
++	if (fj_usbhost_parse_u8_token(&arg, 1, FJ_USBHOST_HUB_PORTS_MAX,
++				      port) ||
++	    fj_usbhost_parse_u8_token(&arg, 2, 127, addr) ||
++	    fj_usbhost_parse_u8_token(&arg, 1, 255, config) ||
++	    fj_usbhost_parse_u8_token(&arg, 0, 255, iface))
++		return -EINVAL;
++	return arg && *strim(arg) ? -EINVAL : 0;
++}
++
++static int fj_usbhost_parse_hub_kbd_init_poll(char *text, u8 *port,
++					      u8 *addr, u8 *config,
++					      u8 *iface, u8 *ep)
++{
++	char *arg = strim(text);
++
++	*port = FJ_USBHOST_HUB_KBD_PORT;
++	*addr = FJ_USBHOST_HUB_KBD_ADDR;
++	*config = FJ_USBHOST_BOOT_KEYBOARD_CONFIG;
++	*iface = FJ_USBHOST_BOOT_KEYBOARD_IFACE;
++	*ep = FJ_USBHOST_BOOT_KEYBOARD_EP;
++	if (!*arg)
++		return 0;
++	if (fj_usbhost_parse_u8_token(&arg, 1, FJ_USBHOST_HUB_PORTS_MAX,
++				      port) ||
++	    fj_usbhost_parse_u8_token(&arg, 2, 127, addr) ||
++	    fj_usbhost_parse_u8_token(&arg, 1, 255, config) ||
++	    fj_usbhost_parse_u8_token(&arg, 0, 255, iface) ||
++	    fj_usbhost_parse_u8_token(&arg, 1, 15, ep))
++		return -EINVAL;
++	return arg && *strim(arg) ? -EINVAL : 0;
++}
+ 
+ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 				size_t count, loff_t *ppos)
+@@ -3324,6 +3458,7 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 	u8 kbd_config;
+ 	u8 kbd_iface;
+ 	u8 kbd_ep;
++	u8 hub_port;
+ 	int ret = 0;
+ 
+ 	if (!count)
+@@ -3418,6 +3553,26 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_active_burst(uh);
+ 	} else if (!strcmp(cmd, "reset-get-device-8-stream")) {
+ 		ret = fj_usbhost_pio_get_device8_active_stream(uh);
++	} else if (!strncmp(cmd, "hub-kbd-init", 12) &&
++		   (cmd[12] == '\0' || cmd[12] == ' ' ||
++		    cmd[12] == '\t')) {
++		ret = fj_usbhost_parse_hub_kbd_init(cmd + 12, &hub_port,
++						    &kbd_addr, &kbd_config,
++						    &kbd_iface);
++		if (!ret)
++			ret = fj_usbhost_pio_hub_keyboard_init(
++				uh, hub_port, kbd_addr, kbd_config,
++				kbd_iface);
++	} else if (!strncmp(cmd, "hub-kbd-init-poll", 17) &&
++		   (cmd[17] == '\0' || cmd[17] == ' ' ||
++		    cmd[17] == '\t')) {
++		ret = fj_usbhost_parse_hub_kbd_init_poll(
++			cmd + 17, &hub_port, &kbd_addr, &kbd_config,
++			&kbd_iface, &kbd_ep);
++		if (!ret)
++			ret = fj_usbhost_pio_hub_keyboard_init_poll(
++				uh, hub_port, kbd_addr, kbd_config,
++				kbd_iface, kbd_ep);
+ 	} else if (!strncmp(cmd, "kbd-init", 8) &&
+ 		   (cmd[8] == '\0' || cmd[8] == ' ' || cmd[8] == '\t')) {
+ 		ret = fj_usbhost_parse_kbd_init(cmd + 8, &kbd_addr,
+-- 
+2.39.5

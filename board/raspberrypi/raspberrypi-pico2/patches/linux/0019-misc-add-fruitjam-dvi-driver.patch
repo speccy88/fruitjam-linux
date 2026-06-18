@@ -313,7 +313,7 @@ index 000000000000..f1a4d8cd1d4d
 +{
 +	writel(0, fj->clocks + RP2350_CLOCKS_HSTX_CTRL);
 +	udelay(1);
-+	writel(RP2350_CLOCKS_DIV_INT(1), fj->clocks + RP2350_CLOCKS_HSTX_DIV);
++	writel(RP2350_CLOCKS_DIV_INT(2), fj->clocks + RP2350_CLOCKS_HSTX_DIV);
 +	writel(RP2350_CLOCKS_CTRL_AUXSRC(0) | RP2350_CLOCKS_CTRL_ENABLE,
 +	       fj->clocks + RP2350_CLOCKS_HSTX_CTRL);
 +}

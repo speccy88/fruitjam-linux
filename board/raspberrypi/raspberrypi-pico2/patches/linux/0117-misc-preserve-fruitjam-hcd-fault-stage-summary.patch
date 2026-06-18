@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 18:40:00 -0400
+Subject: [PATCH] misc: preserve Fruit Jam HCD fault stage summary
+
+The live Fruit Jam HCD failure still occurs before Logitech HID or Xbox xpad
+can bind: the downstream full-speed device is detected, then EP0 control
+transfers time out.  The fault latch is useful because it keeps CDC/telnet/HTTP
+recoverable, but it overwrote last_probe_summary with only the aggregate EP0
+fault state.  That hid the immediately preceding HCD control stage summary.
+
+Keep a copy of that previous summary when latching the fault and include it in
+both bridge status and the kernel warning.  The next hardware run will then
+show whether the final failed URB died in SETUP ACK, data IN, status, or
+no-data control handling instead of collapsing every failure to pid=0 len=0.
+---
+ drivers/misc/fruitjam_usbhost.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -4377,6 +4377,7 @@ static void fj_usbhost_hcd_clear_fault_locked(struct fruitjam_usbhost *uh)
+ 
+ static void fj_usbhost_hcd_fault_locked(struct fruitjam_usbhost *uh, int ret)
+ {
++	char prev_summary[FJ_USBHOST_PROBE_SUMMARY_MAX];
+ 	if (uh->hcd_faulted)
+ 		return;
+ 
+@@ -4386,14 +4387,15 @@ static void fj_usbhost_hcd_fault_locked(struct fruitjam_usbhost *uh, int ret)
+ 					 USB_PORT_STAT_ENABLE |
+ 					 USB_PORT_STAT_LOW_SPEED);
+ 	uh->hcd_port_status |= USB_PORT_STAT_C_CONNECTION << 16;
++	strscpy(prev_summary, uh->last_probe_summary, sizeof(prev_summary));
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+-		  "hcd-fault ep0-failures=%u last-ret=%d pid=0x%02x rx-len=%u",
++		  "hcd-fault ep0-failures=%u last-ret=%d pid=0x%02x rx-len=%u prev=%s",
+ 		  uh->hcd_ep0_failures, ret, uh->last_rx_pid,
+-		  uh->last_rx_len);
++		  uh->last_rx_len, prev_summary);
+ 	dev_warn(uh->dev,
+-		 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u; use fruitjam-usbhost hcd-clear-fault to retry\n",
++		 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u prev=%s; use fruitjam-usbhost hcd-clear-fault to retry\n",
+ 		 uh->hcd_ep0_failures, ret, uh->last_rx_pid,
+-		 uh->last_rx_len);
++		 uh->last_rx_len, prev_summary);
+ }
+ 
+ static void fj_usbhost_hcd_note_urb_result(struct fruitjam_usbhost *uh,
+-- 
+2.39.5

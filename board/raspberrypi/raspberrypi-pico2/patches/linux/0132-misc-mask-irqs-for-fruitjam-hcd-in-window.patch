@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 18:55:00 -0400
+Subject: [PATCH] misc: mask IRQs for Fruit Jam HCD IN window
+
+The remaining live hub failure after aligning the RX lifecycle is a zero-byte
+timeout on the first EP0 IN data stage.  wili8jam/Pico-PIO-USB runs this bus
+transaction in bare-metal timing: prepare RX, send the IN token, clear RX IRQs,
+then wait for the data packet and ACK it without scheduler-visible gaps.
+
+Keep the Linux HCD's short IN-token/receive window under local IRQ masking so
+the PIO state machines, RX IRQ clear, packet drain, and ACK handshake stay as
+close as possible to that known-working timing.  The mask covers only the
+microsecond-scale bus transaction; SOF pacing and higher-level retry loops stay
+outside the critical section.
+---
+ drivers/misc/fruitjam_usbhost.c | 84 +++++++++++++++++++-------------
+ 1 file changed, 50 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 8bdc2a31c6cf..0ca0190fd310 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -15,6 +15,7 @@
+ #include <linux/err.h>
+ #include <linux/fs.h>
+ #include <linux/io.h>
++#include <linux/irqflags.h>
+ #include <linux/kernel.h>
+ #include <linux/kthread.h>
+ #include <linux/math64.h>
+@@ -2592,7 +2593,33 @@ static void fj_usbhost_pio_record_tx(struct fruitjam_usbhost *uh, int ret,
+ 	else
+ 		uh->packets++;
+ }
++
++static int fj_usbhost_pio_hcd_in_token_receive(struct fruitjam_usbhost *uh,
++					       u8 pid, u8 addr, u8 ep,
++					       bool ack_data, u8 *encoded_len)
++{
++	unsigned long flags;
++	int ret;
+ 
++	/*
++	 * wili8jam/Pico-PIO-USB performs this transaction without operating
++	 * system interrupt gaps. Keep the RX arm, IN token, RX IRQ clear,
++	 * packet drain, and optional ACK in one local critical section so Linux
++	 * does not miss the hub's EP0 DATA turnaround window.
++	 */
++	local_irq_save(flags);
++	fj_usbhost_pio_prepare_receive_pico(uh);
++	ret = fj_usbhost_pio_send_token(uh, pid, addr, ep, encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, *encoded_len);
++	if (!ret) {
++		fj_usbhost_pio_start_receive(uh);
++		ret = fj_usbhost_pio_receive_raw(uh, ack_data);
++	}
++	local_irq_restore(flags);
++
++	return ret;
++}
++
+ static int fj_usbhost_pio_self_rx(struct fruitjam_usbhost *uh)
+ {
+ 	u8 packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SOF, 0, 0 };
+@@ -3966,34 +3993,20 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 			u32 payload_len;
+ 			u32 nak_attempt;
+ 
+-			fj_usbhost_pio_prepare_receive_pico(uh);
+-			ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN,
+-							addr, 0,
+-							&encoded_len);
+-			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+-			if (ret)
+-				return ret;
+-			fj_usbhost_pio_start_receive(uh);
+-
+ 			for (nak_attempt = 0;
+ 			     nak_attempt < FJ_USBHOST_HCD_IN_NAK_ATTEMPTS;
+ 			     nak_attempt++) {
+-				ret = fj_usbhost_pio_receive_raw(uh, true);
++				ret = fj_usbhost_pio_hcd_in_token_receive(
++					uh, FJ_USB_PID_IN, addr, 0,
++					true, &encoded_len);
++				if (ret && uh->last_tx_result)
++					return ret;
+ 				if (!ret && uh->last_rx_pid != FJ_USB_PID_NAK)
+ 					break;
+ 				last_ret = ret ? ret : -EAGAIN;
+ 				ret = fj_usbhost_pio_sof_burst(uh, 1);
+-				if (ret)
+-					return ret;
+-				fj_usbhost_pio_prepare_receive_pico(uh);
+-				ret = fj_usbhost_pio_send_token(
+-					uh, FJ_USB_PID_IN, addr, 0,
+-					&encoded_len);
+-				fj_usbhost_pio_record_tx(uh, ret,
+-							 encoded_len);
+ 				if (ret)
+ 					return ret;
+-				fj_usbhost_pio_start_receive(uh);
+ 			}
+ 			if (ret) {
+ 				scnprintf(uh->last_probe_summary,
+@@ -4155,14 +4168,10 @@ static int fj_usbhost_hcd_control_status_in(struct fruitjam_usbhost *uh,
+ 		if (ret)
+ 			return ret;
+ 
+-		fj_usbhost_pio_prepare_receive_pico(uh);
+-		ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, addr, 0,
+-						&encoded_len);
+-		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+-		if (ret)
++		ret = fj_usbhost_pio_hcd_in_token_receive(
++			uh, FJ_USB_PID_IN, addr, 0, true, &encoded_len);
++		if (ret && uh->last_tx_result)
+ 			return ret;
+-		fj_usbhost_pio_start_receive(uh);
+-		ret = fj_usbhost_pio_receive_raw(uh, true);
+ 		if (ret)
+ 			continue;
+ 		if (uh->last_rx_pid == FJ_USB_PID_NAK) {
+@@ -4322,15 +4331,11 @@ static int fj_usbhost_hcd_in(struct fruitjam_usbhost *uh,
+ 			if (ret)
+ 				return ret;
+ 
+-			fj_usbhost_pio_prepare_receive_pico(uh);
+-			ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN,
+-							addr, ep,
+-							&encoded_len);
+-			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+-			if (ret)
++			ret = fj_usbhost_pio_hcd_in_token_receive(
++				uh, FJ_USB_PID_IN, addr, ep, true,
++				&encoded_len);
++			if (ret && uh->last_tx_result)
+ 				return ret;
+-			fj_usbhost_pio_start_receive(uh);
+-			ret = fj_usbhost_pio_receive_raw(uh, true);
+ 			if (ret)
+ 				continue;
+ 			if (uh->last_rx_pid == FJ_USB_PID_NAK) {
+@@ -5365,17 +5370,10 @@ static int fj_usbhost_pio_get_device8_tight(struct fruitjam_usbhost *uh)
+ 		return -EPROTO;
+ 	}
+ 
+-	fj_usbhost_pio_prepare_receive_pico(uh);
+-	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
+-	if (ret) {
+-		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+-		return ret;
+-	}
+-	fj_usbhost_pio_clear_rx_irq(uh);
+-	ret = fj_usbhost_pio_receive_raw(uh, true);
+-	fj_usbhost_pio_record_tx(uh, 0, encoded_len);
+-	return ret;
++	return fj_usbhost_pio_hcd_in_token_receive(uh, FJ_USB_PID_IN, 0, 0,
++						   true, &encoded_len);
+ 
++
+ out_error:
+ 	uh->last_tx_result = ret;
+ 	uh->last_tx_len = 0;
+-- 
+2.39.5

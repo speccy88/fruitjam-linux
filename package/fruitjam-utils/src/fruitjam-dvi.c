@@ -41,7 +41,7 @@ static const char *path_dirs[] = {
 static void usage(FILE *out)
 {
 	fprintf(out,
-		"usage: fruitjam-dvi {dashboard|text TEXT|stdin|tail FILE|exec COMMAND [ARGS...]|bars|pattern|show|start|forever|stop|clear|white|test}\n");
+		"usage: fruitjam-dvi {dashboard|text TEXT|stdin|tail FILE|exec COMMAND [ARGS...]|bars|pattern|show|start|forever|stop|clear|white|test|wili|wili-pattern|wili-show|wili-forever|wili-test}\n");
 }
 
 static unsigned char rgb332(unsigned char r, unsigned char g, unsigned char b)
@@ -89,6 +89,15 @@ static int dvi_fill_and_show(const char *cmd)
 	if (dvi_command(cmd) < 0)
 		return 1;
 	if (dvi_command("show") < 0)
+		return 1;
+	return 0;
+}
+
+static int dvi_fill_and_show_as(const char *fill_cmd, const char *show_cmd)
+{
+	if (dvi_command(fill_cmd) < 0)
+		return 1;
+	if (dvi_command(show_cmd) < 0)
 		return 1;
 	return 0;
 }
@@ -629,10 +638,15 @@ int main(int argc, char **argv)
 	    !strcmp(cmd, "clear") || !strcmp(cmd, "black") ||
 	    !strcmp(cmd, "white"))
 		return dvi_fill_and_show(cmd);
+	if (!strcmp(cmd, "wili") || !strcmp(cmd, "wili-pattern"))
+		return dvi_fill_and_show_as("wili-pattern", "wili-show");
 	if (!strcmp(cmd, "start") || !strcmp(cmd, "show") ||
 	    !strcmp(cmd, "on") || !strcmp(cmd, "stop") ||
 	    !strcmp(cmd, "off") || !strcmp(cmd, "forever") ||
-	    !strcmp(cmd, "continuous") || !strcmp(cmd, "test"))
+	    !strcmp(cmd, "continuous") || !strcmp(cmd, "test") ||
+	    !strcmp(cmd, "wili-show") || !strcmp(cmd, "wili-frame") ||
+	    !strcmp(cmd, "wili-forever") || !strcmp(cmd, "wili-continuous") ||
+	    !strcmp(cmd, "wili-test"))
 		return dvi_command(cmd) < 0 ? 1 : 0;
 	if (!strcmp(cmd, "dashboard")) {
 		make_dashboard();

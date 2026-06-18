@@ -2,6 +2,11 @@
 set -eu
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ "${WILI8JAM_ROOT+x}" ]; then
+	wili8jam_root=$WILI8JAM_ROOT
+else
+	wili8jam_root="$repo/../wili8jam"
+fi
 berry_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/root/berry"
 shell_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/root/sh"
 rtttl_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/root/rtttl"
@@ -14,6 +19,7 @@ dvi_src="$repo/package/fruitjam-utils/src/fruitjam-dvi.c"
 rtttl_src_c="$repo/package/fruitjam-utils/src/fruitjam-rtttl.c"
 wavplay_src="$repo/package/fruitjam-utils/src/fruitjam-wavplay.c"
 telnetd_src="$repo/package/fruitjam-utils/src/fruitjam-telnetd.c"
+fruitjam_shell_src="$repo/package/fruitjam-utils/src/fruitjam-shell.c"
 ftpd_src="$repo/package/fruitjam-utils/src/fruitjam-ftpd.c"
 wget_src="$repo/package/fruitjam-utils/src/fruitjam-wget.c"
 httpd_src="$repo/package/fruitjam-utils/src/fruitjam-httpd.c"
@@ -32,8 +38,16 @@ ps_src="$repo/package/fruitjam-utils/src/fruitjam-ps.c"
 pgrep_src="$repo/package/fruitjam-utils/src/fruitjam-pgrep.c"
 cdc_smoke_src="$repo/scripts/cdc-smoke-test.py"
 usb_keyboard_smoke_src="$repo/scripts/usbhost-keyboard-smoke.py"
+usbhost_hcd_smoke_src="$repo/scripts/usbhost-hcd-smoke.py"
+wili8jam_usb_compare_src="$repo/scripts/compare-wili8jam-usb-config.py"
+wili8jam_media_compare_src="$repo/scripts/compare-wili8jam-media-config.py"
 mqtt_smoke_src="$repo/scripts/mqtt-smoke-test.py"
+recover_flash_src="$repo/scripts/fruitjam-recover-flash.py"
+validate_image_src="$repo/scripts/validate-fruitjam-image.sh"
+defconfig_src="$repo/configs/adafruit_fruit_jam_rp2350_defconfig"
+bootloader_main_src="$repo/package/pico2-bootloader/bootloader/src/main.c"
 bootloader_clocks_src="$repo/package/pico2-bootloader/bootloader/src/clocks.h"
+kernel_bootsel_restart_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0013-riscv-rp2350-add-bootsel-restart-command.patch"
 kernel_usbhost_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0020-misc-add-fruitjam-usbhost-bridge-driver.patch"
 kernel_usbhost_pio_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0021-misc-stage-fruitjam-usbhost-pio2-engine.patch"
 kernel_usbhost_tx_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0022-misc-configure-fruitjam-usbhost-pio2-tx-path.patch"
@@ -57,6 +71,7 @@ kernel_usbhost_dma_idle_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches
 kernel_usbhost_rx_drain_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0040-misc-drain-fruitjam-usbhost-rx-fifo-after-eop.patch"
 kernel_usbhost_setup_selfrx_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0041-misc-add-fruitjam-usbhost-setup-data-self-rx.patch"
 kernel_usbhost_rx_tail_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0042-misc-drain-fruitjam-usbhost-rx-tail-after-eop.patch"
+kernel_cdc_bootsel_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0093-usb-gadget-acm-add-rp2350-bootsel-touch.patch"
 kernel_usbhost_cpu_tx_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0043-misc-add-fruitjam-usbhost-cpu-tx-probes.patch"
 kernel_usbhost_noeop_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0044-misc-add-fruitjam-usbhost-noeop-self-rx-probe.patch"
 kernel_usbhost_sweep_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0045-misc-add-fruitjam-usbhost-data-length-sweep.patch"
@@ -74,6 +89,38 @@ kernel_usbhost_low_speed_patch="$repo/board/raspberrypi/raspberrypi-pico2/patche
 kernel_usbhost_tx_eop_gated_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0057-misc-preserve-fruitjam-usbhost-tx-eop-for-gated-rx.patch"
 kernel_usbhost_combo_skipack_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0058-misc-add-fruitjam-usbhost-combo-skipack-probe.patch"
 kernel_usbhost_keyboard_target_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0060-misc-parameterize-fruitjam-usbhost-keyboard-target.patch"
+kernel_usbhost_ack_sweep_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0095-misc-sweep-fruitjam-usbhost-hcd-ack-arm-gap.patch"
+kernel_usbhost_upstream_hcd_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0096-misc-use-upstream-style-hcd-setup-probe.patch"
+kernel_usbhost_upstream_status_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0097-misc-use-upstream-style-hcd-status-out.patch"
+kernel_usbhost_interrupt_out_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0098-misc-add-fruitjam-hcd-interrupt-out.patch"
+kernel_usbhost_transfer_types_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0099-misc-expand-fruitjam-hcd-transfer-types.patch"
+kernel_usbhost_no_data_control_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0100-misc-sweep-fruitjam-hcd-no-data-control.patch"
+kernel_usbhost_interrupt_idle_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0101-misc-treat-fruitjam-interrupt-in-nak-as-idle.patch"
+kernel_usbhost_xinput_tx_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0102-misc-size-fruitjam-usbhost-tx-buffer-for-xinput.patch"
+kernel_usbhost_pre_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0103-misc-add-fruitjam-hcd-pre-for-low-speed-hub-devices.patch"
+kernel_usbhost_pre_finish_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0104-misc-finish-fruitjam-hcd-pre-program-selection.patch"
+kernel_usbhost_pre_stall_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0105-misc-wait-for-fruitjam-hcd-pre-tx-idle.patch"
+kernel_usbhost_wili8jam_defaults_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0113-misc-default-fruitjam-usbhost-to-wili8jam-config.patch"
+kernel_usbhost_rx_quiesce_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0114-misc-quiesce-fruitjam-usbhost-rx-after-receive.patch"
+kernel_usbhost_manual_hcd_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0115-misc-add-fruitjam-usbhost-manual-hcd-start.patch"
+kernel_usbhost_reset_settle_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0116-misc-settle-fruitjam-hcd-port-reset-before-ep0.patch"
+kernel_usbhost_reset_settle_config_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0123-misc-make-fruitjam-hcd-reset-settle-configurable.patch"
+kernel_usbhost_reset_settle_status_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0124-misc-report-fruitjam-hcd-reset-settle-status-value.patch"
+kernel_usbhost_prestart_power_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0125-misc-power-cycle-fruitjam-hcd-before-registration.patch"
+kernel_usbhost_auto_recover_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0126-misc-auto-recover-fruitjam-hcd-ep0-faults.patch"
+kernel_usbhost_reset_sof_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0127-misc-send-fruitjam-hcd-sof-after-reset-settle.patch"
+kernel_usbhost_status_busy_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0128-misc-keep-fruitjam-usbhost-status-nonblocking.patch"
+kernel_usbhost_auto_recover_cap_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0129-misc-cap-fruitjam-hcd-ep0-auto-recovery.patch"
+kernel_usbhost_data_ack_timing_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0130-misc-ack-fruitjam-hcd-data-with-pico-timing.patch"
+kernel_usbhost_hcd_in_pico_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0131-misc-use-pico-rx-lifecycle-for-fruitjam-hcd-in.patch"
+kernel_usbhost_hcd_in_irq_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0132-misc-mask-irqs-for-fruitjam-hcd-in-window.patch"
+kernel_usbhost_hcd_in_irq_bound_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0133-misc-bound-fruitjam-hcd-in-irq-window.patch"
+kernel_usbhost_fault_summary_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0117-misc-preserve-fruitjam-hcd-fault-stage-summary.patch"
+kernel_usbhost_pico_rx_lifecycle_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0118-misc-use-pico-rx-lifecycle-for-fruitjam-hcd-setup.patch"
+kernel_usbhost_pico_wait_bounds_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0119-misc-match-pico-pio-usb-handshake-wait-bounds.patch"
+kernel_dvi_wili_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0120-misc-add-wili8jam-rgb565-dvi-mode.patch"
+kernel_usbhost_eop_alive_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0121-misc-keep-fruitjam-hcd-eop-alive-after-rx.patch"
+kernel_audio_waveform_patch="$repo/board/raspberrypi/raspberrypi-pico2/patches/linux/0122-misc-add-wili8jam-audio-waveforms.patch"
 kernel_config_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/adafruit_fruit_jam_rp2350.config"
 dts_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/dts/sifive/adafruit_fruit_jam_rp2350.dts"
 inittab_src="$repo/board/adafruit/adafruit_fruit_jam_rp2350/rootfs_overlay/etc/inittab"
@@ -1388,7 +1435,7 @@ print("ok mqtt sub auth")
 PY
 
 echo "== usbhost kernel bridge source guards =="
-python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_usbhost_keyboard_target_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" "$web_page_src" <<'PY'
+python3 - "$kernel_usbhost_patch" "$kernel_usbhost_pio_patch" "$kernel_usbhost_tx_patch" "$kernel_usbhost_rx_patch" "$kernel_usbhost_dma_patch" "$kernel_usbhost_reset_patch" "$kernel_usbhost_reloc_patch" "$kernel_usbhost_rx_osr_patch" "$kernel_usbhost_selfrx_patch" "$kernel_usbhost_eop_patch" "$kernel_usbhost_eop_reset_patch" "$kernel_usbhost_tx_latch_patch" "$kernel_usbhost_tx_idle_patch" "$kernel_usbhost_tx_eop_patch" "$kernel_usbhost_debug_patch" "$kernel_usbhost_debug_finish_patch" "$kernel_usbhost_gated_patch" "$kernel_usbhost_gated_write_patch" "$kernel_usbhost_dma_eop_patch" "$kernel_usbhost_dma_idle_patch" "$kernel_usbhost_rx_drain_patch" "$kernel_usbhost_setup_selfrx_patch" "$kernel_usbhost_rx_tail_patch" "$kernel_usbhost_cpu_tx_patch" "$kernel_usbhost_noeop_patch" "$kernel_usbhost_sweep_patch" "$kernel_usbhost_empty_eop_patch" "$kernel_usbhost_clock_diag_patch" "$kernel_usbhost_active_sof_patch" "$kernel_usbhost_combo_patch" "$kernel_usbhost_fast_patch" "$kernel_usbhost_tight_patch" "$kernel_usbhost_burst_patch" "$kernel_usbhost_stream_patch" "$kernel_usbhost_stream_wait_patch" "$kernel_usbhost_live_drain_patch" "$kernel_usbhost_low_speed_patch" "$kernel_usbhost_tx_eop_gated_patch" "$kernel_usbhost_combo_skipack_patch" "$kernel_usbhost_keyboard_target_patch" "$kernel_usbhost_ack_sweep_patch" "$kernel_usbhost_upstream_hcd_patch" "$kernel_usbhost_upstream_status_patch" "$kernel_usbhost_interrupt_out_patch" "$kernel_usbhost_transfer_types_patch" "$kernel_usbhost_no_data_control_patch" "$kernel_usbhost_interrupt_idle_patch" "$kernel_usbhost_xinput_tx_patch" "$kernel_usbhost_pre_patch" "$kernel_usbhost_pre_finish_patch" "$kernel_usbhost_wili8jam_defaults_patch" "$kernel_usbhost_rx_quiesce_patch" "$kernel_usbhost_pico_wait_bounds_patch" "$kernel_config_src" "$dts_src" "$usbhost_src" "$web_cgi_src" "$airlift_src" "$bootloader_clocks_src" "$web_page_src" <<'PY'
 import sys
 from pathlib import Path
 
@@ -1430,19 +1477,31 @@ low_speed_patch = Path(sys.argv[37]).read_text()
 tx_eop_gated_patch = Path(sys.argv[38]).read_text()
 combo_skipack_patch = Path(sys.argv[39]).read_text()
 keyboard_target_patch = Path(sys.argv[40]).read_text()
-config = Path(sys.argv[41]).read_text()
-dts = Path(sys.argv[42]).read_text()
-helper = Path(sys.argv[43]).read_text()
-cgi = Path(sys.argv[44]).read_text()
-airlift = Path(sys.argv[45]).read_text()
-clocks = Path(sys.argv[46]).read_text()
-web = Path(sys.argv[47]).read_text()
+ack_sweep_patch = Path(sys.argv[41]).read_text()
+upstream_hcd_patch = Path(sys.argv[42]).read_text()
+upstream_status_patch = Path(sys.argv[43]).read_text()
+interrupt_out_patch = Path(sys.argv[44]).read_text()
+transfer_types_patch = Path(sys.argv[45]).read_text()
+no_data_control_patch = Path(sys.argv[46]).read_text()
+interrupt_idle_patch = Path(sys.argv[47]).read_text()
+xinput_tx_patch = Path(sys.argv[48]).read_text()
+pre_patch = Path(sys.argv[49]).read_text() + "\n" + Path(sys.argv[50]).read_text()
+defaults_patch = Path(sys.argv[51]).read_text()
+rx_quiesce_patch = Path(sys.argv[52]).read_text()
+pico_wait_bounds_patch = Path(sys.argv[53]).read_text()
+config = Path(sys.argv[54]).read_text()
+dts = Path(sys.argv[55]).read_text()
+helper = Path(sys.argv[56]).read_text()
+cgi = Path(sys.argv[57]).read_text()
+airlift = Path(sys.argv[58]).read_text()
+clocks = Path(sys.argv[59]).read_text()
+web = Path(sys.argv[60]).read_text()
 if "CONFIG_FRUITJAM_USBHOST_BRIDGE" not in patch or "fruitjam_usbhost.c" not in patch:
     raise SystemExit("kernel patch missing Fruit Jam USB host bridge driver")
 if "/dev/fruitjam-usbhost" not in patch or "pio-packet-io-pending" not in patch:
     raise SystemExit("kernel USB host bridge patch missing device/status contract")
 for needle in (
-    "FJ_USBHOST_PIO_INDEX_DEFAULT\t2u",
+    "FJ_USBHOST_PIO_INDEX_DEFAULT",
     "FJ_USBHOST_PIO_PROGRAM_WORDS\t32u",
     "fj_usbhost_pio_program",
     "pio-packet-io-program-loaded",
@@ -1471,7 +1530,7 @@ for needle in (
     if needle not in rx_patch:
         raise SystemExit(f"kernel USB host RX patch missing {needle}")
 for needle in (
-    "FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 2u",
+    "FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT",
     "FJ_DMA_CTRL_TREQ",
     "fj_usbhost_pio_tx_encoded_dma",
     "tx_dma_packets",
@@ -1650,13 +1709,32 @@ for needle in (
     if needle not in empty_eop_patch:
         raise SystemExit(f"kernel USB host empty-EOP patch missing {needle}")
 for needle in (
-    "FJ_USBHOST_CLK_SYS_HZ_DEFAULT\t144000000u",
+    "FJ_USBHOST_CLK_SYS_HZ_DEFAULT",
     "clk_sys_hz %u",
     "tx_clkdiv 0x%08x",
     "eop_clkdiv 0x%08x",
 ):
     if needle not in clock_diag_patch:
         raise SystemExit(f"kernel USB host clock diagnostics patch missing {needle}")
+for needle in (
+    "wili8jam electrical configuration",
+    "FJ_USBHOST_PIO_INDEX_DEFAULT\t0u",
+    "FJ_USBHOST_CLK_SYS_HZ_DEFAULT\t252000000u",
+    "FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 9u",
+):
+    if needle not in defaults_patch:
+        raise SystemExit(f"kernel USB host wili8jam defaults patch missing {needle}")
+for needle in (
+    "Pico-PIO-USB/wili8jam disables the RX state machine",
+    "static void fj_usbhost_pio_record_rx(struct fruitjam_usbhost *uh, int ret",
+    "static void fj_usbhost_pio_finish_receive",
+    "Preserve the receive diagnostics first",
+    "fj_usbhost_pio_record_rx(uh, ret, len);",
+    "fj_usbhost_pio_disable_receive(uh);",
+    "fj_usbhost_pio_finish_receive(uh, ret, len);",
+):
+    if needle not in rx_quiesce_patch:
+        raise SystemExit(f"kernel USB host RX quiesce patch missing {needle}")
 for needle in (
     "FJ_USBHOST_SOF_BURST_FRAMES",
     "fj_usbhost_pio_send_sof",
@@ -1698,6 +1776,107 @@ for needle in (
 ):
     if needle not in keyboard_target_patch:
         raise SystemExit(f"kernel USB host keyboard target patch missing {needle}")
+for needle in (
+    "FJ_USBHOST_HCD_ACK_ARM_GAP_SWEEP_COUNT 8u",
+    "fj_usbhost_hcd_ack_arm_gap_for_attempt",
+    "4, 2, 1, 0, 8, 12, 16, 6",
+    "hcd-control-read setup-arm-ack addr=%u len=%u attempt=%u gap=%u tx-len=%u",
+):
+    if needle not in ack_sweep_patch:
+        raise SystemExit(f"kernel USB host HCD ACK-arm sweep patch missing {needle}")
+for needle in (
+    "fj_usbhost_pio_send_setup_data0_upstream_addr",
+    "Match Pico-PIO-USB's host setup stage",
+    "FJ_USBHOST_HCD_CONTROL_ATTEMPTS 9u",
+    "mode=upstream",
+    "mode=arm-gap",
+    "hcd-control-read failed modes=upstream,arm-gap",
+):
+    if needle not in upstream_hcd_patch:
+        raise SystemExit(f"kernel USB host upstream-style HCD patch missing {needle}")
+for needle in (
+    "fj_usbhost_hcd_control_status_out",
+    "fj_usbhost_pio_control_status_out_arm_gap",
+    "fj_usbhost_pio_send_data_packet(uh, FJ_USB_PID_DATA1, NULL, 0",
+    "hcd-control-status-out failed upstream-ret=%d fallback-ret=%d",
+    "Pico-PIO-USB handles OUT transactions",
+):
+    if needle not in upstream_status_patch:
+        raise SystemExit(f"kernel USB host upstream-style status OUT patch missing {needle}")
+for needle in (
+    "fj_usbhost_hcd_out",
+    "usb_gettoggle(udev, ep, 1)",
+    "usb_dotoggle(udev, ep, 1)",
+    "fj_usbhost_pio_send_data_packet(",
+    "usb_pipeout(urb->pipe)",
+    "hcd-interrupt",
+    "hcd-bulk",
+    "wili8jam enables TinyUSB XInput support",
+):
+    if needle not in interrupt_out_patch:
+        raise SystemExit(f"kernel USB host interrupt OUT patch missing {needle}")
+for needle in (
+    "fj_usbhost_hcd_control_write",
+    "fj_usbhost_hcd_control_data_out",
+    "fj_usbhost_hcd_control_status_in",
+    "fj_usbhost_hcd_in",
+    "usb_gettoggle(udev, ep, 0)",
+    "usb_dotoggle(udev, ep, 0)",
+    "usb_pipebulk(urb->pipe)",
+    "usb_pipein(urb->pipe)",
+    "hcd-control-write",
+    "hcd-bulk",
+    "control write transfers with DATA1",
+):
+    if needle not in transfer_types_patch:
+        raise SystemExit(f"kernel USB host transfer-types patch missing {needle}")
+for needle in (
+    "fj_usbhost_pio_control_no_data",
+    "fj_usbhost_pio_send_setup_data0_upstream_addr",
+    "fj_usbhost_hcd_ack_arm_gap_for_attempt",
+    "FJ_USBHOST_HCD_CONTROL_ATTEMPTS",
+    "mode=upstream",
+    "mode=arm-gap",
+    "setup-fail %s addr=%u request=0x%02x",
+    "setup-ack-ok %s addr=%u request=0x%02x",
+    "status-in-ok %s addr=%u request=0x%02x",
+    "no-data failed modes=upstream,arm-gap",
+    "SET_ADDRESS",
+    "SET_CONFIGURATION",
+    "SET_PROTOCOL",
+    "SET_IDLE",
+):
+    if needle not in no_data_control_patch:
+        raise SystemExit(f"kernel USB host no-data control patch missing {needle}")
+for needle in (
+    "idle_nak_success",
+    "in-idle-nak",
+    "FJ_USB_PID_NAK",
+    "bool interrupt_in",
+    "wili8jam/TinyUSB leaves such transfers live",
+    "Keep bulk/control behavior unchanged",
+):
+    if needle not in interrupt_idle_patch:
+        raise SystemExit(f"kernel USB host interrupt idle-NAK patch missing {needle}")
+for needle in (
+    "FJ_USBHOST_TX_ENCODED_MAX\t192u",
+    "64-byte HID/XInput payload",
+    "Xbox 360 wireless receiver init packets",
+):
+    if needle not in xinput_tx_patch:
+        raise SystemExit(f"kernel USB host XInput TX buffer patch missing {needle}")
+for needle in (
+    "FJ_USB_PID_PRE",
+    "hcd_need_pre",
+    "fj_usbhost_pio_send_pre",
+    "fj_usbhost_pio_restore_full_speed",
+    "fj_usbhost_hcd_device_needs_pre",
+    "USB_SPEED_LOW && udev->parent",
+    "uh->hcd_need_pre ? 1 : FJ_USBHOST_HCD_CONTROL_ATTEMPTS",
+    "wili8jam's known-working Fruit Jam USB host stack",
+):
+    if needle not in pre_patch:
+        raise SystemExit(f"kernel USB host PRE patch missing {needle}")
 for needle in (
     "fj_usbhost_pio_get_device8_fast",
     "get-device-8-fast",
@@ -1742,14 +1921,14 @@ if "CONFIG_FRUITJAM_USBHOST_BRIDGE=y" not in config:
     raise SystemExit("Fruit Jam kernel config does not enable USB host bridge")
 if "adafruit,fruit-jam-rp2350-usbhost" not in dts or "usbhost-bridge@d0000000" not in dts:
     raise SystemExit("Fruit Jam DTS missing USB host bridge node")
-if "clock-frequency = <144000000>" not in dts or "raspberrypi,clk-sys-hz = <144000000>" not in dts:
-    raise SystemExit("Fruit Jam DTS must keep clk_sys at 144 MHz for exact PIO USB 48 MHz timing")
-if "#define PLL_SYS_HZ\t(144UL * MHZ)" not in clocks or "PLL_FBDIV_INT_REG] = 120" not in clocks:
-    raise SystemExit("Fruit Jam bootloader must keep clk_sys at 144 MHz for exact PIO USB 48 MHz timing")
+if "clock-frequency = <252000000>" not in dts or "raspberrypi,clk-sys-hz = <252000000>" not in dts:
+    raise SystemExit("Fruit Jam DTS must keep clk_sys at 252 MHz for wili8jam-style PIO USB timing")
+if "#define PLL_SYS_HZ\t(252UL * MHZ)" not in clocks or "PLL_FBDIV_INT_REG] = 105" not in clocks:
+    raise SystemExit("Fruit Jam bootloader must keep clk_sys at 252 MHz for wili8jam-style PIO USB timing")
 for needle in ("0x50400000", "raspberrypi,pio = <2>", "raspberrypi,sm-tx = <0>",
                "raspberrypi,sm-rx = <1>", "raspberrypi,sm-eop = <2>",
                "0x50000000", "\"pio\", \"resets\", \"dma\"",
-               "raspberrypi,tx-dma-channel = <2>"):
+               "raspberrypi,tx-dma-channel = <9>"):
     if needle not in dts:
         raise SystemExit(f"Fruit Jam DTS missing USB host PIO2 setting {needle}")
 for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirLift")):
@@ -1759,10 +1938,10 @@ for source, name in ((helper, "fruitjam-usbhost"), (cgi, "CGI"), (airlift, "AirL
         raise SystemExit(f"{name} missing next PIO packet I/O milestone")
     if "pio_ready" not in source:
         raise SystemExit(f"{name} does not surface PIO readiness")
-if "pio-init" not in helper or "tx-test" not in helper:
+if "pio-init" not in helper or "tx-test" not in helper or "tx-test-cpu" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not expose PIO init/TX test")
-if "self-rx" not in helper:
-    raise SystemExit("fruitjam-usbhost helper does not expose self-RX diagnostic")
+if "self-rx" not in helper or "self-rx-cpu" not in helper:
+    raise SystemExit("fruitjam-usbhost helper does not expose self-RX diagnostics")
 if "setup-data-self-rx" not in helper:
     raise SystemExit("fruitjam-usbhost helper does not expose SETUP DATA self-RX diagnostic")
 if "setup-data-self-rx-noeop" not in helper:
@@ -1842,8 +2021,148 @@ for needle in (
         raise SystemExit(f"web page missing USB-host RX decode helper: {needle}")
 print("ok usbhost kernel bridge source")
 PY
+grep -q -- 'fj_usbhost_pio_wait_tx_stall' "$kernel_usbhost_pre_stall_patch"
+grep -q -- 'FJ_PIO_FDEBUG_TXSTALL' "$kernel_usbhost_pre_stall_patch"
+grep -q -- 'Pico-PIO-USB' "$kernel_usbhost_pre_stall_patch"
+grep -q -- 'post-PRE stall/idle point' "$kernel_usbhost_pre_stall_patch"
+echo "ok usbhost PRE TX idle guard"
+grep -q -- 'hcd_manual_start' "$kernel_usbhost_manual_hcd_patch"
+grep -q -- 'hcd-start' "$kernel_usbhost_manual_hcd_patch"
+grep -q -- 'raspberrypi,hcd-manual-start' "$kernel_usbhost_manual_hcd_patch"
+grep -q -- 'USB host HCD waiting for hcd-start' "$kernel_usbhost_manual_hcd_patch"
+grep -q -- 'raspberrypi,hcd-start-delay-ms = <8000>' "$dts_src"
+grep -q -- 'raspberrypi,hcd-port-reset-settle-ms = <500>' "$dts_src"
+grep -q -- 'raspberrypi,hcd-port-reset-sof-frames = <25>' "$dts_src"
+grep -q -- 'raspberrypi,hcd-manual-start' "$dts_src"
+	grep -q -- 'hcd-start' "$usbhost_src"
+	grep -q -- 'hcd_manual_start' "$usbhost_src"
+	grep -q -- 'HCD_START_POWER_OFF_US' "$usbhost_src"
+	grep -q -- 'HCD_START_POWER_ON_US' "$usbhost_src"
+	grep -q -- 'HCD_START_POST_RESET_US' "$usbhost_src"
+	grep -q -- 'bridge_hcd_start' "$usbhost_src"
+	grep -q -- 'bridge_write_command("reset 100")' "$usbhost_src"
+	grep -q -- 'manual-start %d' "$usbhost_src"
+	grep -q -- 'FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS 250u' "$kernel_usbhost_reset_settle_patch"
+	grep -q -- 'FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS_DEFAULT 500u' "$kernel_usbhost_reset_settle_config_patch"
+	grep -q -- 'hcd_port_reset_settle_ms' "$kernel_usbhost_reset_settle_config_patch"
+	grep -q -- 'raspberrypi,hcd-port-reset-settle-ms' "$kernel_usbhost_reset_settle_config_patch"
+	grep -q -- 'uh->hcd_port_reset_settle_ms' "$kernel_usbhost_reset_settle_status_patch"
+	grep -q -- 'reset-settle-ms %d' "$usbhost_src"
+	grep -q -- 'fj_usbhost_hcd_port_reset_settle' "$kernel_usbhost_reset_settle_patch"
+	grep -q -- 'hcd-port-reset-settle-ms=%u' "$kernel_usbhost_reset_settle_patch"
+	grep -q -- 'FJ_USBHOST_HCD_PORT_RESET_SOF_FRAMES_DEFAULT 25u' "$kernel_usbhost_reset_sof_patch"
+	grep -q -- 'hcd_port_reset_sof_frames' "$kernel_usbhost_reset_sof_patch"
+	grep -q -- 'raspberrypi,hcd-port-reset-sof-frames' "$kernel_usbhost_reset_sof_patch"
+	grep -q -- 'sof-frames=%u' "$kernel_usbhost_reset_sof_patch"
+	grep -q -- 'data-ack-tail-drain-us %d' "$usbhost_src"
+	grep -q -- '"hcd_data_ack_tail_drain_us"' "$usbhost_src"
+	grep -q -- '"hcd_data_ack_tail_drain_us"' "$airlift_src"
+	grep -q -- 'mutex_trylock(&uh->lock)' "$kernel_usbhost_status_busy_patch"
+	grep -q -- 'status-busy lock-held' "$kernel_usbhost_status_busy_patch"
+	grep -q -- 'pio-packet-io-busy' "$kernel_usbhost_status_busy_patch"
+	grep -q -- 'FJ_USBHOST_HCD_PRESTART_POWER_OFF_MS 250u' "$kernel_usbhost_prestart_power_patch"
+	grep -q -- 'FJ_USBHOST_HCD_PRESTART_POWER_ON_MS 750u' "$kernel_usbhost_prestart_power_patch"
+	grep -q -- 'FJ_USBHOST_HCD_PRESTART_RESET_MS 100u' "$kernel_usbhost_prestart_power_patch"
+	grep -q -- 'fj_usbhost_hcd_prestart_power_cycle' "$kernel_usbhost_prestart_power_patch"
+	grep -q -- 'hcd-prestart-power-cycle off-ms=%u on-ms=%u reset-ms=%u' "$kernel_usbhost_prestart_power_patch"
+	grep -q -- 'USB host HCD pre-start power cycle complete' "$kernel_usbhost_prestart_power_patch"
+	grep -q -- 'FJ_USBHOST_HCD_FAULT_RECOVER_DELAY_MS 1000u' "$kernel_usbhost_auto_recover_patch"
+	grep -q -- 'hcd_fault_recover_work' "$kernel_usbhost_auto_recover_patch"
+	grep -q -- 'scheduling automatic recovery' "$kernel_usbhost_auto_recover_patch"
+	grep -q -- 'hcd-auto-recover %u start' "$kernel_usbhost_auto_recover_patch"
+	grep -q -- 'hcd-auto-recover %u done' "$kernel_usbhost_auto_recover_patch"
+	grep -q -- 'usb_hcd_poll_rh_status' "$kernel_usbhost_auto_recover_patch"
+	grep -q -- 'FJ_USBHOST_HCD_FAULT_RECOVER_MAX 2u' "$kernel_usbhost_auto_recover_cap_patch"
+	grep -q -- 'auto recovery limit reached' "$kernel_usbhost_auto_recover_cap_patch"
+	grep -q -- 'hcd-fault auto-recovery-limit=%u' "$kernel_usbhost_auto_recover_cap_patch"
+	grep -q -- 'FJ_USBHOST_HCD_DATA_ACK_TAIL_DRAIN_US 4u' "$kernel_usbhost_data_ack_timing_patch"
+	grep -q -- "Match Pico-PIO-USB's data receive path" "$kernel_usbhost_data_ack_timing_patch"
+	grep -q -- 'the device expects the handshake immediately after EOP' "$kernel_usbhost_data_ack_timing_patch"
+	grep -q -- 'hcd_data_ack_tail_drain_us %u' "$kernel_usbhost_data_ack_timing_patch"
+		grep -q -- 'use Pico RX lifecycle for Fruit Jam HCD IN' "$kernel_usbhost_hcd_in_pico_patch"
+		grep -q -- 'zero-byte timeout on the following IN data stage' "$kernel_usbhost_hcd_in_pico_patch"
+		grep -q -- 'fj_usbhost_pio_prepare_receive_pico(uh)' "$kernel_usbhost_hcd_in_pico_patch"
+		grep -q -- 'mask IRQs for Fruit Jam HCD IN window' "$kernel_usbhost_hcd_in_irq_patch"
+		grep -q -- 'fj_usbhost_pio_hcd_in_token_receive' "$kernel_usbhost_hcd_in_irq_patch"
+		grep -q -- 'local_irq_save(flags)' "$kernel_usbhost_hcd_in_irq_patch"
+		grep -q -- "does not miss the hub's EP0 DATA turnaround window" "$kernel_usbhost_hcd_in_irq_patch"
+		grep -q -- 'bound Fruit Jam HCD IN IRQ window' "$kernel_usbhost_hcd_in_irq_bound_patch"
+		grep -q -- 'FJ_USBHOST_HCD_IN_IRQ_RX_TIMEOUT_US 120u' "$kernel_usbhost_hcd_in_irq_bound_patch"
+		grep -q -- 'fj_usbhost_pio_receive_raw_timeout' "$kernel_usbhost_hcd_in_irq_bound_patch"
+		grep -q -- 'should only cover the immediate USB response/handshake interval' "$kernel_usbhost_hcd_in_irq_bound_patch"
+		grep -q -- 'prev_summary' "$kernel_usbhost_fault_summary_patch"
+		grep -q -- 'hcd-fault ep0-failures=%u last-ret=%d pid=0x%02x rx-len=%u prev=%s' "$kernel_usbhost_fault_summary_patch"
+		grep -q -- 'USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u prev=%s' "$kernel_usbhost_fault_summary_patch"
+	grep -q -- 'fj_usbhost_pio_prepare_receive_pico' "$kernel_usbhost_pico_rx_lifecycle_patch"
+	grep -q -- 'fj_usbhost_pio_finish_receive_pico' "$kernel_usbhost_pico_rx_lifecycle_patch"
+	grep -q -- 'The EOP detector keeps running' "$kernel_usbhost_pico_rx_lifecycle_patch"
+	grep -q -- 'fj_usbhost_pio_prepare_receive_pico(uh)' "$kernel_usbhost_pico_rx_lifecycle_patch"
+	grep -q -- 'fj_usbhost_pio_finish_receive_pico(uh, ret, len)' "$kernel_usbhost_pico_rx_lifecycle_patch"
+	grep -q -- 'match Pico-PIO-USB handshake wait bounds' "$kernel_usbhost_pico_wait_bounds_patch"
+	grep -q -- 'waited <= start_timeout' "$kernel_usbhost_pico_wait_bounds_patch"
+	grep -q -- 'waited > start_timeout' "$kernel_usbhost_pico_wait_bounds_patch"
+	grep -q -- 'waited <= FJ_USBHOST_HCD_HANDSHAKE_PACKET_US' "$kernel_usbhost_pico_wait_bounds_patch"
+	grep -q -- 'keep Fruit Jam HCD EOP alive after RX' "$kernel_usbhost_eop_alive_patch"
+	grep -q -- 'Pico-PIO-USB/wili8jam transaction tail' "$kernel_usbhost_eop_alive_patch"
+	grep -q -- 'leave the EOP detector running between EP0 phases' "$kernel_usbhost_eop_alive_patch"
+	grep -q -- 'fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx)' "$kernel_usbhost_eop_alive_patch"
+	echo "ok usbhost automatic delayed HCD start guard"
+	echo "ok usbhost HCD reset settle guard"
+	echo "ok usbhost HCD fault summary guard"
+	echo "ok usbhost Pico RX lifecycle guard"
+	echo "ok usbhost Pico handshake wait guard"
+	echo "ok usbhost EOP alive RX finish guard"
+	python3 -m py_compile "$wili8jam_usb_compare_src"
+	if [ -f "$wili8jam_root/usb-host/tusb_config.h" ]; then
+		wili8jam_usb_compare_out=$(python3 "$wili8jam_usb_compare_src" --wili8jam-root "$wili8jam_root")
+		printf '%s\n' "$wili8jam_usb_compare_out" | grep -q 'wili8jam USB config compare: ok'
+	else
+		echo "skip wili8jam USB config compare: missing $wili8jam_root"
+	fi
+	grep -q -- 'CFG_TUH_XINPUT' "$wili8jam_usb_compare_src"
+	grep -q -- 'CONFIG_JOYSTICK_XPAD' "$wili8jam_usb_compare_src"
+	grep -q -- 'raspberrypi,tx-dma-channel = <9>' "$wili8jam_usb_compare_src"
+	grep -q -- 'logitech receiver usb' "$wili8jam_usb_compare_src"
+	echo "ok wili8jam USB reference compare guard"
+	python3 -m py_compile "$wili8jam_media_compare_src"
+	if [ -f "$wili8jam_root/src/dvi.c" ]; then
+		wili8jam_media_compare_out=$(python3 "$wili8jam_media_compare_src" --wili8jam-root "$wili8jam_root")
+		printf '%s\n' "$wili8jam_media_compare_out" | grep -q 'wili8jam media config compare: ok'
+	else
+		echo "skip wili8jam media config compare: missing $wili8jam_root"
+	fi
+	grep -q -- 'DVI via HSTX (640x480@60Hz)' "$wili8jam_media_compare_src"
+	grep -q -- 'Audio: I2S + DAC ready' "$wili8jam_media_compare_src"
+	grep -q -- 'adafruit,i2s-gpios = <24 25 26 27 23>' "$wili8jam_media_compare_src"
+	grep -q -- 'raspberrypi,mclk-hz = <15000000>' "$wili8jam_media_compare_src"
+	grep -q -- 'Fruit Jam HSTX DVI registered at %ux%u RGB332' "$wili8jam_media_compare_src"
+	grep -q -- 'FJ_DVI_WILI_FB_WIDTH' "$wili8jam_media_compare_src"
+	grep -q -- 'DMA_CTRL_SIZE_HALFWORD' "$wili8jam_media_compare_src"
+	grep -q -- 'wili-pattern' "$wili8jam_media_compare_src"
+	grep -q -- 'add wili8jam RGB565 DVI mode' "$kernel_dvi_wili_patch"
+	grep -q -- 'FJ_DVI_WILI_FB_WIDTH' "$kernel_dvi_wili_patch"
+	grep -q -- 'HSTX_EXPAND_TMDS_L2_NBITS(4)' "$kernel_dvi_wili_patch"
+	grep -q -- 'HSTX_EXPAND_SHIFT_ENC_N(FJ_DVI_WILI_SCALE)' "$kernel_dvi_wili_patch"
+	grep -q -- 'DMA_CTRL_SIZE_HALFWORD' "$kernel_dvi_wili_patch"
+	grep -q -- 'wili-test' "$kernel_dvi_wili_patch"
+	echo "ok wili8jam media reference compare guard"
+	grep -q -- 'add wili8jam audio waveforms' "$kernel_audio_waveform_patch"
+	grep -q -- 'tone HZ MS WAVEFORM' "$kernel_audio_waveform_patch"
+	grep -q -- 'wave WAVEFORM HZ MS' "$kernel_audio_waveform_patch"
+	grep -q -- 'FJ_AUDIO_WAVE_SQUARE' "$kernel_audio_waveform_patch"
+	grep -q -- 'FJ_AUDIO_WAVE_NOISE' "$kernel_audio_waveform_patch"
+	grep -q -- 'phase - phase_step' "$kernel_audio_waveform_patch"
+	grep -q -- 'fj_audio_wave_sample' "$kernel_audio_waveform_patch"
+	grep -q -- 'last_waveform' "$kernel_audio_waveform_patch"
+	grep -q -- '--waveform WAVE' "$rtttl_src_c"
+	grep -q -- 'I2S_WAVE_NOISE' "$rtttl_src_c"
+	grep -q -- 'tone %u %u %s' "$rtttl_src_c"
+	grep -q -- 'audio_waveform_args' "$berry_src/fruitjam.be"
+	grep -q -- 'fruitjam.audio_tone_command = def(hz, ms, loud, backend, waveform)' "$berry_src/fruitjam.be"
+	grep -q -- 'fruitjam.rtttl_command = def(song, loud, backend, waveform)' "$berry_src/fruitjam.be"
+	echo "ok wili8jam audio waveform guard"
 
-echo "== console source guards =="
+	echo "== console source guards =="
 python3 -m py_compile "$cdc_smoke_src"
 grep -q -- '--usb-keyboard' "$cdc_smoke_src"
 grep -q -- 'usbhost_keyboard_tests' "$cdc_smoke_src"
@@ -1855,8 +2174,246 @@ printf '%s\n' "$usb_keyboard_smoke_out" | grep -q '7 passed, 0 failed'
 grep -q -- '--transport' "$usb_keyboard_smoke_src"
 grep -q -- '--shell-probe-timeout' "$usb_keyboard_smoke_src"
 grep -q -- '--serial-open-timeout' "$usb_keyboard_smoke_src"
+grep -q -- 'def _probe_serial_open' "$usb_keyboard_smoke_src"
+grep -q -- 'subprocess.run' "$usb_keyboard_smoke_src"
 grep -q -- 'kbd-auto-shell' "$usb_keyboard_smoke_src"
 echo "ok focused usb keyboard smoke guard"
+python3 -m py_compile "$usbhost_hcd_smoke_src"
+usbhost_hcd_smoke_out=$("$usbhost_hcd_smoke_src" --self-test)
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'logitech receiver usb'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'hid keyboard input'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'external hub usb'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'xbox receiver usb'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'xpad gamepad input'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'hcd not faulted'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'wili8jam electrical config'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'hcd service window'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'usbhost bridge pre-start'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'usbhost hcd start'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q 'usbhost hcd status'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q '22 passed, 0 failed'
+printf '%s\n' "$usbhost_hcd_smoke_out" | grep -q '0 failed'
+grep -q -- '--self-test' "$usbhost_hcd_smoke_src"
+grep -q -- 'USB_DEVICE_REGISTRY_CMD' "$usbhost_hcd_smoke_src"
+grep -q -- 'KERNEL_RELEASE_CMD' "$usbhost_hcd_smoke_src"
+grep -q -- 'HCD_START_CMD' "$usbhost_hcd_smoke_src"
+grep -q -- 'HCD_STATUS_CMD' "$usbhost_hcd_smoke_src"
+grep -q -- 'ROOT_HUB_MAXCHILD = "1"' "$usbhost_hcd_smoke_src"
+grep -q -- 'def root_hub_port_count_ok' "$usbhost_hcd_smoke_src"
+grep -q -- 'def external_hub_present' "$usbhost_hcd_smoke_src"
+grep -q -- 'maxchild=4' "$usbhost_hcd_smoke_src"
+grep -q -- 'CH334F USB2.0 Hub' "$usbhost_hcd_smoke_src"
+grep -q -- 'fruitjam-usbhost hcd-start' "$usbhost_hcd_smoke_src"
+grep -q -- 'fruitjam-usbhost status' "$usbhost_hcd_smoke_src"
+grep -q -- 'manual-start 1' "$usbhost_hcd_smoke_src"
+grep -q -- 'reset-settle-ms 500' "$usbhost_hcd_smoke_src"
+grep -q -- 'data-ack-tail-drain-us 4' "$usbhost_hcd_smoke_src"
+grep -q -- 'def _probe_serial_open' "$usbhost_hcd_smoke_src"
+grep -q -- 'xpad_input_present' "$usbhost_hcd_smoke_src"
+grep -q -- 'hcd_not_faulted' "$usbhost_hcd_smoke_src"
+grep -q -- 'wili8jam_config_present' "$usbhost_hcd_smoke_src"
+grep -q -- 'self._api("status", timeout)' "$usbhost_hcd_smoke_src"
+grep -q -- 'self._api("hcd-start", timeout)' "$usbhost_hcd_smoke_src"
+grep -q -- 'time.sleep(2)' "$usbhost_hcd_smoke_src"
+grep -q -- '"HTTP API error:"' "$usbhost_hcd_smoke_src"
+grep -q -- '"telnet error:"' "$usbhost_hcd_smoke_src"
+grep -q -- 'def check_output_if_ok' "$usbhost_hcd_smoke_src"
+grep -q -- 'def auto_transports' "$usbhost_hcd_smoke_src"
+grep -q -- 'preflight_failures.append' "$usbhost_hcd_smoke_src"
+echo "ok usbhost hcd smoke guard"
+python3 -m py_compile "$recover_flash_src"
+grep -q -- '--http-host' "$recover_flash_src"
+grep -q -- 'FJ_HTTP_HOST' "$recover_flash_src"
+grep -q -- 'action=bootsel' "$recover_flash_src"
+grep -q -- '--post-trigger-bootsel-timeout' "$recover_flash_src"
+grep -q -- 'FJ_POST_TRIGGER_BOOTSEL_TIMEOUT' "$recover_flash_src"
+grep -q -- '--manual-bootsel-timeout' "$recover_flash_src"
+grep -q -- 'FJ_MANUAL_BOOTSEL_TIMEOUT' "$recover_flash_src"
+grep -q -- 'FJ_BARK_URL' "$recover_flash_src"
+grep -q -- '--bark-url' "$recover_flash_src"
+grep -q -- 'FJ_AIRLIFT_DISCOVERY' "$recover_flash_src"
+grep -q -- 'FJ_UART_PORT' "$recover_flash_src"
+grep -q -- 'FJ_UART_BAUD' "$recover_flash_src"
+grep -q -- 'FJ_UART_DISCOVERY' "$recover_flash_src"
+grep -q -- 'def auto_airlift_hosts' "$recover_flash_src"
+grep -q -- 'def auto_uart_ports' "$recover_flash_src"
+grep -q -- 'esp32c6-' "$recover_flash_src"
+grep -q -- '--skip-airlift-discovery' "$recover_flash_src"
+grep -q -- '--uart-port' "$recover_flash_src"
+grep -q -- '--skip-uart' "$recover_flash_src"
+grep -q -- '--skip-uart-discovery' "$recover_flash_src"
+grep -q -- 'def recovery_hosts' "$recover_flash_src"
+grep -q -- 'reboot bootsel' "$recover_flash_src"
+grep -q -- 'b"bootsel 250\\n"' "$recover_flash_src"
+grep -q -- 'request_sent = False' "$recover_flash_src"
+grep -q -- 'socket closed before reply' "$recover_flash_src"
+		grep -q -- 'def cdc_counterpart' "$recover_flash_src"
+		grep -q -- '--include-tty-counterpart' "$recover_flash_src"
+		grep -q -- '--no-tty-counterpart' "$recover_flash_src"
+		grep -q -- 'FJ_INCLUDE_TTY_COUNTERPART' "$recover_flash_src"
+			grep -q -- 'os.environ.get("FJ_INCLUDE_TTY_COUNTERPART", "1")' "$recover_flash_src"
+		grep -q -- 'include_tty_counterparts or sys.platform != "darwin"' "$recover_flash_src"
+		grep -q -- '"/dev/tty."' "$recover_flash_src"
+	grep -q -- 'def close_own_fds_for_path' "$recover_flash_src"
+	grep -q -- 'closed lingering CDC fd' "$recover_flash_src"
+	grep -q -- 'close_own_fds_for_path(port, verbose)' "$recover_flash_src"
+	grep -q -- 'def run_serial_child' "$recover_flash_src"
+	grep -q -- 'sys.executable, "-c", code' "$recover_flash_src"
+	grep -q -- 'def uart_shell_bootsel' "$recover_flash_src"
+	grep -q -- 'ser.dtr = False' "$recover_flash_src"
+	grep -q -- 'ser.rts = False' "$recover_flash_src"
+	grep -q -- 'sent BOOTSEL commands over UART' "$recover_flash_src"
+	grep -q -- 'sent BOOTSEL commands over CDC' "$recover_flash_src"
+		grep -q -- 'def cdc_raw_shell_bootsel' "$recover_flash_src"
+		grep -q -- 'os.O_NONBLOCK' "$recover_flash_src"
+		grep -q -- 'CDC raw shell BOOTSEL on' "$recover_flash_src"
+		grep -q -- 'cdc_raw_shell_bootsel(port, args.serial_open_timeout, args.verbose)' "$recover_flash_src"
+		grep -q -- 'sent raw CDC BOOTSEL commands over' "$recover_flash_src"
+		grep -q -- '--skip-cdc-raw-shell' "$recover_flash_src"
+grep -q -- 'def telnet_immediate_bootsel' "$recover_flash_src"
+grep -q -- 'def notify_bark' "$recover_flash_src"
+grep -q -- 'Fruit Jam BOOTSEL needed' "$recover_flash_src"
+grep -q -- 'BOOTSEL appeared during fallback wait' "$recover_flash_src"
+grep -q -- '--watch-only' "$recover_flash_src"
+grep -q -- 'def watch_only_bootsel' "$recover_flash_src"
+grep -q -- 'no recovery triggers will be sent' "$recover_flash_src"
+grep -q -- 'def picotool_force_bootsel' "$recover_flash_src"
+grep -q -- '"reboot", "-u", "-f"' "$recover_flash_src"
+grep -q -- '--skip-picotool-force' "$recover_flash_src"
+grep -q -- 'picotool_force_bootsel(args.picotool, args.verbose)' "$recover_flash_src"
+	grep -q -- 'sent immediate BOOTSEL command over telnet' "$recover_flash_src"
+	grep -q -- 'bootsel 250' "$recover_flash_src"
+	grep -q -- 'def cdc_1200_stty_bootsel' "$recover_flash_src"
+	grep -q -- 'def cdc_1200_native_touch_bootsel' "$recover_flash_src"
+	grep -q -- 'termios.TIOCMSET' "$recover_flash_src"
+	grep -q -- '"1200", "hupcl"' "$recover_flash_src"
+	grep -q -- 'sent native 1200-baud DTR-low BOOTSEL touch on CDC' "$recover_flash_src"
+	grep -q -- 'sent stty 1200-baud BOOTSEL touch on CDC' "$recover_flash_src"
+grep -q -- '"load", "-fu"' "$recover_flash_src"
+grep -q -- 'DEFAULT_FLASH_TIMEOUT = float(os.environ.get("FJ_FLASH_TIMEOUT", "180"))' "$recover_flash_src"
+grep -q -- 'LINUX_REBOOT_CMD_RESTART2' "$fruitjam_shell_src"
+grep -q -- 'reboot_bootsel' "$fruitjam_shell_src"
+grep -q -- 'builtins: bootsel cd echo exit help history status' "$fruitjam_shell_src"
+grep -q -- 'maybe_direct_bootsel' "$telnetd_src"
+grep -q -- 'MSG_PEEK' "$telnetd_src"
+grep -q -- 'fruitjam-telnetd: reboot bootsel' "$telnetd_src"
+grep -q -- 'ACM_RP2350_BOOTSEL_BAUD' "$kernel_cdc_bootsel_patch"
+grep -q -- 'kernel_restart("bootsel")' "$kernel_cdc_bootsel_patch"
+grep -q -- 'mod_delayed_work' "$kernel_cdc_bootsel_patch"
+grep -q -- 'RP2350_PSM_WDSEL_ROSC' "$kernel_bootsel_restart_patch"
+grep -q -- 'RP2350_PSM_WDSEL_XOSC' "$kernel_bootsel_restart_patch"
+grep -q -- 'RP2350_PSM_WDSEL_BITS &' "$kernel_bootsel_restart_patch"
+grep -q -- 'RP2350_BOOTROM_BOOT_TYPE_BOOTSEL' "$kernel_bootsel_restart_patch"
+grep -q -- 'RP2350_BOOTLOADER_RESCUE_MAGIC' "$kernel_bootsel_restart_patch"
+grep -q -- 'early_initcall(rp2350_disarm_rescue_watchdog)' "$kernel_bootsel_restart_patch"
+grep -q -- 'writel(0, watchdog + RP2350_WATCHDOG_CTRL)' "$kernel_bootsel_restart_patch"
+grep -q -- 'BR2_PACKAGE_PICO2_BOOTLOADER_RESCUE_WATCHDOG_MS=15000' "$defconfig_src"
+	grep -q -- 'WATCHDOG_BOOTSEL_VECTOR_MAGIC' "$bootloader_main_src"
+	grep -q -- 'watchdog_bootsel_vector_fired' "$bootloader_main_src"
+	grep -q -- 'BOOTSEL watchdog vector reached bootloader' "$bootloader_main_src"
+	grep -F -q -- 'def parse_fdt' "$validate_image_src"
+	grep -F -q -- 'DTB has wrong magic' "$validate_image_src"
+	grep -F -q -- 'adafruit_fruit_jam_rp2350.dtb' "$validate_image_src"
+		grep -F -q -- 'require_u32s(dt_props, "/clk-sys", "clock-frequency", [252000000])' "$validate_image_src"
+		grep -F -q -- 'require_u32s(dt_props, "/fruitjam-pins", "adafruit,usb-host-gpios", [1, 2, 11])' "$validate_image_src"
+		grep -F -q -- 'require_u32s(dt_props, "/fruitjam-pins", "adafruit,i2c-gpios", [20, 21])' "$validate_image_src"
+		grep -F -q -- 'require_u32s(dt_props, "/fruitjam-pins", "adafruit,i2s-gpios", [24, 25, 26, 27, 23])' "$validate_image_src"
+		grep -F -q -- 'require_u32s(dt_props, "/fruitjam-pins", "adafruit,dvi-gpios", [12, 13, 14, 15, 16, 17, 18, 19])' "$validate_image_src"
+		grep -F -q -- 'usbhost_path = "/soc/usbhost-bridge@d0000000"' "$validate_image_src"
+		grep -F -q -- '("raspberrypi,tx-dma-channel", [9])' "$validate_image_src"
+		grep -F -q -- '("raspberrypi,hcd-start-delay-ms", [8000])' "$validate_image_src"
+		grep -F -q -- '("raspberrypi,hcd-port-reset-settle-ms", [500])' "$validate_image_src"
+		grep -F -q -- '("raspberrypi,hcd-port-reset-sof-frames", [25])' "$validate_image_src"
+		grep -F -q -- 'DTB usbhost bridge must set raspberrypi,hcd-manual-start' "$validate_image_src"
+		grep -F -q -- 'b"bridge HCD start power-on failed"' "$validate_image_src"
+		grep -F -q -- 'b"bridge HCD start bus-reset failed"' "$validate_image_src"
+		grep -F -q -- 'audio_path = "/soc/audio-clock@50300000"' "$validate_image_src"
+		grep -F -q -- '("raspberrypi,mclk-hz", [15000000])' "$validate_image_src"
+		grep -F -q -- 'dvi_path = "/soc/dvi@400c0000"' "$validate_image_src"
+		grep -F -q -- 'b"Fruit Jam audio clock ready on /dev/fruitjam-audio"' "$validate_image_src"
+		grep -F -q -- 'b"Fruit Jam HSTX DVI registered at %ux%u RGB332, idle"' "$validate_image_src"
+			grep -F -q -- 'b"hcd-start"' "$validate_image_src"
+			grep -F -q -- 'b"hcd_port_reset_settle_ms %u"' "$validate_image_src"
+			grep -F -q -- 'b"hcd_port_reset_sof_frames %u"' "$validate_image_src"
+			grep -F -q -- 'b"hcd_data_ack_tail_drain_us %u"' "$validate_image_src"
+			grep -F -q -- 'b"hcd-port-reset-settle-ms=%u"' "$validate_image_src"
+			grep -F -q -- 'b"sof-frames=%u"' "$validate_image_src"
+			grep -F -q -- 'b"status-busy lock-held"' "$validate_image_src"
+			grep -F -q -- 'b"hcd-prestart-power-cycle off-ms=%u on-ms=%u reset-ms=%u"' "$validate_image_src"
+			grep -F -q -- 'b"USB host HCD pre-start power cycle complete"' "$validate_image_src"
+			grep -F -q -- 'b"scheduling automatic recovery"' "$validate_image_src"
+			grep -F -q -- 'b"hcd-auto-recover %u done"' "$validate_image_src"
+			grep -F -q -- 'b"auto recovery limit reached"' "$validate_image_src"
+			grep -F -q -- 'b"hcd-fault auto-recovery-limit=%u"' "$validate_image_src"
+			grep -F -q -- 'b"hcd-fault ep0-failures=%u last-ret=%d pid=0x%02x rx-len=%u prev=%s"' "$validate_image_src"
+			grep -F -q -- 'b"usb-devices"' "$validate_image_src"
+		grep -F -q -- 'b"dev-input"' "$validate_image_src"
+		grep -F -q -- 'b"input-registry"' "$validate_image_src"
+		grep -F -q -- 'b"Xbox 360 Wireless Receiver (XBOX)"' "$validate_image_src"
+		echo "ok image USB/media artifact guard"
+	python3 - "$recover_flash_src" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text()
+if "return False\n                sock.sendall" in source:
+    raise SystemExit("prompt-aware telnet BOOTSEL send is unreachable")
+needle = 'sock.sendall(b"\\r\\nbootsel 250\\r\\n/usr/bin/fruitjamctl bootsel 250\\r\\n")'
+if needle not in source:
+    raise SystemExit("prompt-aware telnet BOOTSEL payload is missing")
+request = source.split("def request_bootsel", 1)[1]
+immediate = request.find("telnet_immediate_bootsel")
+prompt = request.find("telnet_bootsel")
+if immediate < 0 or prompt < 0 or immediate > prompt:
+    raise SystemExit("telnet recovery must send immediate BOOTSEL before prompt-aware shell fallback")
+port_loop = request.split("for port in ports:", 1)[1].split("return picotool_info", 1)[0]
+uart_loop = request.split("for port in uart_ports:", 1)[1].split("ports = selected_cdc_ports", 1)[0]
+if "uart_shell_bootsel(port, args.uart_baud, args.serial_open_timeout, args.verbose)" not in uart_loop:
+    raise SystemExit("UART recovery loop is missing the DTR/RTS-disabled shell BOOTSEL method")
+native_touch = port_loop.find("cdc_1200_native_touch_bootsel")
+shell_touch = port_loop.find("cdc_shell_bootsel")
+raw_touch = port_loop.find("cdc_raw_shell_bootsel")
+stty_touch = port_loop.find("cdc_1200_stty_bootsel")
+if min(native_touch, shell_touch, raw_touch, stty_touch) < 0:
+    raise SystemExit("CDC recovery loop is missing one of the expected recovery methods")
+if not (native_touch < shell_touch < raw_touch < stty_touch):
+    raise SystemExit("CDC native 1200-baud touch must run before shell-open fallbacks")
+uart_ports = request.find("uart_ports = selected_uart_ports")
+cdc_ports = request.find("ports = selected_cdc_ports")
+if uart_ports < 0 or cdc_ports < 0 or uart_ports > cdc_ports:
+    raise SystemExit("UART recovery should run before USB CDC fallbacks")
+main = source.split("def main", 1)[1]
+watch = main.find("watch_only_bootsel(args)")
+request_call = main.find("request_bootsel(args)")
+if watch < 0 or request_call < 0 or watch > request_call:
+    raise SystemExit("watch-only mode must bypass automatic recovery triggers")
+if "if not args.watch_only:\n                notify_bark" not in source:
+    raise SystemExit("manual BOOTSEL notification must stay on automatic recovery failure only")
+if "Bark notification skipped: no FJ_BARK_URL/BARK_URL configured" not in source:
+    raise SystemExit("manual BOOTSEL notification path must report missing Bark config in verbose mode")
+PY
+if grep -q -- '^+.*USB_CDC_CTRL_DTR' "$kernel_cdc_bootsel_patch"; then
+	echo "CDC 1200-baud recovery must not depend on a separate DTR transition" >&2
+	exit 1
+fi
+if grep -q -- 'RP2350_PSM_WDSEL_PROC_COLD' "$kernel_bootsel_restart_patch"; then
+	echo "BOOTSEL watchdog reset must not exclude PROC_COLD; match Pico SDK ROSC/XOSC exclusion" >&2
+	exit 1
+fi
+python3 - "$kernel_bootsel_restart_patch" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text()
+needle = (
+    "RP2350_PSM_WDSEL_BITS &\n"
+    "+\t       ~(RP2350_PSM_WDSEL_ROSC | RP2350_PSM_WDSEL_XOSC)"
+)
+if needle not in source:
+    raise SystemExit("BOOTSEL watchdog reset does not match Pico SDK WDSEL mask")
+print("ok bootsel watchdog reset guard")
+PY
+echo "ok recovery flash helper guard"
 python3 -m py_compile "$mqtt_smoke_src"
 mqtt_smoke_out=$("$mqtt_smoke_src" --self-test --host broker.local --username user --password validate-secret)
 printf '%s\n' "$mqtt_smoke_out" | grep -q 'target mqtt publish'
@@ -1876,12 +2433,13 @@ fi
 grep -q '/etc/profile.d/\*.sh' "$profile_src"
 grep -q 'clear()' "$cls_src"
 grep -q 'cls()' "$cls_src"
-python3 - "$web_cgi_src" "$airlift_src" <<'PY'
+python3 - "$web_cgi_src" "$airlift_src" "$httpd_src" <<'PY'
 import sys
 from pathlib import Path
 
 cgi = Path(sys.argv[1]).read_text()
 airlift = Path(sys.argv[2]).read_text()
+httpd = Path(sys.argv[3]).read_text()
 
 for source, name in ((cgi, "CGI"), (airlift, "AirLift")):
     if "LINUX_REBOOT_CMD_RESTART2" not in source or 'SYS_reboot' not in source:
@@ -1890,6 +2448,23 @@ for source, name in ((cgi, "CGI"), (airlift, "AirLift")):
         raise SystemExit(f"{name} BOOTSEL path reintroduced fruitjamctl exec")
     if '\\"verified\\":false' not in source or "picotool info -a" not in source:
         raise SystemExit(f"{name} BOOTSEL response does not state host verification is required")
+if "if (!ret && reboot_bootsel" in airlift:
+    raise SystemExit("AirLift BOOTSEL reboot must not depend on successful HTTP reply delivery")
+for needle, label in [
+    ("LINUX_REBOOT_CMD_RESTART2", "direct restart2 constants"),
+    ("query_has_bootsel_action", "action parser"),
+    ("serve_direct_bootsel", "direct BOOTSEL endpoint"),
+    ("reboot_bootsel_after_delay(1200)", "delayed BOOTSEL restart"),
+    ("direct-httpd", "direct HTTPD JSON source"),
+    ("action=bootsel", "literal BOOTSEL action match"),
+    ("picotool info -a", "host verification response"),
+]:
+    if needle not in httpd:
+        raise SystemExit(f"fruitjam-httpd missing {label}")
+if 'fruitjamctl", "bootsel"' in httpd:
+    raise SystemExit("fruitjam-httpd BOOTSEL path reintroduced fruitjamctl exec")
+if "if (!ret && reboot_bootsel_after_delay" in httpd:
+    raise SystemExit("fruitjam-httpd BOOTSEL reboot must not depend on successful HTTP reply delivery")
 print("ok web bootsel direct restart guard")
 PY
 echo "ok uart login guard"
@@ -1983,6 +2558,24 @@ if "pio-packet-io" not in airlift or "boot-protocol-keyboard" not in airlift:
 if "http_usbhost_bus_reset" not in airlift or "reset_ms" not in airlift:
     raise SystemExit("airliftctl USB API missing USB bus reset path")
 for needle, label in [
+    ("http_usbhost_hcd_start", "direct HCD start helper"),
+    ('"hcd-start"', "HTTP HCD start command"),
+    ('"hcd-clear-fault"', "HTTP HCD fault clear command"),
+    ('"usb-devices"', "HTTP USB devices snapshot"),
+    ('"dev-input"', "HTTP dev/input snapshot"),
+    ('"input-registry"', "HTTP input registry snapshot"),
+    ('"hcd_registered"', "HCD registered JSON field"),
+    ('"hcd_ep0_failures"', "HCD EP0 failure JSON field"),
+    ('"hcd_port_reset_settle_ms"', "HCD port reset settle JSON field"),
+    ('"probe_summary"', "probe summary JSON field"),
+    ('"clk_sys_hz"', "USB clock JSON field"),
+    ('"tx_dma_channel"', "USB DMA channel JSON field"),
+    ('http_status_text_int(bridge_status, "tx_dma", 0)', "USB DMA status parser"),
+    ('http_status_text_int(bridge_status, "hcd_port_reset_settle_ms", 0)', "USB reset settle status parser"),
+]:
+    if needle not in airlift:
+        raise SystemExit(f"airliftctl USB API missing {label}")
+for needle, label in [
     ("AIRLIFT_LOCK_PATH", "AirLift lock path"),
     ("O_WRONLY | O_CREAT | O_EXCL", "atomic PID lock create"),
     ("read_lock_owner", "PID lock owner read"),
@@ -1996,6 +2589,43 @@ if "AIRLIFT_START_LOG" not in airlift or "print_cached_airlift_info" not in airl
     raise SystemExit("airliftctl missing cached read-only AirLift info fallback")
 if "AIRLIFT_HEARTBEAT_PATH" not in airlift or "inbound_heartbeat_poll" not in airlift:
     raise SystemExit("airliftctl missing inbound heartbeat updates")
+for needle, label in [
+    ("AIRLIFT_TELNET_BOOTSEL_PEEK_MS", "AirLift telnet BOOTSEL peek window"),
+    ("AIRLIFT_ACCEPTED_CLIENT_GRACE_MS", "AirLift accepted telnet grace window"),
+    ("tcp_wait_accepted_client_ready", "AirLift accepted telnet socket readiness"),
+    ("proceeding without ESTABLISHED", "AirLift accepted telnet state tolerance"),
+    ("read_initial_telnet_payload", "AirLift initial telnet payload read"),
+    ("avail_failures", "AirLift initial telnet transient avail tolerance"),
+    ("maybe_airlift_telnet_bootsel", "AirLift direct telnet BOOTSEL handler"),
+    ("AirLift telnet closed before shell attach; checking BOOTSEL payload",
+     "AirLift fast-close direct BOOTSEL peek"),
+    ("telnet reboot bootsel", "AirLift direct telnet BOOTSEL error log"),
+    ("reboot_bootsel_after_delay(250)", "AirLift direct telnet BOOTSEL restart"),
+]:
+    if needle not in airlift:
+        raise SystemExit(f"airliftctl missing {label}")
+if "AIRLIFT_SHELL_IDLE_MS 60000L" not in airlift:
+    raise SystemExit("airliftctl AirLift telnet idle timeout must stay short")
+if "AIRLIFT_SHELL_PREEMPT_IDLE_MS 15000L" not in airlift or "AirLift telnet stale session preempted" not in airlift:
+    raise SystemExit("airliftctl missing stale AirLift telnet preemption")
+if "AirLift telnet idle timeout" not in airlift:
+    raise SystemExit("airliftctl missing silent stale AirLift telnet idle cleanup")
+if "AIRLIFT_TELNET_MAX_MS 300000L" not in airlift or "AirLift telnet max session timeout" not in airlift:
+    raise SystemExit("airliftctl missing hard AirLift telnet session cap")
+if "tcp_drop_client" not in airlift:
+    raise SystemExit("airliftctl missing fast stale AirLift telnet socket drop")
+if "!telnet_session_active(&telnet) &&" in airlift:
+    raise SystemExit("airliftctl inbound recycle must not be blocked by a stale telnet session")
+for needle in ("AIRLIFT_INBOUND_RECYCLE_MS 300000L",
+               "AirLift inbound periodic recycle",
+               "AirLift shell accept failed; recycling",
+               "AirLift HTTP accept failed; recycling",
+               "AirLift FTP accept failed; recycling",
+               "AirLift telnet poll failed; closing session",
+               "AirLift HTTP client failed; keeping inbound server alive",
+               "AirLift FTP client failed; keeping inbound server alive"):
+    if needle not in airlift:
+        raise SystemExit(f"airliftctl missing inbound recycle guard {needle!r}")
 if '"mqtt-sub"' not in airlift or "mqtt_subscribe(" not in airlift or "mqtt_send_subscribe" not in airlift:
     raise SystemExit("airliftctl missing MQTT subscribe path")
 if "#include <stdbool.h>" not in airlift:

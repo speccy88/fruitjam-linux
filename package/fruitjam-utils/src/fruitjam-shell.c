@@ -10,10 +10,16 @@
 #include <errno.h>
 #include <ctype.h>
 #include <dirent.h>
+#ifdef __linux__
+#include <linux/reboot.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <sys/stat.h>
 #include <termios.h>
 #include <sys/types.h>
@@ -29,8 +35,40 @@ static const char *path_dirs[] = {
 };
 
 static const char *builtins[] = {
-	"cd", "echo", "exit", "help", "history", "status", "?"
+	"bootsel", "cd", "echo", "exit", "help", "history", "status", "?"
 };
+
+static int parse_delay_ms(const char *s, unsigned int *delay_ms)
+{
+	char *end;
+	unsigned long parsed;
+
+	if (!s || !*s) {
+		*delay_ms = 250;
+		return 0;
+	}
+	errno = 0;
+	parsed = strtoul(s, &end, 10);
+	if (errno || *end || parsed > 60000ul)
+		return -1;
+	*delay_ms = (unsigned int)parsed;
+	return 0;
+}
+
+static int reboot_bootsel(unsigned int delay_ms)
+{
+#ifdef __linux__
+	if (delay_ms)
+		usleep(delay_ms * 1000u);
+	sync();
+	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
+#else
+	(void)delay_ms;
+	errno = ENOSYS;
+	return -1;
+#endif
+}
 
 static void prompt(void)
 {
@@ -524,7 +562,7 @@ int main(void)
 			continue;
 		}
 		if (!strcmp(argv[0], "?") || !strcmp(argv[0], "help")) {
-			puts("builtins: cd echo exit help history status");
+			puts("builtins: bootsel cd echo exit help history status");
 			puts("simple commands are searched in /bin /usr/bin /sbin /usr/sbin");
 			puts("line editing: up/down history, tab command/path completion");
 			last_status = 0;
@@ -540,6 +578,24 @@ int main(void)
 		}
 		if (!strcmp(argv[0], "status")) {
 			printf("%d\n", last_status);
+			continue;
+		}
+		if (!strcmp(argv[0], "bootsel")) {
+			unsigned int delay_ms;
+
+			if (parse_delay_ms(argc > 1 ? argv[1] : NULL, &delay_ms) < 0) {
+				fprintf(stderr, "bad bootsel delay: %s\n", argv[1]);
+				last_status = 2;
+				continue;
+			}
+			puts("BOOTSEL");
+			fflush(stdout);
+			if (reboot_bootsel(delay_ms) < 0) {
+				perror("reboot bootsel");
+				last_status = 1;
+			} else {
+				last_status = 0;
+			}
 			continue;
 		}
 

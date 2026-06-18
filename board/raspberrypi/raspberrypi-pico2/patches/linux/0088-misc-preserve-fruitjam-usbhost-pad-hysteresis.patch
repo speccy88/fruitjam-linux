@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 03:15:00 +0000
+Subject: [PATCH] misc: preserve Fruit Jam usbhost pad hysteresis
+
+Pico-PIO-USB configures the Fruit Jam USB host pins with fast slew and 12 mA
+drive, but it reaches those settings through SDK helpers that update only the
+target pad fields. The pad's input hysteresis bit therefore remains at its
+reset/default value while D+/D- are used as PIO inputs.
+
+The Linux bridge wrote the full pad value and unintentionally cleared that
+hysteresis bit. Keep the wili8jam/Pico-PIO-USB drive and slew settings while
+preserving Schmitt input hysteresis for the RX/EOP PIO state machines.
+---
+ drivers/misc/fruitjam_usbhost.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -239,6 +239,7 @@ struct fruitjam_usbhost {
+ #define FJ_PADS_PDE			BIT(2)
+ #define FJ_PADS_DRIVE_4MA		BIT(4)
+ #define FJ_PADS_DRIVE_12MA		(BIT(5) | BIT(4))
++#define FJ_PADS_SCHMITT		BIT(1)
+ #define FJ_PADS_SLEWFAST		BIT(0)
+ 
+ #define FJ_DMA_CH_STRIDE		0x040
+@@ -686,9 +687,9 @@ static void fj_usbhost_pio_configure_gpio(struct fruitjam_usbhost *uh)
+ 	fj_gpio_oe(uh, uh->dp_gpio, false);
+ 	fj_gpio_oe(uh, uh->dm_gpio, false);
+ 	writel(FJ_PADS_IE | FJ_PADS_PDE | FJ_PADS_DRIVE_12MA |
+-	       FJ_PADS_SLEWFAST, uh->pads_bank0 + FJ_PADS_GPIO(uh->dp_gpio));
++	       FJ_PADS_SCHMITT | FJ_PADS_SLEWFAST, uh->pads_bank0 + FJ_PADS_GPIO(uh->dp_gpio));
+ 	writel(FJ_PADS_IE | FJ_PADS_PDE | FJ_PADS_DRIVE_12MA |
+-	       FJ_PADS_SLEWFAST, uh->pads_bank0 + FJ_PADS_GPIO(uh->dm_gpio));
++	       FJ_PADS_SCHMITT | FJ_PADS_SLEWFAST, uh->pads_bank0 + FJ_PADS_GPIO(uh->dm_gpio));
+ 	fj_gpio_func(uh, uh->dp_gpio, func);
+ 	fj_gpio_func(uh, uh->dm_gpio, func);
+ 	fj_gpio_inover(uh, uh->dp_gpio, true);
+-- 
+2.39.5

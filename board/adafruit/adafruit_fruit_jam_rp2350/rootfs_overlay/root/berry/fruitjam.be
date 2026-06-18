@@ -778,19 +778,28 @@ fruitjam.audio_loud_args = def(loud)
     return ""
 end
 
-fruitjam.audio_tone_command = def(hz, ms, loud, backend)
+fruitjam.audio_waveform_args = def(waveform)
+    if waveform != nil && waveform != ""
+        return " --waveform " + fruitjam.shell_quote(waveform)
+    end
+    return ""
+end
+
+fruitjam.audio_tone_command = def(hz, ms, loud, backend, waveform)
     var duration = ms
     if duration == nil || duration == ""
         duration = 1200
     end
     return "fruitjam-rtttl" + fruitjam.audio_backend_args(backend) +
-           fruitjam.audio_loud_args(loud) + " --tone " +
+           fruitjam.audio_loud_args(loud) +
+           fruitjam.audio_waveform_args(waveform) + " --tone " +
            fruitjam.shell_quote(hz) + " " + fruitjam.shell_quote(duration)
 end
 
-fruitjam.rtttl_command = def(song, loud, backend)
+fruitjam.rtttl_command = def(song, loud, backend, waveform)
     var cmd = "fruitjam-rtttl" + fruitjam.audio_backend_args(backend) +
-              fruitjam.audio_loud_args(loud)
+              fruitjam.audio_loud_args(loud) +
+              fruitjam.audio_waveform_args(waveform)
     if song != nil && song != ""
         cmd = cmd + " " + fruitjam.shell_quote(song)
     end
@@ -806,14 +815,14 @@ fruitjam.wav_play_command = def(path, backend, loud)
            fruitjam.audio_loud_args(loud) + " " + fruitjam.shell_quote(path)
 end
 
-fruitjam.audio_tone = def(hz, ms, loud, backend)
-    var cmd = fruitjam.audio_tone_command(hz, ms, loud, backend)
+fruitjam.audio_tone = def(hz, ms, loud, backend, waveform)
+    var cmd = fruitjam.audio_tone_command(hz, ms, loud, backend, waveform)
     var status = os.system(cmd)
     return {"ok": status == 0, "status": status, "command": cmd}
 end
 
-fruitjam.rtttl = def(song, loud, backend)
-    var cmd = fruitjam.rtttl_command(song, loud, backend)
+fruitjam.rtttl = def(song, loud, backend, waveform)
+    var cmd = fruitjam.rtttl_command(song, loud, backend, waveform)
     var status = os.system(cmd)
     return {"ok": status == 0, "status": status, "command": cmd}
 end

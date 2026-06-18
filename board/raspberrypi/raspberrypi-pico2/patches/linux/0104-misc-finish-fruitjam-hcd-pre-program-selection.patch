@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 10:20:00 -0400
+Subject: [PATCH] misc: finish Fruit Jam HCD PRE program selection
+
+The previous PRE patch adds the HCD PRE state machine and all call sites.  Keep
+the most context-sensitive PIO program-selection edits in this follow-up patch,
+generated against the post-PRE source, so Buildroot's fuzz-free patch step can
+apply the series reproducibly.
+
+This completes the wili8jam-style low-speed child path: PRE uses the full-speed
+upstream bus, while the child packet uses low-speed timing with full-speed idle
+polarity.
+---
+ drivers/misc/fruitjam_usbhost.c | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -329,10 +329,30 @@
+ 	0xc700, 0x73a2, 0xf380, 0x6ba2, 0xf083,
+ };
+ 
++static const u16 fj_usbhost_tx_pre_program_dpdm[] = {
++	0xcf00, 0x6ba2, 0xeb80, 0x73a2, 0xe883,
++};
++
++static const u16 fj_usbhost_tx_pre_program_dmdp[] = {
++	0xd700, 0x73a2, 0xf380, 0x6ba2, 0xf083,
++};
++
+ static void fj_usbhost_pio_load_tx_program(struct fruitjam_usbhost *uh)
+ {
+-	const u16 *program = uh->low_speed ? fj_usbhost_tx_program_dmdp :
+-					     fj_usbhost_tx_program_dpdm;
++	const u16 *program = (uh->low_speed && !uh->hcd_need_pre) ?
++			     fj_usbhost_tx_program_dmdp :
++			     fj_usbhost_tx_program_dpdm;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(fj_usbhost_tx_program_dpdm); i++)
++		writel(program[i], uh->pio + FJ_PIO_INSTR_MEM + i * 4);
++}
++
++static void fj_usbhost_pio_load_tx_pre_program(struct fruitjam_usbhost *uh)
++{
++	const u16 *program = uh->dp_gpio < uh->dm_gpio ?
++			     fj_usbhost_tx_pre_program_dpdm :
++			     fj_usbhost_tx_pre_program_dmdp;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fj_usbhost_tx_program_dpdm); i++)
+@@ -1695,8 +1715,7 @@
+ 	 * time to complete without splitting the transaction into slow,
+ 	 * scheduler-visible sends.
+ 	 */
+-	idle_byte = uh->low_speed ? FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE :
+-				    FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE;
++	idle_byte = fj_usbhost_pio_gap_idle_byte(uh);
+ 	memcpy(encoded, encoded_a, len_a);
+ 	memset(encoded + len_a, idle_byte, arm_gap);
+ 	memcpy(encoded + len_a + arm_gap, encoded_b, len_b);
+@@ -3172,8 +3191,7 @@
+ 	    len_a + gap_bytes + len_b > sizeof(encoded))
+ 		return -EOVERFLOW;
+ 
+-	idle_byte = uh->low_speed ? FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE :
+-				    FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE;
++	idle_byte = fj_usbhost_pio_gap_idle_byte(uh);
+ 	memcpy(encoded, encoded_a, len_a);
+ 	memset(encoded + len_a, idle_byte, gap_bytes);
+ 	memcpy(encoded + len_a + gap_bytes, encoded_b, len_b);
+-- 
+2.39.5

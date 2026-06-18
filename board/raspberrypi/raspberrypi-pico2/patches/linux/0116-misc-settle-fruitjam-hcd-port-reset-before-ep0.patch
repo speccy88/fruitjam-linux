@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 17:20:00 -0400
+Subject: [PATCH] misc: settle Fruit Jam HCD port reset before EP0
+
+The CH334F hub on Fruit Jam can be slow to answer the first downstream EP0
+transaction immediately after reset deassertion.  The HCD already keeps the bus
+active with SOF traffic, but hub_control() reported C_RESET as soon as reset_bus()
+returned, so usbcore could issue GET_DESCRIPTOR while the hub side was still
+settling.
+
+Add a short post-reset settle window before reporting reset completion.  Drop
+the bridge mutex during the wait so the SOF thread can keep emitting frames
+rather than leaving the full-speed hub idle long enough to look suspended.
+---
+ drivers/misc/fruitjam_usbhost.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -62,6 +62,7 @@
+ #define FJ_USBHOST_HCD_IDLE_SLEEP_MS	20u
+ #define FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT 0u
+ #define FJ_USBHOST_HCD_EP0_FAULT_LIMIT 4u
++#define FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS 250u
+ /*
+  * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
+  * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
+@@ -4555,6 +4556,28 @@ static int fj_usbhost_hcd_hub_status_data(struct usb_hcd *hcd, char *buf)
+ 	return ret;
+ }
+ 
++static void fj_usbhost_hcd_port_reset_settle(struct fruitjam_usbhost *uh)
++{
++	/*
++	 * Called with uh->lock held.  Releasing it here lets the SOF worker keep
++	 * the full-speed bus alive while the external hub/device settles.
++	 */
++	uh->hcd_sof_enabled = true;
++	fj_usbhost_hcd_refresh_port(uh);
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-port-reset-settle-ms=%u",
++		  FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS);
++
++	mutex_unlock(&uh->lock);
++	msleep(FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS);
++	mutex_lock(&uh->lock);
++
++	fj_usbhost_hcd_refresh_port(uh);
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-port-reset-settle-ms=%u done",
++		  FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS);
++}
++
+ static int fj_usbhost_hcd_hub_control(struct usb_hcd *hcd, u16 type_req,
+ 				      u16 value, u16 index, char *buf,
+ 				      u16 length)
+@@ -4610,0 +4633,1 @@ static int fj_usbhost_hcd_hub_control(struct usb_hcd *hcd, u16 type_req,
++				fj_usbhost_hcd_port_reset_settle(uh);
+-- 
+2.39.5

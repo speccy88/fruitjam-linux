@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -110,8 +111,46 @@ class SerialShell:
             raise SystemExit("pyserial is required for CDC mode: python3 -m pip install pyserial") from exc
 
         self.verbose = verbose
+        self._probe_serial_open(port, baud, open_timeout)
         self.serial = self._open_serial(serial, port, baud, open_timeout)
         self.counter = 0
+
+    @staticmethod
+    def _probe_serial_open(port: str, baud: int, open_timeout: float) -> None:
+        if open_timeout <= 0:
+            return
+        code = """
+import sys
+import time
+import serial
+
+ser = serial.Serial(
+    sys.argv[1],
+    int(sys.argv[2]),
+    timeout=0.1,
+    write_timeout=1,
+    dsrdtr=False,
+    rtscts=False,
+)
+ser.dtr = True
+ser.rts = False
+time.sleep(0.05)
+ser.close()
+"""
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", code, port, str(baud)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=open_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"serial open timed out after {open_timeout:.0f}s on {port}") from exc
+        if result.returncode != 0:
+            detail = result.stdout.strip() or f"exit {result.returncode}"
+            raise RuntimeError(f"serial open failed on {port}: {detail}")
 
     @staticmethod
     def _open_serial(serial_module, port: str, baud: int, open_timeout: float):
@@ -225,12 +264,39 @@ class TelnetShell:
             chunks.append(data.replace(CONTROL_NOISE, b""))
         return b"".join(chunks)
 
+    @staticmethod
+    def _read_until_prompt(sock: socket.socket, seconds: float) -> bytes:
+        chunks: list[bytes] = []
+        deadline = time.monotonic() + seconds
+        sock.settimeout(0.15)
+        while time.monotonic() < deadline:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+            chunks.append(data.replace(CONTROL_NOISE, b""))
+            if "fj$" in decode(b"".join(chunks)):
+                break
+        return b"".join(chunks)
+
+    @classmethod
+    def _send_line_wait_prompt(
+        cls,
+        sock: socket.socket,
+        line: str,
+        seconds: float,
+    ) -> tuple[bytes, bool]:
+        sock.sendall((line + "\n").encode("utf-8"))
+        data = cls._read_until_prompt(sock, seconds)
+        return data, "fj$" in decode(data)
+
     def run(self, command: str, timeout: float = 12.0) -> CommandResult:
         self.counter += 1
         ident = f"FJUSB_{self.counter:04d}"
         begin = f"__{ident}_BEGIN__"
         end = f"__{ident}_END__"
-        wrapped = f"echo {begin}\n{command}\nstatus\necho {end}\nexit"
 
         if self.verbose:
             print(f"$ {command}", file=sys.stderr)
@@ -238,32 +304,32 @@ class TelnetShell:
         raw = bytearray()
         marker_re = re.compile((r"(?:^|\r?\n)" + re.escape(end) + r"(?:\r?\n|$)").encode())
         match: re.Match[bytes] | None = None
+        timed_out = False
 
         try:
             with socket.create_connection((self.host, self.port), timeout=10) as sock:
-                raw.extend(self._read_available(sock, 0.75))
-                sock.settimeout(0.25)
-                sock.sendall(wrapped.encode("utf-8") + b"\n")
+                raw.extend(self._read_until_prompt(sock, 5.0))
 
-                deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline:
-                    try:
-                        data = sock.recv(4096)
-                    except socket.timeout:
-                        continue
-                    if not data:
-                        break
+                for line, wait in (
+                    (f"echo {begin}", 3.0),
+                    (command, timeout),
+                    ("status", 3.0),
+                    (f"echo {end}", 3.0),
+                ):
+                    data, saw_prompt = self._send_line_wait_prompt(sock, line, wait)
                     raw.extend(data.replace(CONTROL_NOISE, b""))
-                    match = marker_re.search(bytes(raw))
-                    if match:
+                    if not saw_prompt:
+                        timed_out = True
                         break
 
-                if match is None:
-                    try:
+                match = marker_re.search(bytes(raw))
+                try:
+                    if timed_out:
                         sock.sendall(b"\x03\n")
                         raw.extend(self._read_available(sock, 1.0))
-                    except OSError:
-                        pass
+                    sock.sendall(b"exit\n")
+                except OSError:
+                    pass
         except OSError as exc:
             return CommandResult(command, f"telnet error: {exc}", None, False)
 
@@ -271,8 +337,8 @@ class TelnetShell:
         output, rc = extract_fruitjam_shell_payload(text, begin, end)
         if self.verbose:
             print(output.rstrip(), file=sys.stderr)
-            print(f"rc={rc} timed_out={match is None}", file=sys.stderr)
-        return CommandResult(command, output, rc, match is None)
+            print(f"rc={rc} timed_out={timed_out or match is None}", file=sys.stderr)
+        return CommandResult(command, output, rc, timed_out or match is None)
 
 
 class FakeShell:

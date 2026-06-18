@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 15:20:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost hub set-address no-reset probe
+
+The Fruit Jam USB-A connectors sit behind an onboard CH334F hub.  Once the
+driver has powered the hub and performed an upstream bus reset, add a narrow
+diagnostic that can send additional full-speed SOF frames and then retry only
+the hub SET_ADDRESS control request without another reset.  This separates
+"the hub needs more frame traffic" from "the SETUP/DATA0 packet is not being
+accepted".
+---
+ drivers/misc/fruitjam_usbhost.c | 50 +++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -69,6 +69,7 @@
+ #define FJ_USBHOST_HUB_PORTS_MAX	4u
+ #define FJ_USBHOST_HUB_POWER_DELAY_MS	100u
+ #define FJ_USBHOST_HUB_RESET_DELAY_MS	60u
++#define FJ_USBHOST_HUB_SOF_MAX_FRAMES	500u
+ #define FJ_USB_REQ_CLEAR_FEATURE	0x01u
+ #define FJ_USB_REQ_SET_FEATURE		0x03u
+ #define FJ_USB_PORT_FEAT_RESET		4u
+@@ -3383,6 +3384,25 @@ static int fj_usbhost_pio_sof_burst(struct fruitjam_usbhost *uh, u32 frames)
+ 	return 0;
+ }
+ 
++static int fj_usbhost_pio_hub_set_address_noreset(struct fruitjam_usbhost *uh,
++						  u32 sof_frames)
++{
++	int ret;
++
++	if (sof_frames > FJ_USBHOST_HUB_SOF_MAX_FRAMES)
++		return -EINVAL;
++
++	if (sof_frames) {
++		ret = fj_usbhost_pio_sof_burst(uh, sof_frames);
++		if (ret)
++			return ret;
++	}
++
++	return fj_usbhost_pio_control_no_data(
++		uh, 0, 0x00, 0x05, FJ_USBHOST_HUB_ADDR, 0,
++		"hub-set-address-noreset");
++}
++
+ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh)
+ {
+ 	int ret;
+@@ -3694,6 +3714,27 @@ static int fj_usbhost_parse_clk_sys_hz(char *text, u32 *clk_sys_hz)
+ 	return 0;
+ }
+ 
++static int fj_usbhost_parse_optional_u32(char *text, u32 max, u32 *value)
++{
++	char *arg;
++	unsigned long parsed;
++	int ret;
++
++	arg = strim(text);
++	if (!*arg) {
++		*value = 0;
++		return 0;
++	}
++
++	ret = kstrtoul(arg, 10, &parsed);
++	if (ret)
++		return ret;
++	if (parsed > max)
++		return -EINVAL;
++	*value = parsed;
++	return 0;
++}
++
+ static int fj_usbhost_set_clk_sys_hz(struct fruitjam_usbhost *uh,
+ 				     u32 clk_sys_hz)
+ {
+@@ -3833,6 +3872,7 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 	u8 kbd_iface;
+ 	u8 kbd_ep;
+ 	u8 hub_port;
++	u32 sof_frames;
+ 	int ret = 0;
+ 
+ 	if (!count)
+@@ -3924,6 +3964,15 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_get_device8_active_stream(uh);
+ 	} else if (!strcmp(cmd, "hub-set-address-capture")) {
+ 		ret = fj_usbhost_pio_hub_set_address_capture(uh);
++	} else if (!strncmp(cmd, "hub-set-address-noreset", 23) &&
++		   (cmd[23] == '\0' || cmd[23] == ' ' ||
++		    cmd[23] == '\t')) {
++		ret = fj_usbhost_parse_optional_u32(
++			cmd + 23, FJ_USBHOST_HUB_SOF_MAX_FRAMES,
++			&sof_frames);
++		if (!ret)
++			ret = fj_usbhost_pio_hub_set_address_noreset(
++				uh, sof_frames);
+ 	} else if (!strncmp(cmd, "hub-kbd-init", 12) &&
+ 		   (cmd[12] == '\0' || cmd[12] == ' ' ||
+ 		    cmd[12] == '\t')) {
+-- 
+2.39.5

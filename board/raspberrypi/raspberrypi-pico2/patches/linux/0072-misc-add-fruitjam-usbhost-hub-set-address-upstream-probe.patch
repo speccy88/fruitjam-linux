@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 16:45:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost upstream-style hub SET_ADDRESS
+ probe
+
+The Fruit Jam CH334F root hub still ignores the bridge's SET_ADDRESS setup
+stage even when ACK capture is skipped.  Add a deliberately upstream-shaped
+diagnostic path modeled after Pico-PIO-USB's setup transaction:
+
+  prepare receive
+  send SETUP token
+  send DATA0 setup payload
+  clear/start RX
+  wait for the two-byte handshake
+  send/ACK the status IN stage
+
+This keeps the existing experimental paths intact while giving hardware tests a
+less synthetic setup transaction to compare against.
+---
+ drivers/misc/fruitjam_usbhost.c | 148 ++++++++++++++++++++++++++++++++
+ 1 file changed, 148 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -57,6 +57,8 @@
+ #define FJ_USBHOST_ACTIVE_RESET_MS	50u
+ #define FJ_USBHOST_RESET_RECOVERY_MS	25u
+ #define FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US 1000u
++#define FJ_USBHOST_HANDSHAKE_START_TIMEOUT_US 20u
++#define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_EP	1u
+@@ -566,6 +568,11 @@ static void fj_usbhost_pio_clear_tx_irq(struct fruitjam_usbhost *uh)
+ 	}
+ }
+ 
++static void fj_usbhost_pio_start_receive(struct fruitjam_usbhost *uh)
++{
++	fj_usbhost_pio_clear_rx_irq(uh);
++}
++
+ static void fj_usbhost_pio_disable_receive(struct fruitjam_usbhost *uh)
+ {
+ 	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+@@ -1901,6 +1908,73 @@ static void fj_usbhost_pio_record_rx(struct fruitjam_usbhost *uh, int ret,
+ 		uh->rx_errors++;
+ }
+ 
++static int fj_usbhost_pio_wait_handshake_fast(struct fruitjam_usbhost *uh)
++{
++	u32 waited;
++	u32 len = 0;
++	int ret = -ETIMEDOUT;
++
++#define FJ_USBHOST_DRAIN_HANDSHAKE_FIFO()					\
++	do {									\
++		while (!(readl(uh->pio + FJ_PIO_FSTAT) &			\
++			 FJ_PIO_FSTAT_RXEMPTY(uh->sm_rx))) {			\
++			if (len >= FJ_USBHOST_RX_BYTES_MAX) {			\
++				ret = -EOVERFLOW;				\
++				goto out;					\
++			}							\
++			uh->last_rx_bytes[len++] =				\
++				readl(uh->pio + FJ_PIO_RXF(uh->sm_rx)) >> 24;	\
++		}								\
++	} while (0)
++
++	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
++	for (waited = 0; waited < FJ_USBHOST_HANDSHAKE_START_TIMEOUT_US;
++	     waited++) {
++		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
++
++		if (irq & FJ_PIO_IRQ_RX_START)
++			break;
++		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
++			ret = -EILSEQ;
++			goto out;
++		}
++		udelay(1);
++	}
++	if (waited >= FJ_USBHOST_HANDSHAKE_START_TIMEOUT_US)
++		goto out;
++
++	for (waited = 0; waited < FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US;
++	     waited++) {
++		u32 irq;
++
++		FJ_USBHOST_DRAIN_HANDSHAKE_FIFO();
++		irq = readl(uh->pio + FJ_PIO_IRQ);
++		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
++			ret = -EILSEQ;
++			goto out;
++		}
++		if (irq & FJ_PIO_IRQ_RX_EOP) {
++			FJ_USBHOST_DRAIN_HANDSHAKE_FIFO();
++			ret = 0;
++			break;
++		}
++		udelay(1);
++	}
++
++	if (!ret) {
++		if (len != 2 || uh->last_rx_bytes[0] != FJ_USB_SYNC)
++			ret = -EPROTO;
++	} else if (len) {
++		ret = -EPROTO;
++	}
++
++out:
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_record_rx(uh, ret, len);
++	return ret;
++#undef FJ_USBHOST_DRAIN_HANDSHAKE_FIFO
++}
++
+ static bool fj_usbhost_pio_rx_data_crc_ok(struct fruitjam_usbhost *uh, u32 len)
+ {
+ 	u8 pid;
+@@ -2695,6 +2768,32 @@ static int fj_usbhost_pio_control_status_in(struct fruitjam_usbhost *uh,
+ 	return 0;
+ }
+ 
++static int fj_usbhost_pio_control_status_in_upstream(struct fruitjam_usbhost *uh,
++						     u8 addr)
++{
++	u8 encoded_len = 0;
++	int ret;
++
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, addr, 0,
++					&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_start_receive(uh);
++	ret = fj_usbhost_pio_receive_raw(uh, true);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_DATA1 ||
++	    uh->last_rx_len != 4 ||
++	    !fj_usbhost_pio_rx_data_crc_ok(uh, uh->last_rx_len)) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++	return 0;
++}
++
+ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 					  u8 addr, u8 request_type,
+ 					  u8 request, u16 value, u16 index,
+@@ -3449,6 +3550,62 @@ static int fj_usbhost_pio_hub_set_address_skipack(struct fruitjam_usbhost *uh,
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_hub_set_address_upstream(struct fruitjam_usbhost *uh,
++						   u32 sof_frames)
++{
++	u8 setup[8] = {
++		0x00, 0x05,
++		FJ_USBHOST_HUB_ADDR, 0x00,
++		0x00, 0x00,
++		0x00, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	if (sof_frames > FJ_USBHOST_HUB_SOF_MAX_FRAMES)
++		return -EINVAL;
++
++	if (sof_frames) {
++		ret = fj_usbhost_pio_sof_burst(uh, sof_frames);
++		if (ret)
++			return ret;
++	}
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_prepare_receive(uh);
++	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_SETUP, 0, 0,
++					&encoded_len);
++	if (!ret)
++		ret = fj_usbhost_pio_send_data0(uh, setup, sizeof(setup),
++						&encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_start_receive(uh);
++	ret = fj_usbhost_pio_wait_handshake_fast(uh);
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hub-set-address-upstream setup-handshake pid=0x%02x len=%u sof-frames=%u ret=%d",
++		  uh->last_rx_pid, uh->last_rx_len, sof_frames, ret);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++
++	ret = fj_usbhost_pio_control_status_in_upstream(uh, 0);
++	if (!ret)
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "hub-set-address-upstream status-in-ok sof-frames=%u",
++			  sof_frames);
++	return ret;
++}
++
+ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh)
+ {
+ 	int ret;
+@@ -4022,6 +4161,15 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		if (!ret)
+ 			ret = fj_usbhost_pio_hub_set_address_skipack(
+ 				uh, sof_frames);
++	} else if (!strncmp(cmd, "hub-set-address-upstream", 24) &&
++		   (cmd[24] == '\0' || cmd[24] == ' ' ||
++		    cmd[24] == '\t')) {
++		ret = fj_usbhost_parse_optional_u32(
++			cmd + 24, FJ_USBHOST_HUB_SOF_MAX_FRAMES,
++			&sof_frames);
++		if (!ret)
++			ret = fj_usbhost_pio_hub_set_address_upstream(
++				uh, sof_frames);
+ 	} else if (!strncmp(cmd, "hub-kbd-init", 12) &&
+ 		   (cmd[12] == '\0' || cmd[12] == ' ' ||
+ 		    cmd[12] == '\t')) {
+-- 
+2.39.5

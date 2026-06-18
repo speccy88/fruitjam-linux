@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 20:05:00 -0400
+Subject: [PATCH] misc: add wili8jam audio waveforms
+
+wili8jam exposes a tiny audio synth API with sine, square, saw, triangle, and
+noise waveforms.  Fruit Jam Linux already has a no-MMU friendly synchronous I2S
+tone path, but it only generated sine samples.
+
+Extend the /dev/fruitjam-audio text protocol without breaking the existing
+command:
+
+  tone HZ MS
+  tone HZ MS WAVEFORM
+  wave WAVEFORM HZ MS
+
+Accepted waveform names are sine, square, saw, triangle, and noise, with the
+same numeric values used by wili8jam's audio.h.
+---
+ drivers/misc/fruitjam_audio_clock.c | 116 +++++++++++++++++++++++++--
+ 1 file changed, 109 insertions(+), 7 deletions(-)
+
+--- a/drivers/misc/fruitjam_audio_clock.c
++++ b/drivers/misc/fruitjam_audio_clock.c
+@@ -31,6 +31,12 @@
+ #define FJ_AUDIO_TAIL_FRAMES		64u
+ #define FJ_AUDIO_MCLK_PROGRAM_OFFSET	0u
+ #define FJ_AUDIO_STREAM_PROGRAM_OFFSET	8u
++#define FJ_AUDIO_WAVE_SINE		0u
++#define FJ_AUDIO_WAVE_SQUARE		1u
++#define FJ_AUDIO_WAVE_SAW		2u
++#define FJ_AUDIO_WAVE_TRIANGLE		3u
++#define FJ_AUDIO_WAVE_NOISE		4u
++#define FJ_AUDIO_WAVE_DEFAULT		FJ_AUDIO_WAVE_SINE
+ 
+ #define RP2350_PIO_CTRL			0x000
+ #define RP2350_PIO_FSTAT		0x004
+@@ -134,6 +140,7 @@
+ 	u32 tone_count;
+ 	u32 last_hz;
+ 	u32 last_ms;
++	u32 last_waveform;
+ 	u32 last_fstat;
+ 	u32 last_fdebug;
+ 	int last_ret;
+@@ -371,6 +378,86 @@
+ 	return (s16)((v * amp) / 32767);
+ }
+ 
++static const char *fj_audio_waveform_name(u32 waveform)
++{
++	switch (waveform) {
++	case FJ_AUDIO_WAVE_SINE:
++		return "sine";
++	case FJ_AUDIO_WAVE_SQUARE:
++		return "square";
++	case FJ_AUDIO_WAVE_SAW:
++		return "saw";
++	case FJ_AUDIO_WAVE_TRIANGLE:
++		return "triangle";
++	case FJ_AUDIO_WAVE_NOISE:
++		return "noise";
++	default:
++		return "unknown";
++	}
++}
++
++static int fj_audio_parse_waveform(const char *name, u32 *waveform)
++{
++	unsigned int value;
++
++	if (!strcmp(name, "sine")) {
++		*waveform = FJ_AUDIO_WAVE_SINE;
++		return 0;
++	}
++	if (!strcmp(name, "square")) {
++		*waveform = FJ_AUDIO_WAVE_SQUARE;
++		return 0;
++	}
++	if (!strcmp(name, "saw")) {
++		*waveform = FJ_AUDIO_WAVE_SAW;
++		return 0;
++	}
++	if (!strcmp(name, "triangle")) {
++		*waveform = FJ_AUDIO_WAVE_TRIANGLE;
++		return 0;
++	}
++	if (!strcmp(name, "noise")) {
++		*waveform = FJ_AUDIO_WAVE_NOISE;
++		return 0;
++	}
++	if (!kstrtouint(name, 0, &value) && value <= FJ_AUDIO_WAVE_NOISE) {
++		*waveform = value;
++		return 0;
++	}
++	return -EINVAL;
++}
++
++static s16 fj_audio_wave_sample(u32 phase, u32 phase_step, s32 amp,
++				u32 waveform, u16 *noise_lfsr)
++{
++	s32 v;
++
++	switch (waveform) {
++	case FJ_AUDIO_WAVE_SQUARE:
++		return phase & 0x80000000u ? amp : -amp;
++	case FJ_AUDIO_WAVE_SAW:
++		v = (s32)((phase >> 16) & 0xffff) - 32768;
++		return (s16)((v * amp) / 32767);
++	case FJ_AUDIO_WAVE_TRIANGLE:
++		if (phase < 0x80000000u)
++			v = (s32)((phase >> 15) & 0xffff) - 32768;
++		else
++			v = 32767 - (s32)(((phase - 0x80000000u) >> 15) & 0xffff);
++		return (s16)((v * amp) / 32767);
++	case FJ_AUDIO_WAVE_NOISE:
++		if ((phase >> 24) != ((phase - phase_step) >> 24)) {
++			u16 bit = ((*noise_lfsr >> 0) ^ (*noise_lfsr >> 1) ^
++				   (*noise_lfsr >> 5) ^ (*noise_lfsr >> 6)) & 1;
++			*noise_lfsr = (*noise_lfsr >> 1) | (bit << 15);
++		}
++		v = (s32)*noise_lfsr - 32768;
++		return (s16)((v * amp) / 32767);
++	case FJ_AUDIO_WAVE_SINE:
++	default:
++		return fj_audio_sine_sample(phase, amp);
++	}
++}
++
+ static int fj_audio_wait_tx_space(struct fj_audio *fj)
+ {
+ 	int i;
+@@ -410,11 +497,13 @@
+ static void fj_audio_record_tone_result(struct fj_audio *fj,
+ 					unsigned int hz,
+ 					unsigned int ms,
++					u32 waveform,
+ 					int ret)
+ {
+ 	fj->tone_count++;
+ 	fj->last_hz = hz;
+ 	fj->last_ms = ms;
++	fj->last_waveform = waveform;
+ 	fj->last_ret = ret;
+ 	fj->last_fstat = readl(fj->pio + RP2350_PIO_FSTAT);
+ 	fj->last_fdebug = readl(fj->pio + RP2350_PIO_FDEBUG);
+@@ -457,7 +546,8 @@
+ 	return 0;
+ }
+ 
+-static int fj_audio_tone(struct fj_audio *fj, unsigned int hz, unsigned int ms)
++static int fj_audio_tone(struct fj_audio *fj, unsigned int hz, unsigned int ms,
++			 u32 waveform)
+ {
+ 	unsigned int req_hz = hz;
+ 	unsigned int req_ms = ms;
+@@ -465,10 +555,11 @@
+ 	u32 phase_step;
+ 	u32 frames;
+ 	u32 i;
++	u16 noise_lfsr = 0xace1;
+ 	int ret;
+ 
+ 	if (!ms) {
+-		fj_audio_record_tone_result(fj, req_hz, req_ms, 0);
++		fj_audio_record_tone_result(fj, req_hz, req_ms, waveform, 0);
+ 		return 0;
+ 	}
+ 	if (ms > FJ_AUDIO_TONE_MAX_MS)
+@@ -477,13 +568,13 @@
+ 		hz = FJ_AUDIO_SAMPLE_RATE / 2 - 1;
+ 	if (!hz) {
+ 		msleep(ms);
+-		fj_audio_record_tone_result(fj, req_hz, req_ms, 0);
++		fj_audio_record_tone_result(fj, req_hz, req_ms, waveform, 0);
+ 		return 0;
+ 	}
+ 
+ 	ret = fj_audio_configure_i2s_stream(fj);
+ 	if (ret) {
+-		fj_audio_record_tone_result(fj, req_hz, req_ms, ret);
++		fj_audio_record_tone_result(fj, req_hz, req_ms, waveform, ret);
+ 		return ret;
+ 	}
+ 
+@@ -503,7 +594,8 @@
+ 			if (frames - i < FJ_AUDIO_SAMPLE_RATE / 200)
+ 				amp = div_u64((u64)amp * (frames - i),
+ 					      FJ_AUDIO_SAMPLE_RATE / 200);
+-			sample = fj_audio_sine_sample(phase, amp);
++			sample = fj_audio_wave_sample(phase, phase_step, amp,
++						      waveform, &noise_lfsr);
+ 			phase += phase_step;
+ 		}
+ 		ret = fj_audio_write_frame(fj, fj_audio_i2s_word(sample));
+@@ -517,7 +609,7 @@
+ 		ret = fj_audio_wait_tx_empty(fj);
+ 	udelay(500);
+ 	fj_audio_sm_disable_one(fj, fj->sm);
+-	fj_audio_record_tone_result(fj, req_hz, req_ms, ret);
++	fj_audio_record_tone_result(fj, req_hz, req_ms, waveform, ret);
+ 	return ret;
+ }
+ 
+@@ -528,6 +620,8 @@
+ 	char buf[32];
+ 	unsigned int hz;
+ 	unsigned int ms;
++	char waveform_name[16];
++	u32 waveform = FJ_AUDIO_WAVE_DEFAULT;
+ 	int ret = 0;
+ 
+ 	if (!count)
+@@ -542,12 +636,26 @@
+ 	mutex_lock(&fj->lock);
+ 	if (!strcmp(buf, "start"))
+ 		ret = fj_audio_start(fj);
+-	else if (sscanf(buf, "tone %u %u", &hz, &ms) == 2)
+-		ret = fj_audio_tone(fj, hz, ms);
+-	else if (!strcmp(buf, "stop"))
+-		fj_audio_stop(fj);
+-	else
+-		ret = -EINVAL;
++	else if (sscanf(buf, "wave %15s %u %u", waveform_name, &hz, &ms) == 3) {
++		ret = fj_audio_parse_waveform(waveform_name, &waveform);
++		if (!ret)
++			ret = fj_audio_tone(fj, hz, ms, waveform);
++	} else {
++		int matched = sscanf(buf, "tone %u %u %15s",
++				     &hz, &ms, waveform_name);
++
++		if (matched == 2) {
++			ret = fj_audio_tone(fj, hz, ms, FJ_AUDIO_WAVE_DEFAULT);
++		} else if (matched == 3) {
++			ret = fj_audio_parse_waveform(waveform_name, &waveform);
++			if (!ret)
++				ret = fj_audio_tone(fj, hz, ms, waveform);
++		} else if (!strcmp(buf, "stop")) {
++			fj_audio_stop(fj);
++		} else {
++			ret = -EINVAL;
++		}
++	}
+ 	mutex_unlock(&fj->lock);
+ 
+ 	return ret ? ret : count;
+@@ -574,6 +682,8 @@
+ 			"tone_count %u\n"
+ 			"last_hz %u\n"
+ 			"last_ms %u\n"
++			"last_waveform %s\n"
++			"last_waveform_id %u\n"
+ 			"last_ret %d\n"
+ 			"last_fstat 0x%08x\n"
+ 			"last_fdebug 0x%08x\n"
+@@ -581,8 +691,10 @@
+ 			"fdebug 0x%08x\n"
+ 			"ctrl 0x%08x\n",
+ 			fj->running ? 1 : 0, fj->mclk_hz, FJ_AUDIO_SAMPLE_RATE,
+-			fj->tone_count, fj->last_hz, fj->last_ms, fj->last_ret,
+-			fj->last_fstat, fj->last_fdebug, fstat, fdebug, ctrl);
++			fj->tone_count, fj->last_hz, fj->last_ms,
++			fj_audio_waveform_name(fj->last_waveform),
++			fj->last_waveform, fj->last_ret, fj->last_fstat,
++			fj->last_fdebug, fstat, fdebug, ctrl);
+ 	mutex_unlock(&fj->lock);
+ 
+ 	return simple_read_from_buffer(ubuf, count, ppos, buf, len);

@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Thu, 18 Jun 2026 00:00:00 -0400
+Subject: [PATCH] misc: cap Fruit Jam HCD EP0 automatic recovery
+
+Live Fruit Jam testing with the CH334F path, Logitech receiver, and Xbox 360
+gamepad showed the HCD could fault on EP0, automatically recover, and then
+immediately repeat descriptor-read timeouts forever. On the no-MMU image that
+loop continuously creates new usbcore enumeration attempts and starves the
+small AirLift/httpd control processes into contiguous allocation failures.
+
+Keep the transient recovery behavior, but cap it. After the bounded automatic
+passes are spent, leave the HCD fault latched with a clear diagnostic so
+userspace status and manual recovery remain usable instead of letting USB host
+failure degrade the rest of the board.
+---
+ drivers/misc/fruitjam_usbhost.c | 34 +++++++++++++++++++++++-----------
+ 1 file changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -68,6 +68,7 @@
+ #define FJ_USBHOST_HCD_PRESTART_POWER_ON_MS 750u
+ #define FJ_USBHOST_HCD_PRESTART_RESET_MS 100u
+ #define FJ_USBHOST_HCD_FAULT_RECOVER_DELAY_MS 1000u
++#define FJ_USBHOST_HCD_FAULT_RECOVER_MAX 2u
+ /*
+  * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
+  * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
+@@ -4416,13 +4417,27 @@ static void fj_usbhost_hcd_fault_locked(struct fruitjam_usbhost *uh, int ret)
+		  "hcd-fault ep0-failures=%u last-ret=%d pid=0x%02x rx-len=%u prev=%s",
+		  uh->hcd_ep0_failures, ret, uh->last_rx_pid,
+		  uh->last_rx_len, prev_summary);
++	if (uh->hcd_registered &&
++	    uh->hcd_fault_recoveries < FJ_USBHOST_HCD_FAULT_RECOVER_MAX) {
++		dev_warn(uh->dev,
++			 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u prev=%s; scheduling automatic recovery %u/%u\n",
++			 uh->hcd_ep0_failures, ret, uh->last_rx_pid,
++			 uh->last_rx_len, prev_summary,
++			 uh->hcd_fault_recoveries + 1,
++			 FJ_USBHOST_HCD_FAULT_RECOVER_MAX);
++		schedule_delayed_work(&uh->hcd_fault_recover_work,
++			msecs_to_jiffies(FJ_USBHOST_HCD_FAULT_RECOVER_DELAY_MS));
++		return;
++	}
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-fault auto-recovery-limit=%u ep0-failures=%u last-ret=%d pid=0x%02x rx-len=%u prev=%s",
++		  FJ_USBHOST_HCD_FAULT_RECOVER_MAX, uh->hcd_ep0_failures,
++		  ret, uh->last_rx_pid, uh->last_rx_len, prev_summary);
+ 	dev_warn(uh->dev,
+-		 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u prev=%s; scheduling automatic recovery\n",
++		 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u prev=%s; auto recovery limit reached, use fruitjam-usbhost hcd-clear-fault to retry\n",
+ 		 uh->hcd_ep0_failures, ret, uh->last_rx_pid,
+ 		 uh->last_rx_len, prev_summary);
+-	if (uh->hcd_registered)
+-		schedule_delayed_work(&uh->hcd_fault_recover_work,
+-			msecs_to_jiffies(FJ_USBHOST_HCD_FAULT_RECOVER_DELAY_MS));
+ }
+ 
+ static void fj_usbhost_hcd_note_urb_result(struct fruitjam_usbhost *uh,

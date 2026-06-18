@@ -262,7 +262,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "fruitjamctl: reboot bootsel: %s\n", strerror(errno));
 			return 1;
 		}
-		return 1;
+		return 0;
 	}
 
 	if (!strcmp(argv[1], "init"))

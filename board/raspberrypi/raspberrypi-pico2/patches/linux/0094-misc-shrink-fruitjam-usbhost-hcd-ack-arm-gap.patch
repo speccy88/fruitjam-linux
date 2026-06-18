@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 00:25:00 -0400
+Subject: [PATCH] misc: shrink Fruit Jam usbhost HCD ACK arm gap
+
+Hardware testing of the gated HCD setup path showed a clean timeout waiting
+for the hub ACK:
+
+  hcd-control setup-arm-ack tx-len=50
+  last-rx-result -110 pid 0x00 len 0
+
+That path was using a 16-byte idle pad between the SETUP token and DATA0 packet
+so the CPU could arm RX after the first EOP. The pad is useful, but 16 encoded
+idle bytes stretches the host inter-packet delay far enough that the CH334F hub
+may discard the setup transaction before the host reaches the DATA0 packet.
+
+Keep the gated ACK strategy, but reduce the arm pad to 4 bytes. This still gives
+the Linux MMIO handoff a bounded window while keeping the host packet pair much
+closer to normal USB timing.
+---
+ drivers/misc/fruitjam_usbhost.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -74,7 +74,7 @@
+ #define FJ_USBHOST_SETUP_GAP_MAX_BYTES 16u
+ #define FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE 0xffu
+ #define FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE 0x55u
+-#define FJ_USBHOST_HCD_ACK_ARM_GAP_BYTES 16u
++#define FJ_USBHOST_HCD_ACK_ARM_GAP_BYTES 4u
+ #define FJ_USBHOST_FRAME_RETRY_DEFAULT 8u
+ #define FJ_USBHOST_FRAME_RETRY_MAX 64u
+ #define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
+-- 
+2.39.5

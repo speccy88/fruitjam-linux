@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000083 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 00:35:00 -0400
+Subject: [PATCH] misc: frame-pace Fruit Jam usbhost HCD transfers
+
+TinyUSB's Pico-PIO-USB host drives transfers from its 1 kHz host frame path:
+it emits SOF, performs one transaction stage, then advances the next control
+stage on a later frame.  The initial Linux HCD path sent SETUP and the first
+IN stage back-to-back on its first attempt, and it continued into the data
+stage even when SETUP did not ACK.
+
+Pace HCD control and interrupt transactions with a SOF before each stage, retry
+SETUP cleanly when the ACK is missing, and keep enough RX history for a full
+64-byte full-speed data packet plus sync/PID/CRC.  This keeps the Linux HCD
+closer to the known-working wili8jam/TinyUSB timing while preserving the small
+synchronous bridge design.
+---
+ drivers/misc/fruitjam_usbhost.c | 28 ++++++++++++++++++++--------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3226,6 +3226,7 @@ static int fj_usbhost_pio_control_status_out(struct fruitjam_usbhost *uh,
+ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 				       u8 addr, const u8 *setup,
+-				       u8 *buf, u16 len, u32 *actual)
++				       u8 *buf, u16 len, u16 maxpacket,
++				       u32 *actual)
+ {
+ 	u8 encoded_len;
+ 	u8 expected_pid;
+@@ -3238,6 +3239,11 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 	if (len && !buf)
+ 		return -EINVAL;
+ 
++	if (!maxpacket)
++		maxpacket = FJ_USBHOST_HCD_MAXPACKET;
++	else if (maxpacket > 64)
++		maxpacket = 64;
++
+ 	for (attempt = 0; attempt < FJ_USBHOST_HCD_CONTROL_ATTEMPTS;
+ 	     attempt++) {
+ 		bool setup_seen = false;
+@@ -3250,11 +3256,9 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 		ret = fj_usbhost_pio_require_configured(uh);
+ 		if (ret)
+ 			return ret;
+-		if (attempt) {
+-			ret = fj_usbhost_pio_sof_burst(uh, 1);
+-			if (ret)
+-				return ret;
+-		}
++		ret = fj_usbhost_pio_sof_burst(uh, 1);
++		if (ret)
++			return ret;
+ 
+ 		fj_usbhost_pio_disable_receive(uh);
+ 		ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
+@@ -3279,7 +3283,12 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 				  uh->last_rx_pid);
+ 			last_ret = ret;
+ 		}
++		if (ret)
++			continue;
+ 
++		ret = fj_usbhost_pio_sof_burst(uh, 1);
++		if (ret)
++			return ret;
+ 		for (;;) {
+ 			u32 payload_len;
+ 			u32 nak_attempt;
+@@ -3345,7 +3354,11 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 			expected_pid = expected_pid == FJ_USB_PID_DATA1 ?
+ 				       FJ_USB_PID_DATA0 : FJ_USB_PID_DATA1;
+ 			if (copied >= len ||
+-			    payload_len < FJ_USBHOST_HCD_MAXPACKET) {
++			    payload_len < maxpacket) {
++				ret = fj_usbhost_pio_sof_burst(uh, 1);
++				if (ret)
++					return ret;
++
+ 				ret = fj_usbhost_pio_control_status_out(uh,
+ 									addr);
+ 				if (!ret) {
+@@ -3379,6 +3392,10 @@ static int fj_usbhost_hcd_interrupt_in(struct fruitjam_usbhost *uh,
+ 	ret = fj_usbhost_pio_require_configured(uh);
+ 	if (ret)
+ 		return ret;
++	ret = fj_usbhost_pio_sof_burst(uh, 1);
++	if (ret)
++		return ret;
++
+ 
+ 	fj_usbhost_pio_prepare_receive_after_tx(uh);
+ 	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, addr, ep,
+@@ -3569,5 +3586,6 @@ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ 		struct usb_ctrlrequest *setup;
+ 		u16 len;
++		u16 maxpacket;
+ 
+ 		if (!urb->setup_packet)
+ 			return -EINVAL;
+@@ -3581,10 +3599,12 @@ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ 				uh, addr, setup->bRequestType,
+ 				setup->bRequest, le16_to_cpu(setup->wValue),
+ 				le16_to_cpu(setup->wIndex), "hcd-control");
+-		else if (setup->bRequestType & USB_DIR_IN)
++		else if (setup->bRequestType & USB_DIR_IN) {
++			maxpacket = usb_endpoint_maxp(&urb->ep->desc);
+ 			ret = fj_usbhost_hcd_control_read(
+ 				uh, addr, urb->setup_packet,
+-				urb->transfer_buffer, len, &actual);
++				urb->transfer_buffer, len, maxpacket, &actual);
++		}
+ 		else
+ 			ret = -EOPNOTSUPP;
+ 	} else if (usb_pipeint(urb->pipe) && usb_pipein(urb->pipe)) {
+-- 
+2.39.5

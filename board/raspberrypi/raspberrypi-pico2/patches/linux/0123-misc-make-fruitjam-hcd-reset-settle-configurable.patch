@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 18:30:00 -0400
+Subject: [PATCH] misc: make Fruit Jam HCD reset settle configurable
+
+The first EP0 transaction after reset release is the fragile point on the
+Fruit Jam CH334F hub path. Keep the post-reset settle guard, but make it a
+board DTS property so the Linux image can match the hardware margin without
+hard-coding that timing in the driver.
+
+Expose the configured value through the bridge status text so local tools and
+the AirLift HTTP USB API can prove which timing is actually running.
+---
+ drivers/misc/fruitjam_usbhost.c | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -62,7 +62,7 @@
+ #define FJ_USBHOST_HCD_IDLE_SLEEP_MS	20u
+ #define FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT 0u
+ #define FJ_USBHOST_HCD_EP0_FAULT_LIMIT 4u
+-#define FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS 250u
++#define FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS_DEFAULT 500u
+ /*
+  * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
+  * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
+@@ -304,6 +304,7 @@ struct fruitjam_usbhost {
+ 	struct delayed_work hcd_register_work;
+ 	u32 hcd_port_status;
+ 	u32 hcd_start_delay_ms;
++	u32 hcd_port_reset_settle_ms;
+ 	bool hcd_manual_start;
+ 	u32 hcd_ep0_failures;
+ 	u16 hcd_frame;
+@@ -4570,16 +4571,16 @@ static void fj_usbhost_hcd_port_reset_settle(struct fruitjam_usbhost *uh)
+ 	fj_usbhost_hcd_refresh_port(uh);
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+ 		  "hcd-port-reset-settle-ms=%u",
+-		  FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS);
++		  uh->hcd_port_reset_settle_ms);
+ 
+ 	mutex_unlock(&uh->lock);
+-	msleep(FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS);
++	msleep(uh->hcd_port_reset_settle_ms);
+ 	mutex_lock(&uh->lock);
+ 
+ 	fj_usbhost_hcd_refresh_port(uh);
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+ 		  "hcd-port-reset-settle-ms=%u done",
+-		  FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS);
++		  uh->hcd_port_reset_settle_ms);
+ }
+ 
+ static int fj_usbhost_hcd_hub_control(struct usb_hcd *hcd, u16 type_req,
+@@ -5760,6 +5761,7 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 			 "hcd_faulted %u\n"
+ 			 "hcd_ep0_failures %u\n"
+ 			 "hcd_delay_ms %u\n"
++			 "hcd_port_reset_settle_ms %u\n"
+ 			 "hcd_sof %u\n"
+ 			 "pio_configured %u\n"
+ 			 "pio_program %s\n"
+@@ -6363,6 +6366,7 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	uh->clk_sys_hz = FJ_USBHOST_CLK_SYS_HZ_DEFAULT;
+ 	uh->tx_dma_channel = FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT;
+ 	uh->hcd_start_delay_ms = FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT;
++	uh->hcd_port_reset_settle_ms = FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS_DEFAULT;
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dp-gpio", &uh->dp_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dm-gpio", &uh->dm_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,power-gpio", &uh->power_gpio);
+@@ -6373,6 +6377,8 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,tx-dma-channel", &uh->tx_dma_channel);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,clk-sys-hz", &uh->clk_sys_hz);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,hcd-start-delay-ms", &uh->hcd_start_delay_ms);
++	device_property_read_u32(&pdev->dev, "raspberrypi,hcd-port-reset-settle-ms",
++				 &uh->hcd_port_reset_settle_ms);
+ 	uh->hcd_manual_start = device_property_read_bool(&pdev->dev,
+ 							 "raspberrypi,hcd-manual-start");
+ 
+@@ -6423,11 +6429,11 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	dev_info(&pdev->dev,
+-		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u clk_sys_hz=%u dma=%u ch=%u hcd_delay_ms=%u\n",
++		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u clk_sys_hz=%u dma=%u ch=%u hcd_delay_ms=%u hcd_reset_settle_ms=%u\n",
+ 		 uh->dp_gpio, uh->dm_gpio, uh->power_gpio, uh->pio_index,
+ 		 uh->pio_ready, uh->pio_configured, uh->clk_sys_hz,
+ 		 uh->dma ? 1 : 0, uh->tx_dma_channel,
+-		 uh->hcd_start_delay_ms);
++		 uh->hcd_start_delay_ms, uh->hcd_port_reset_settle_ms);
+ 	return 0;
+ }
+ 
+-- 
+2.39.5

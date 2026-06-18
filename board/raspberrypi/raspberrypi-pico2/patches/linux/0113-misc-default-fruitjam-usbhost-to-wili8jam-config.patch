@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 11:25:00 -0400
+Subject: [PATCH] misc: default Fruit Jam usbhost to wili8jam config
+
+The Fruit Jam DTS already overrides the USB host bridge with the known-working
+wili8jam electrical configuration: PIO0, clk_sys at 252 MHz, and TX DMA channel
+9. Keep the bridge defaults aligned with that board configuration too, so debug
+status and any future probe path that starts before property parsing are not
+biased toward the older PIO2/144 MHz/DMAC2 bring-up settings.
+---
+ drivers/misc/fruitjam_usbhost.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -43,11 +43,11 @@
+ #define FJ_USBHOST_POST_RESET_MS	100u
+ #define FJ_USBHOST_COMMAND_MAX		64u
+ 
+-#define FJ_USBHOST_PIO_INDEX_DEFAULT	2u
++#define FJ_USBHOST_PIO_INDEX_DEFAULT	0u
+ #define FJ_USBHOST_SM_TX_DEFAULT	0u
+ #define FJ_USBHOST_SM_RX_DEFAULT	1u
+ #define FJ_USBHOST_SM_EOP_DEFAULT	2u
+-#define FJ_USBHOST_CLK_SYS_HZ_DEFAULT	144000000u
++#define FJ_USBHOST_CLK_SYS_HZ_DEFAULT	252000000u
+ #define FJ_USBHOST_PIO_PROGRAM_WORDS	32u
+ #define FJ_USBHOST_CLK_SYS_MIN_HZ	48000000u
+ #define FJ_USBHOST_CLK_SYS_MAX_HZ	300000000u
+@@ -68,7 +68,7 @@
+  */
+ #define FJ_USBHOST_TX_ENCODED_MAX	192u
+ #define FJ_USBHOST_RX_BYTES_MAX		72u
+-#define FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 2u
++#define FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 9u
+ #define FJ_USBHOST_PROBE_SUMMARY_MAX	512u
+ #define FJ_USBHOST_DMA_TIMEOUT_US	2000u
+ #define FJ_USBHOST_SOF_BURST_FRAMES	20u
+-- 
+2.39.5

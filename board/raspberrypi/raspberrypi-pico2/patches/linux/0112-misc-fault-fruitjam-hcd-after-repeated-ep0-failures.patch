@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 10:10:00 -0400
+Subject: [PATCH] misc: fault Fruit Jam HCD after repeated EP0 failures
+
+The Fruit Jam HCD currently leaves the synthetic root-hub port connected while
+endpoint-zero enumeration is failing. On the no-MMU image this can keep usbcore
+retrying through the synchronous PIO transfer path hard enough that telnet/CDC
+recovery and small status commands stop making progress.
+
+Latch the HCD into a faulted state after a small number of failed control URBs.
+The physical line-state bridge remains available, but the Linux root hub reports
+the port disconnected and the SOF thread idles until userspace explicitly clears
+the fault or power-cycles the bridge. This preserves recovery and makes the
+remaining EP0 failure observable instead of letting retries consume the board.
+---
+ drivers/misc/fruitjam_usbhost.c | 96 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 93 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -61,6 +61,7 @@
+ #define FJ_USBHOST_HCD_IN_NAK_ATTEMPTS 16u
+ #define FJ_USBHOST_HCD_IDLE_SLEEP_MS	20u
+ #define FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT 0u
++#define FJ_USBHOST_HCD_EP0_FAULT_LIMIT 4u
+ /*
+  * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
+  * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
+@@ -303,9 +304,11 @@
+ 	struct delayed_work hcd_register_work;
+ 	u32 hcd_port_status;
+ 	u32 hcd_start_delay_ms;
++	u32 hcd_ep0_failures;
+ 	u16 hcd_frame;
+ 	bool hcd_sof_enabled;
+ 	bool hcd_registered;
++	bool hcd_faulted;
+ 	u8 last_rx_bytes[FJ_USBHOST_RX_BYTES_MAX];
+ 	u8 tx_dma_buf[FJ_USBHOST_TX_ENCODED_MAX];
+ 	bool pio_ready;
+@@ -4339,6 +4342,51 @@
+ static struct fruitjam_usbhost *fj_usbhost_hcd_to_uh(struct usb_hcd *hcd)
+ {
+ 	return *(struct fruitjam_usbhost **)hcd->hcd_priv;
++}
++
++static void fj_usbhost_hcd_clear_fault_locked(struct fruitjam_usbhost *uh)
++{
++	uh->hcd_faulted = false;
++	uh->hcd_ep0_failures = 0;
++}
++
++static void fj_usbhost_hcd_fault_locked(struct fruitjam_usbhost *uh, int ret)
++{
++	if (uh->hcd_faulted)
++		return;
++
++	uh->hcd_faulted = true;
++	uh->hcd_sof_enabled = false;
++	uh->hcd_port_status &= ~(USB_PORT_STAT_CONNECTION |
++					 USB_PORT_STAT_ENABLE |
++					 USB_PORT_STAT_LOW_SPEED);
++	uh->hcd_port_status |= USB_PORT_STAT_C_CONNECTION << 16;
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-fault ep0-failures=%u last-ret=%d pid=0x%02x rx-len=%u",
++		  uh->hcd_ep0_failures, ret, uh->last_rx_pid,
++		  uh->last_rx_len);
++	dev_warn(uh->dev,
++		 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u; use fruitjam-usbhost hcd-clear-fault to retry\n",
++		 uh->hcd_ep0_failures, ret, uh->last_rx_pid,
++		 uh->last_rx_len);
++}
++
++static void fj_usbhost_hcd_note_urb_result(struct fruitjam_usbhost *uh,
++					   struct urb *urb, int ret)
++{
++	if (!usb_pipecontrol(urb->pipe))
++		return;
++	if (!ret) {
++		uh->hcd_ep0_failures = 0;
++		return;
++	}
++	if (ret == -EPIPE)
++		return;
++
++	if (uh->hcd_ep0_failures < FJ_USBHOST_HCD_EP0_FAULT_LIMIT)
++		uh->hcd_ep0_failures++;
++	if (uh->hcd_ep0_failures >= FJ_USBHOST_HCD_EP0_FAULT_LIMIT)
++		fj_usbhost_hcd_fault_locked(uh, ret);
+ }
+ 
+ static void fj_usbhost_hcd_hub_descriptor(struct usb_hub_descriptor *desc)
+@@ -4359,6 +4407,15 @@
+ 	u32 status = old & 0xffff0000;
+ 
+ 	fj_gpio_wire_pair_get(uh, &dp, &dm);
++	if (uh->hcd_faulted) {
++		if (power)
++			status |= USB_PORT_STAT_POWER;
++		if ((old ^ status) & USB_PORT_STAT_CONNECTION)
++			status |= USB_PORT_STAT_C_CONNECTION << 16;
++		uh->hcd_port_status = status;
++		return;
++	}
++
+ 	if (power)
+ 		status |= USB_PORT_STAT_POWER;
+ 	if (power && dp != dm) {
+@@ -4374,6 +4431,7 @@
+ static bool fj_usbhost_hcd_sof_active(struct fruitjam_usbhost *uh)
+ {
+ 	return uh->hcd_sof_enabled && uh->pio_configured &&
++	       !uh->hcd_faulted &&
+ 	       (uh->hcd_port_status & USB_PORT_STAT_POWER) &&
+ 	       (uh->hcd_port_status & USB_PORT_STAT_CONNECTION);
+ }
+@@ -4448,6 +4506,7 @@
+ 	hcd->uses_new_polling = 1;
+ 	mutex_lock(&uh->lock);
+ 	uh->hcd_sof_enabled = true;
++	fj_usbhost_hcd_clear_fault_locked(uh);
+ 	fj_usbhost_hcd_refresh_port(uh);
+ 	mutex_unlock(&uh->lock);
+ 	fj_usbhost_hcd_sof_start(uh);
+@@ -4733,6 +4792,11 @@
+ 		return ret;
+	mutex_lock(&uh->lock);
+-	ret = fj_usbhost_hcd_do_urb(uh, urb);
++	if (uh->hcd_faulted) {
++		ret = -ENODEV;
++	} else {
++		ret = fj_usbhost_hcd_do_urb(uh, urb);
++		fj_usbhost_hcd_note_urb_result(uh, urb, ret);
++	}
+	mutex_unlock(&uh->lock);
+	usb_hcd_unlink_urb_from_ep(hcd, urb);
+	usb_hcd_giveback_urb(hcd, urb, ret);
+@@ -5677,6 +5737,11 @@
+ 			 "bridge %s\n"
+ 			 "pio %u\n"
+ 			 "pio_ready %u\n"
++			 "hcd_registered %u\n"
++			 "hcd_faulted %u\n"
++			 "hcd_ep0_failures %u\n"
++			 "hcd_delay_ms %u\n"
++			 "hcd_sof %u\n"
+ 			 "pio_configured %u\n"
+ 			 "pio_program %s\n"
+ 			 "tx_sm %u\nrx_sm %u\neop_sm %u\n"
+@@ -5725,7 +5790,10 @@
+ 			 power, dp, dm, state, fj_usbhost_present(state),
+ 			 uh->pio_ready ? "pio-packet-io-program-loaded" :
+ 					 "pio-packet-io-pending",
+-			 uh->pio_index, uh->pio_ready, uh->pio_configured,
++			 uh->pio_index, uh->pio_ready,
++			 uh->hcd_registered ? 1 : 0, uh->hcd_faulted ? 1 : 0,
++			 uh->hcd_ep0_failures, uh->hcd_start_delay_ms,
++			 uh->hcd_sof_enabled ? 1 : 0, uh->pio_configured,
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+ 			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->clk_sys_hz,
+ 			 tx_clkdiv, rx_clkdiv, eop_clkdiv,
+@@ -5986,19 +6054,35 @@
+ 
+ 	mutex_lock(&uh->lock);
+ 	if (!strcmp(cmd, "on")) {
++		fj_usbhost_hcd_clear_fault_locked(uh);
++		if (uh->hcd_registered)
++			uh->hcd_sof_enabled = true;
+ 		fj_gpio_output(uh, uh->power_gpio, true);
+ 		if (uh->pio_ready)
+ 			ret = fj_usbhost_pio_configure_sms(uh);
+ 	} else if (!strcmp(cmd, "off")) {
++		fj_usbhost_hcd_clear_fault_locked(uh);
+ 		fj_usbhost_pio_release(uh);
+ 		fj_gpio_output(uh, uh->power_gpio, false);
+ 		fj_gpio_input(uh, uh->dp_gpio);
+ 		fj_gpio_input(uh, uh->dm_gpio);
++	} else if (!strcmp(cmd, "hcd-clear-fault")) {
++		fj_usbhost_hcd_clear_fault_locked(uh);
++		if (uh->hcd_registered)
++			uh->hcd_sof_enabled = true;
++		fj_usbhost_hcd_refresh_port(uh);
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "hcd-clear-fault");
+ 	} else if (!strncmp(cmd, "reset", 5) &&
+ 		   (cmd[5] == '\0' || cmd[5] == ' ' || cmd[5] == '\t')) {
+ 		ret = fj_usbhost_parse_reset_ms(cmd + 5, &reset_ms);
+-		if (!ret)
++		if (!ret) {
++			fj_usbhost_hcd_clear_fault_locked(uh);
++			if (uh->hcd_registered)
++				uh->hcd_sof_enabled = true;
+ 			fj_usbhost_reset_bus(uh, reset_ms);
++		}
+ 	} else if (!strcmp(cmd, "pio-init")) {
+ 		ret = fj_usbhost_pio_configure_sms(uh);
+ 	} else if (!strncmp(cmd, "clk-sys-hz", 10) &&
+-- 
+2.39.5

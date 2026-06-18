@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 02:05:00 +0000
+Subject: [PATCH] misc: pad Fruit Jam usbhost HCD ACK arm window
+
+The HCD setup and status-OUT paths stream two host packets through DMA, then
+use the CPU to arm the RX/EOP state machines after the first transmitted EOP.
+On Linux that CPU-side handoff can miss the second packet's EOP, leaving the
+RX gate stuck waiting for an IRQ that already passed before the device ACK
+window opens.
+
+Keep the packets in one DMA stream, but insert a small full-speed/low-speed
+idle pad between them only for this ACK-arming helper. That preserves a bounded
+token-to-data/status gap while giving the existing PIO gate enough time to arm
+before the second EOP. The manual packet probes remain unchanged.
+---
+ drivers/misc/fruitjam_usbhost.c | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -65,6 +65,7 @@
+ #define FJ_USBHOST_SETUP_GAP_MAX_BYTES 16u
+ #define FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE 0xffu
+ #define FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE 0x55u
++#define FJ_USBHOST_HCD_ACK_ARM_GAP_BYTES 16u
+ #define FJ_USBHOST_FRAME_RETRY_DEFAULT 8u
+ #define FJ_USBHOST_FRAME_RETRY_MAX 64u
+ #define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
+@@ -1579,81 +1579,93 @@ static int fj_usbhost_pio_tx_two_packets_dma_arm_rx_after_first_eop(
+ 	struct fruitjam_usbhost *uh, const u8 *packet_a, u8 packet_a_len,
+ 	const u8 *packet_b, u8 packet_b_len, u8 *encoded_len)
+ {
+ 	u8 encoded_a[FJ_USBHOST_TX_ENCODED_MAX];
+ 	u8 encoded_b[FJ_USBHOST_TX_ENCODED_MAX];
+ 	u8 encoded[FJ_USBHOST_TX_ENCODED_MAX];
+ 	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
+ 	u8 len_a;
+ 	u8 len_b;
++	u8 idle_byte;
+ 	u32 ch = uh->tx_dma_channel;
+ 	u32 ctrl;
+ 	u32 waited;
+ 	bool armed = false;
+ 	int ret = -ETIMEDOUT;
+ 
+ 	len_a = fj_usbhost_encode_tx(packet_a, packet_a_len, encoded_a);
+ 	len_b = fj_usbhost_encode_tx(packet_b, packet_b_len, encoded_b);
+ 	if (len_a > sizeof(encoded) || len_b > sizeof(encoded) ||
+-	    len_a + len_b > sizeof(encoded))
++	    len_a + FJ_USBHOST_HCD_ACK_ARM_GAP_BYTES + len_b >
++		    sizeof(encoded))
+ 		return -EOVERFLOW;
+ 	if (!uh->dma || !uh->pio_phys || ch > 15)
+ 		return -ENODEV;
+ 
++	/*
++	 * The RX/EOP gate is programmed from the CPU after packet A's EOP and
++	 * released by packet B's EOP. A short idle pad gives that MMIO handoff
++	 * time to complete without splitting the transaction into slow,
++	 * scheduler-visible sends.
++	 */
++	idle_byte = uh->low_speed ? FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE :
++				    FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE;
+ 	memcpy(encoded, encoded_a, len_a);
+-	memcpy(encoded + len_a, encoded_b, len_b);
+-	*encoded_len = len_a + len_b;
++	memset(encoded + len_a, idle_byte, FJ_USBHOST_HCD_ACK_ARM_GAP_BYTES);
++	memcpy(encoded + len_a + FJ_USBHOST_HCD_ACK_ARM_GAP_BYTES, encoded_b,
++	       len_b);
++	*encoded_len = len_a + FJ_USBHOST_HCD_ACK_ARM_GAP_BYTES + len_b;
+ 
+ 	fj_usbhost_dma_abort(uh);
+ 	memcpy(uh->tx_dma_buf, encoded, *encoded_len);
+ 	wmb();
+ 
+ 	ctrl = FJ_DMA_CTRL_TREQ(fj_usbhost_pio_tx_dreq(uh)) |
+ 	       FJ_DMA_CTRL_CHAIN_TO(ch) |
+ 	       FJ_DMA_CTRL_INCR_READ |
+ 	       FJ_DMA_CTRL_SIZE_BYTE |
+ 	       FJ_DMA_CTRL_HIGH_PRIORITY |
+ 	       FJ_DMA_CTRL_IRQ_QUIET |
+ 	       FJ_DMA_CTRL_EN;
+ 
+ 	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
+ 	writel(FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx), uh->pio + FJ_PIO_FDEBUG);
+ 	writel((u32)virt_to_phys(uh->tx_dma_buf),
+ 	       uh->dma + FJ_DMA_CH_READ_ADDR(ch));
+ 	writel((u32)(uh->pio_phys + FJ_PIO_TXF(uh->sm_tx)),
+ 	       uh->dma + FJ_DMA_CH_WRITE_ADDR(ch));
+ 	writel(*encoded_len, uh->dma + FJ_DMA_CH_TRANS_COUNT(ch));
+ 	writel(FJ_PIO_TX_START_INSTR, tx_sm + FJ_PIO_SM_INSTR);
+ 	writel(ctrl, uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
+ 
+ 	for (waited = 0; waited < FJ_USBHOST_TX_TIMEOUT_US; waited++) {
+ 		if (!armed && (readl(uh->pio + FJ_PIO_IRQ) & FJ_PIO_IRQ_TX_EOP)) {
+ 			writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
+ 			fj_usbhost_pio_prepare_receive_after_tx(uh);
+ 			armed = true;
+ 		}
+ 		if (!(readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch)) &
+ 		      FJ_DMA_CTRL_BUSY) &&
+ 		    fj_usbhost_pio_dma_tx_idle(uh, tx_sm)) {
+ 			ret = armed ? 0 : -ENODATA;
+ 			break;
+ 		}
+ 		udelay(1);
+ 	}
+ 
+ 	for (waited = 0; waited < FJ_USBHOST_DMA_TIMEOUT_US; waited++) {
+ 		if (!(readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch)) &
+ 		      FJ_DMA_CTRL_BUSY))
+ 			break;
+ 		udelay(1);
+ 	}
+ 
+ 	uh->last_dma_ctrl = readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
+ 	if (uh->last_dma_ctrl & (FJ_DMA_CTRL_AHB_ERROR |
+ 				 FJ_DMA_CTRL_READ_ERROR |
+ 				 FJ_DMA_CTRL_WRITE_ERROR))
+ 		ret = ret ?: -EIO;
+ 	uh->last_dma_result = ret;
+ 	if (!ret)
+ 		uh->tx_dma_packets++;
+ 	return ret;
+ }
+-- 
+2.39.5

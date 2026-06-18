@@ -8,18 +8,19 @@ standard restart2 command string "bootsel". Linux sets up the RP2350
 bootrom watchdog vector used by rom_reboot(REBOOT_TYPE_BOOTSEL), then
 resets through the watchdog.
 ---
- arch/riscv/kernel/reset.c | 90 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 90 insertions(+)
+ arch/riscv/kernel/reset.c | 114 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 114 insertions(+)
 
 diff --git a/arch/riscv/kernel/reset.c b/arch/riscv/kernel/reset.c
 index f927fcefe6b0..0c340cf444a2 100644
 --- a/arch/riscv/kernel/reset.c
 +++ b/arch/riscv/kernel/reset.c
-@@ -4,7 +4,95 @@
+@@ -4,7 +4,119 @@
   */
  
  #include <linux/reboot.h>
 +#include <linux/io.h>
++#include <linux/init.h>
 +#include <linux/string.h>
  #include <linux/pm.h>
 +
@@ -45,7 +46,8 @@ index f927fcefe6b0..0c340cf444a2 100644
 +
 +#define RP2350_PSM_WDSEL		0x08
 +#define RP2350_PSM_WDSEL_BITS		0x01ffffff
-+#define RP2350_PSM_WDSEL_PROC_COLD	BIT(0)
++#define RP2350_PSM_WDSEL_XOSC		BIT(3)
++#define RP2350_PSM_WDSEL_ROSC		BIT(2)
 +#define RP2350_SYSCFG_AUXCTRL		0x14
 +#define RP2350_SYSCFG_AUXCTRL_CLK		BIT(0)
 +#define RP2350_TICKS_WATCHDOG_CTRL	0x30
@@ -55,6 +57,7 @@ index f927fcefe6b0..0c340cf444a2 100644
 +#define RP2350_BOOTROM_VECTOR_MAGIC	0xb007c0d3
 +#define RP2350_BOOTROM_VECTOR_PC_MOD	0xfffffffe
 +#define RP2350_BOOTROM_BOOT_TYPE_BOOTSEL	2
++#define RP2350_BOOTLOADER_RESCUE_MAGIC	0x6ab73121
 +#define RP2350_BOOTSEL_FLAGS		0
 +#define RP2350_BOOTSEL_GPIO_CONFIG	0
 +#define RP2350_WATCHDOG_DELAY_US	10000
@@ -77,7 +80,8 @@ index f927fcefe6b0..0c340cf444a2 100644
 +	 * BOOTSEL parameters before any flash bootloader is entered.
 +	 */
 +	writel(0, watchdog + RP2350_WATCHDOG_CTRL);
-+	writel(RP2350_PSM_WDSEL_BITS & ~RP2350_PSM_WDSEL_PROC_COLD,
++	writel(RP2350_PSM_WDSEL_BITS &
++	       ~(RP2350_PSM_WDSEL_ROSC | RP2350_PSM_WDSEL_XOSC),
 +	       psm + RP2350_PSM_WDSEL);
 +	writel(RP2350_BOOTSEL_FLAGS, watchdog + RP2350_WATCHDOG_SCRATCH2);
 +	writel(RP2350_BOOTSEL_GPIO_CONFIG, watchdog + RP2350_WATCHDOG_SCRATCH3);
@@ -103,6 +107,26 @@ index f927fcefe6b0..0c340cf444a2 100644
 +	while (1)
 +		;
 +}
++
++static int __init rp2350_disarm_rescue_watchdog(void)
++{
++	void __iomem *watchdog;
++
++	watchdog = ioremap(RP2350_WATCHDOG_PHYS, RP2350_WATCHDOG_MMIO_SIZE);
++	if (!watchdog)
++		return 0;
++
++	if (readl(watchdog + RP2350_WATCHDOG_SCRATCH4) ==
++	    RP2350_BOOTLOADER_RESCUE_MAGIC) {
++		writel(0, watchdog + RP2350_WATCHDOG_CTRL);
++		writel(0, watchdog + RP2350_WATCHDOG_SCRATCH4);
++	}
++
++	iounmap(watchdog);
++	return 0;
++}
++early_initcall(rp2350_disarm_rescue_watchdog);
++
 +#else
 +static inline void rp2350_restart_bootsel(void)
 +{
@@ -111,7 +135,7 @@ index f927fcefe6b0..0c340cf444a2 100644
  
  static void default_power_off(void)
  {
-@@ -17,6 +105,8 @@
+@@ -17,6 +129,8 @@
  
  void machine_restart(char *cmd)
  {

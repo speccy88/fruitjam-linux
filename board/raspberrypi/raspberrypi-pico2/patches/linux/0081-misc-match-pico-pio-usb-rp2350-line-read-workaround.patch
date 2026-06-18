@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 22:55:00 -0400
+Subject: [PATCH] misc: match Pico-PIO-USB RP2350 line-read workaround
+
+Pico-PIO-USB toggles D+/D- pad input-enable before sampling line state on
+early RP2350 silicon. Keep the Fruit Jam bridge's line-state reads aligned
+with that known-working implementation by sampling D+/D- as a pair and
+pulsing IE before the SIO read.
+
+This keeps the diagnostic bridge behavior unchanged except for the line-state
+sample path used by status and low-speed detection.
+---
+ drivers/misc/fruitjam_usbhost.c | 39 +++++++++++++++++++++++++++++----
+ 1 file changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -406,11 +406,42 @@ static bool fj_gpio_in_get(struct fruitjam_usbhost *uh, unsigned int gpio)
+ 	return !!(value & fj_gpio_mask(gpio));
+ }
+ 
+-static bool fj_gpio_wire_get(struct fruitjam_usbhost *uh, unsigned int gpio)
++static void fj_gpio_pad_input_enable(struct fruitjam_usbhost *uh,
++				     unsigned int gpio, bool enable)
+ {
+-	bool value = fj_gpio_in_get(uh, gpio);
++	u32 value;
+ 
+-	return uh->pio_configured ? !value : value;
++	if (!uh->pads_bank0 || gpio > 31)
++		return;
++
++	value = readl(uh->pads_bank0 + FJ_PADS_GPIO(gpio));
++	if (enable)
++		value |= FJ_PADS_IE;
++	else
++		value &= ~FJ_PADS_IE;
++	writel(value, uh->pads_bank0 + FJ_PADS_GPIO(gpio));
++}
++
++static void fj_gpio_wire_pair_get(struct fruitjam_usbhost *uh,
++				  bool *dp, bool *dm)
++{
++	/*
++	 * Pico-PIO-USB works around early RP2350 line-read leakage by briefly
++	 * disabling pad input-enable before sampling. Use the same sequence
++	 * for bridge status and speed detection.
++	 */
++	fj_gpio_pad_input_enable(uh, uh->dp_gpio, false);
++	fj_gpio_pad_input_enable(uh, uh->dm_gpio, false);
++	ndelay(32);
++	fj_gpio_pad_input_enable(uh, uh->dp_gpio, true);
++	fj_gpio_pad_input_enable(uh, uh->dm_gpio, true);
++
++	*dp = fj_gpio_in_get(uh, uh->dp_gpio);
++	*dm = fj_gpio_in_get(uh, uh->dm_gpio);
++	if (uh->pio_configured) {
++		*dp = !*dp;
++		*dm = !*dm;
++	}
+ }
+ 
+ static bool fj_gpio_out_get(struct fruitjam_usbhost *uh, unsigned int gpio)
+@@ -423,9 +454,9 @@ static bool fj_gpio_out_get(struct fruitjam_usbhost *uh, unsigned int gpio)
+ static bool fj_usbhost_low_speed_line(struct fruitjam_usbhost *uh)
+ {
+ 	bool power = fj_gpio_out_get(uh, uh->power_gpio);
+-	bool dp = fj_gpio_wire_get(uh, uh->dp_gpio);
+-	bool dm = fj_gpio_wire_get(uh, uh->dm_gpio);
++	bool dp, dm;
+ 
++	fj_gpio_wire_pair_get(uh, &dp, &dm);
+ 	return power && !dp && dm;
+ }
+ 
+@@ -4021,9 +4052,8 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 				    char *buf, size_t len)
+ {
+ 	bool power = fj_gpio_out_get(uh, uh->power_gpio);
+-	bool dp = fj_gpio_wire_get(uh, uh->dp_gpio);
+-	bool dm = fj_gpio_wire_get(uh, uh->dm_gpio);
+-	const char *state = fj_usbhost_state(power, dp, dm);
++	bool dp, dm;
++	const char *state;
+ 	char rx_hex[FJ_USBHOST_RX_BYTES_MAX * 2 + 1];
+ 	static const char hex[] = "0123456789abcdef";
+ 	void __iomem *tx_sm = uh->pio ? fj_usbhost_pio_sm(uh, uh->sm_tx) : NULL;
+@@ -4053,6 +4083,8 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh,
+ 		     readl(uh->pads_bank0 + FJ_PADS_GPIO(uh->dm_gpio)) : 0;
+ 	u32 i;
+ 
++	fj_gpio_wire_pair_get(uh, &dp, &dm);
++	state = fj_usbhost_state(power, dp, dm);
+ 	for (i = 0; i < uh->last_rx_len && i < FJ_USBHOST_RX_BYTES_MAX; i++) {
+ 		rx_hex[i * 2] = hex[uh->last_rx_bytes[i] >> 4];
+ 		rx_hex[i * 2 + 1] = hex[uh->last_rx_bytes[i] & 0xf];
+-- 
+2.39.5

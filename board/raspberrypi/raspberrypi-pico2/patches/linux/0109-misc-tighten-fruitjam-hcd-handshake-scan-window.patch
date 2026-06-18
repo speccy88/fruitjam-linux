@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000109 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Thu, 18 Jun 2026 12:10:00 +0000
+Subject: [PATCH] misc: tighten Fruit Jam HCD handshake scan window
+
+The 0108 passive scan image still fails CH334F EP0 enumeration, and focused
+probes show the useful distinction: local PIO loopback decodes correctly, while
+external control requests either time out or collect shifted host SETUP/DATA0
+echoes instead of a device handshake.
+
+Pico-PIO-USB's host helper does not scan for milliseconds after a transaction.
+It requires RX_START within the USB handshake window, then drains only the short
+handshake packet window. Match that timing for the HCD setup handshake scanner
+while keeping its one-bit-shifted ACK/NAK/STALL tolerance. This prevents the HCD
+from treating late reflected host bytes as meaningful control-transfer replies.
+
+Signed-off-by: Codex <codex@local>
+---
+ drivers/misc/fruitjam_usbhost.c | 63 +++++++++++++++++++++++++--------
+ 1 file changed, 47 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -84,6 +84,9 @@
+ #define FJ_USBHOST_FRAME_RETRY_DEFAULT 8u
+ #define FJ_USBHOST_FRAME_RETRY_MAX 64u
+ #define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
++#define FJ_USBHOST_HCD_HANDSHAKE_START_FS_US 3u
++#define FJ_USBHOST_HCD_HANDSHAKE_START_LS_US 12u
++#define FJ_USBHOST_HCD_HANDSHAKE_PACKET_US 7u
+ #define FJ_USBHOST_HANDSHAKE_SCAN_QUIET_US 80u
+ #define FJ_USBHOST_SHIFTED_SYNC		0x01u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+@@ -3140,44 +3143,73 @@ static int fj_usbhost_pio_wait_handshake_scan(struct fruitjam_usbhost *uh,
+ 					      bool accept_shifted)
+ {
+ 	u32 waited;
+-	u32 quiet = 0;
++	u32 start_timeout = uh->low_speed ?
++			    FJ_USBHOST_HCD_HANDSHAKE_START_LS_US :
++			    FJ_USBHOST_HCD_HANDSHAKE_START_FS_US;
+ 	u32 len = 0;
+ 	u8 pid = 0;
+ 	bool shifted = false;
+ 	int ret = -ETIMEDOUT;
+ 
+ 	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
+-	for (waited = 0; waited < FJ_USBHOST_RX_TIMEOUT_US; waited++) {
++	for (waited = 0; waited < start_timeout; waited++) {
++		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
++
++		if (irq & FJ_PIO_IRQ_RX_START)
++			break;
++		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
++			ret = -EILSEQ;
++			goto out;
++		}
++		udelay(1);
++	}
++	if (waited >= start_timeout)
++		goto out;
++
++	for (waited = 0; waited < FJ_USBHOST_HCD_HANDSHAKE_PACKET_US;) {
+ 		u32 before = len;
+ 		u32 irq;
++		int drain_ret;
+ 
+ 		ret = fj_usbhost_pio_capture_drain(uh, &len);
+-		if (ret)
+-			break;
++		drain_ret = ret;
++		if (drain_ret)
++			goto out;
++		ret = -ETIMEDOUT;
+ 		if (fj_usbhost_pio_find_handshake(uh, len, accept_shifted,
+ 						  &pid, &shifted)) {
+ 			ret = 0;
+-			break;
++			goto out;
+ 		}
+ 
+ 		irq = readl(uh->pio + FJ_PIO_IRQ);
+-		if (len != before || (irq & (FJ_PIO_IRQ_RX_EOP |
+-					     FJ_PIO_IRQ_RX_START |
+-					     FJ_PIO_IRQ_DECODER_TRIGGER))) {
+-			quiet = 0;
+-		} else if (len) {
+-			quiet++;
++		if (irq & FJ_PIO_IRQ_RX_BS_ERR) {
++			ret = -EILSEQ;
++			goto out;
+ 		}
+-		if (len && quiet >= FJ_USBHOST_HANDSHAKE_SCAN_QUIET_US) {
+-			ret = -EPROTO;
+-			break;
++		if (irq & FJ_PIO_IRQ_RX_EOP) {
++			ret = fj_usbhost_pio_capture_drain(uh, &len);
++			if (!ret &&
++			    !fj_usbhost_pio_find_handshake(uh, len,
++							   accept_shifted,
++							   &pid, &shifted))
++				ret = -EPROTO;
++			goto out;
++		}
++		if (len != before) {
++			waited = 0;
++		} else {
++			waited++;
++			udelay(1);
+ 		}
+-		udelay(1);
++		if (waited >= FJ_USBHOST_HCD_HANDSHAKE_PACKET_US && len)
++			ret = -EPROTO;
+ 	}
+ 
++out:
+ 	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+ 	fj_usbhost_pio_record_rx(uh, ret, len);
+ 	if (!ret)
+ 		uh->last_rx_pid = pid;
+ 	return ret;
+ }
+-- 
+2.39.5

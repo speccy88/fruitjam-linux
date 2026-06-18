@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 08:05:00 -0400
+Subject: [PATCH] misc: size Fruit Jam usbhost TX buffer for XInput
+
+wili8jam's known-working Fruit Jam USB host configuration enables 64-byte HID
+and XInput endpoint buffers.  The Linux PIO bridge already captures 64-byte IN
+packets, and the HCD can now submit interrupt/bulk/control OUT transfers, but
+its encoded TX buffer was still sized for early setup and boot-keyboard probes.
+
+A full-speed 64-byte OUT payload is encoded as sync + PID + 64 payload bytes +
+CRC16: 68 raw bytes.  In the worst case, USB bit stuffing adds one bit after
+each six consecutive one bits, and the PIO encoding stores four two-bit bus
+symbols per byte.  That needs fewer than 160 encoded bytes after EOP and
+alignment, so use a 192-byte buffer.  This avoids truncating or overflowing
+XInput/HID OUT reports such as the Xbox 360 wireless receiver init packets once
+enumeration reaches those endpoints.
+---
+ drivers/misc/fruitjam_usbhost.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -59,6 +59,10 @@
+ #define FJ_USBHOST_HCD_IN_NAK_ATTEMPTS 16u
+ #define FJ_USBHOST_HCD_IDLE_SLEEP_MS	20u
+-#define FJ_USBHOST_TX_ENCODED_MAX	96u
++/*
++ * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
++ * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
++ */
++#define FJ_USBHOST_TX_ENCODED_MAX	192u
+ #define FJ_USBHOST_RX_BYTES_MAX		72u
+ #define FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT 2u
+ #define FJ_USBHOST_PROBE_SUMMARY_MAX	512u
+-- 
+2.39.5

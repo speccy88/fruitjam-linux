@@ -14,16 +14,18 @@ first descriptor packet.  If it still times out, the next bug is earlier than
 the ACK receive window: packet polarity, reset/speed setup, or token/data
 acceptance.
 ---
- drivers/misc/fruitjam_usbhost.c | 69 ++++++++++++++++++++++++++++++++
- 1 file changed, 69 insertions(+)
+ drivers/misc/fruitjam_usbhost.c | 71 +++++++++++++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
 
 diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
 --- a/drivers/misc/fruitjam_usbhost.c
 +++ b/drivers/misc/fruitjam_usbhost.c
-@@ -2297,6 +2297,64 @@ static int fj_usbhost_pio_get_device8_combo(struct fruitjam_usbhost *uh)
+@@ -2297,6 +2297,66 @@ static int fj_usbhost_pio_get_device8_combo(struct fruitjam_usbhost *uh)
  	return ret;
  }
  
++static int fj_usbhost_pio_sof_burst(struct fruitjam_usbhost *uh, u32 frames);
++
 +static int fj_usbhost_pio_get_device8_combo_skipack(struct fruitjam_usbhost *uh)
 +{
 +	static const u8 get_device8_setup[8] = {

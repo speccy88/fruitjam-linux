@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000078 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 00:00:00 +0000
+Subject: [PATCH] misc: clear fruitjam usbhost TX IRQ after wait
+
+The PIO USB TX helper intentionally leaves TX-EOP latched until
+fj_usbhost_pio_wait_tx_complete() can observe short packets that may finish
+before the CPU reaches the wait loop.  Once the helper has observed completion,
+clear the TX-EOP bit before returning so the PIO IRQ line does not remain
+asserted after a userspace diagnostic command.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ drivers/misc/fruitjam_usbhost.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1019,6 +1019,12 @@ static bool fj_usbhost_pio_dma_tx_idle(struct fruitjam_usbhost *uh,
+ 	       (fdebug & FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx));
+ }
+ 
++static int fj_usbhost_pio_tx_complete_return(struct fruitjam_usbhost *uh)
++{
++	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++	return 0;
++}
++
+ static bool fj_usbhost_pio_tx_comp_done(struct fruitjam_usbhost *uh, u32 addr)
+ {
+ 	return uh->low_speed ? addr > FJ_USB_TX_ENCODED_COMP :
+@@ -1042,10 +1048,11 @@ static int fj_usbhost_pio_wait_tx_complete(struct fruitjam_usbhost *uh)
+ 					break;
+ 				udelay(1);
+ 			}
+-			return 0;
++			return fj_usbhost_pio_tx_complete_return(uh);
+ 		}
++
+ 		if (fj_usbhost_pio_dma_tx_idle(uh, tx_sm))
+-			return 0;
++			return fj_usbhost_pio_tx_complete_return(uh);
+ 
+ 		udelay(1);
+ 	}
+-- 
+2.39.5

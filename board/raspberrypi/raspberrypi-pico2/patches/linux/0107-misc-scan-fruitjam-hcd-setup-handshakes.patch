@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000107 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 15:30:00 +0000
+Subject: [PATCH] misc: scan Fruit Jam HCD setup handshakes
+
+Fruit Jam hardware still reaches the CH334F hub EP0 setup stage with a healthy
+local PIO RX path, but the normal receive helper either times out with no bytes
+or captures reflected host traffic such as a shifted SETUP token. That makes it
+too easy to miss a real hub ACK that arrives after the reflected packet, and it
+also prevents testing the Pico-PIO-USB issue-97 workaround class where the first
+RX handshake can be shifted by one bit.
+
+Add a bounded handshake scanner for HCD control handshakes. It drains the RX
+FIFO for the existing receive timeout, clears transient RX IRQs while scanning,
+ignores non-handshake bytes, and succeeds only when it finds ACK/NAK/STALL in
+the byte stream. For the setup handshake only, it also accepts the known
+one-bit-shifted two-byte form of those handshake PIDs. This keeps the normal
+control flow intact while letting the HCD progress if the only missing piece is
+the first shifted ACK.
+---
+ drivers/misc/fruitjam_usbhost.c | 122 +++++++++++++++++++++++++++++++---------
+ 1 file changed, 97 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -84,6 +84,8 @@
+ #define FJ_USBHOST_FRAME_RETRY_DEFAULT 8u
+ #define FJ_USBHOST_FRAME_RETRY_MAX 64u
+ #define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
++#define FJ_USBHOST_HANDSHAKE_SCAN_QUIET_US 80u
++#define FJ_USBHOST_SHIFTED_SYNC		0x01u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_EP	1u
+@@ -3079,11 +3081,110 @@ static bool fj_usbhost_rx_has_pid(struct fruitjam_usbhost *uh, u8 pid)
+ 
+ 	for (i = 1; i < uh->last_rx_len; i++) {
+ 		if (uh->last_rx_bytes[i] == pid)
++			return true;
++	}
++	return false;
++}
++
++static bool fj_usbhost_pio_is_handshake_pid(u8 pid)
++{
++	return pid == FJ_USB_PID_ACK || pid == FJ_USB_PID_NAK ||
++	       pid == FJ_USB_PID_STALL;
++}
++
++static u8 fj_usbhost_pio_shifted_pid(u8 pid)
++{
++	return (pid << 1) | 1u;
++}
++
++static bool fj_usbhost_pio_find_handshake(struct fruitjam_usbhost *uh,
++					  u32 len, bool accept_shifted,
++					  u8 *pid, bool *shifted)
++{
++	u32 i;
++
++	for (i = 0; i + 1 < len; i++) {
++		if (uh->last_rx_bytes[i] == FJ_USB_SYNC &&
++		    fj_usbhost_pio_is_handshake_pid(uh->last_rx_bytes[i + 1])) {
++			*pid = uh->last_rx_bytes[i + 1];
++			*shifted = false;
++			return true;
++		}
++
++		if (!accept_shifted ||
++		    uh->last_rx_bytes[i] != FJ_USBHOST_SHIFTED_SYNC)
++			continue;
++		if (uh->last_rx_bytes[i + 1] ==
++		    fj_usbhost_pio_shifted_pid(FJ_USB_PID_ACK)) {
++			*pid = FJ_USB_PID_ACK;
++			*shifted = true;
+ 			return true;
++		}
++		if (uh->last_rx_bytes[i + 1] ==
++		    fj_usbhost_pio_shifted_pid(FJ_USB_PID_NAK)) {
++			*pid = FJ_USB_PID_NAK;
++			*shifted = true;
++			return true;
++		}
++		if (uh->last_rx_bytes[i + 1] ==
++		    fj_usbhost_pio_shifted_pid(FJ_USB_PID_STALL)) {
++			*pid = FJ_USB_PID_STALL;
++			*shifted = true;
++			return true;
++		}
+ 	}
++
+ 	return false;
+ }
+ 
++static int fj_usbhost_pio_wait_handshake_scan(struct fruitjam_usbhost *uh,
++					      bool accept_shifted)
++{
++	u32 waited;
++	u32 quiet = 0;
++	u32 len = 0;
++	u8 pid = 0;
++	bool shifted = false;
++	int ret = -ETIMEDOUT;
++
++	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
++	for (waited = 0; waited < FJ_USBHOST_RX_TIMEOUT_US; waited++) {
++		u32 before = len;
++		u32 irq;
++
++		ret = fj_usbhost_pio_capture_drain(uh, &len);
++		if (ret)
++			break;
++		if (fj_usbhost_pio_find_handshake(uh, len, accept_shifted,
++						  &pid, &shifted)) {
++			ret = 0;
++			break;
++		}
++
++		irq = readl(uh->pio + FJ_PIO_IRQ);
++		if (irq & FJ_PIO_IRQ_RX_ALL)
++			writel(FJ_PIO_IRQ_RX_ALL, uh->pio + FJ_PIO_IRQ);
++		if (len != before || (irq & (FJ_PIO_IRQ_RX_EOP |
++					     FJ_PIO_IRQ_RX_START |
++					     FJ_PIO_IRQ_DECODER_TRIGGER))) {
++			quiet = 0;
++		} else if (len) {
++			quiet++;
++		}
++		if (len && quiet >= FJ_USBHOST_HANDSHAKE_SCAN_QUIET_US) {
++			ret = -EPROTO;
++			break;
++		}
++		udelay(1);
++	}
++
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_record_rx(uh, ret, len);
++	if (!ret)
++		uh->last_rx_pid = pid;
++	return ret;
++}
++
+ static int fj_usbhost_pio_get_device8_combo(struct fruitjam_usbhost *uh)
+ {
+ 	static const u8 get_device8_setup[8] = {
+@@ -3404,9 +3505,7 @@ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = upstream_mode ?
+-		      fj_usbhost_pio_wait_handshake_fast(uh) :
+-		      fj_usbhost_pio_receive_raw(uh, false);
++		ret = fj_usbhost_pio_wait_handshake_scan(uh, true);
+ 		if (!ret && uh->last_rx_pid != FJ_USB_PID_ACK) {
+ 			fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
+ 			ret = -EPROTO;
+@@ -3548,7 +3647,7 @@ static int fj_usbhost_pio_control_status_out(struct fruitjam_usbhost *uh,
+ 		return ret;
+ 
+ 	fj_usbhost_pio_start_receive(uh);
+-	ret = fj_usbhost_pio_wait_handshake_fast(uh);
++	ret = fj_usbhost_pio_wait_handshake_scan(uh, false);
+ 	if (ret)
+ 		return ret;
+ 	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
+@@ -3578,7 +3677,7 @@ static int fj_usbhost_pio_control_status_out_arm_gap(struct fruitjam_usbhost *uh
+ 	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+ 	if (ret)
+ 		return ret;
+-	ret = fj_usbhost_pio_receive_raw(uh, false);
++	ret = fj_usbhost_pio_wait_handshake_scan(uh, false);
+ 	if (ret)
+ 		return ret;
+ 	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
+@@ -3666,9 +3765,7 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = upstream_mode ?
+-		      fj_usbhost_pio_wait_handshake_fast(uh) :
+-		      fj_usbhost_pio_receive_raw(uh, false);
++		ret = fj_usbhost_pio_wait_handshake_scan(uh, true);
+ 		if (!ret && uh->last_rx_pid == FJ_USB_PID_ACK) {
+ 			setup_seen = true;
+ 		} else if (!ret) {
+@@ -3839,7 +3936,7 @@ static int fj_usbhost_hcd_control_data_out(struct fruitjam_usbhost *uh,
+ 				return ret;
+ 
+ 			fj_usbhost_pio_start_receive(uh);
+-			ret = fj_usbhost_pio_wait_handshake_fast(uh);
++			ret = fj_usbhost_pio_wait_handshake_scan(uh, false);
+ 			if (ret)
+ 				continue;
+ 			if (uh->last_rx_pid == FJ_USB_PID_ACK) {
+@@ -3974,9 +4071,7 @@ static int fj_usbhost_hcd_control_write(struct fruitjam_usbhost *uh,
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = upstream_mode ?
+-		      fj_usbhost_pio_wait_handshake_fast(uh) :
+-		      fj_usbhost_pio_receive_raw(uh, false);
++		ret = fj_usbhost_pio_wait_handshake_scan(uh, true);
+ 		if (!ret && uh->last_rx_pid != FJ_USB_PID_ACK) {
+ 			fj_usbhost_pio_record_rx(uh, -EPROTO,
+ 						 uh->last_rx_len);
+@@ -5214,7 +5309,7 @@ static int fj_usbhost_pio_hub_set_address_upstream(struct fruitjam_usbhost *uh,
+ 		return ret;
+ 
+ 	fj_usbhost_pio_start_receive(uh);
+-	ret = fj_usbhost_pio_wait_handshake_fast(uh);
++	ret = fj_usbhost_pio_wait_handshake_scan(uh, true);
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+ 		  "hub-set-address-upstream setup-handshake pid=0x%02x len=%u sof-frames=%u ret=%d",
+ 		  uh->last_rx_pid, uh->last_rx_len, sof_frames, ret);
+-- 
+2.39.5

@@ -7,7 +7,9 @@
 #include "helpers.h"
 #ifdef PICO_SDK
 #include <stdio.h>
+#include "hardware/clocks.h"
 #else
+#include "clocks.h"
 #include "stdio_local.h"
 #endif
 #include "linux/irqflags.h"
@@ -135,7 +137,7 @@ size_t setup_psram(void)
 	XIP_QMI_BASE[QMI_DIRECT_CSR] |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
 	uint8_t kgd = 0;
 	uint8_t eid = 0;
-	for (size_t i = 0; i < 7; i++) {
+	for (size_t i = 0; i < 12; i++) {
 		if (i == 0)
 			XIP_QMI_BASE[QMI_DIRECT_TX] = 0x9f;
 		else
@@ -167,15 +169,17 @@ size_t setup_psram(void)
 	// direct-mode operation
 	while ((XIP_QMI_BASE[QMI_DIRECT_CSR] & QMI_DIRECT_CSR_BUSY_BITS) != 0);
 
-	// RESETEN, RESET and quad enable
-	for (uint8_t i = 0; i < 3; i++) {
+	// RESETEN, RESET, quad enable and toggle wrap boundary.
+	for (uint8_t i = 0; i < 4; i++) {
 		XIP_QMI_BASE[QMI_DIRECT_CSR] |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
 		if (i == 0)
 			XIP_QMI_BASE[QMI_DIRECT_TX] = 0x66;
 		else if (i == 1)
 			XIP_QMI_BASE[QMI_DIRECT_TX] = 0x99;
-		else
+		else if (i == 2)
 			XIP_QMI_BASE[QMI_DIRECT_TX] = 0x35;
+		else
+			XIP_QMI_BASE[QMI_DIRECT_TX] = 0xc0;
 
 		while ((XIP_QMI_BASE[QMI_DIRECT_CSR] & QMI_DIRECT_CSR_BUSY_BITS) != 0);
 
@@ -188,14 +192,23 @@ size_t setup_psram(void)
 	// Disable direct csr.
 	XIP_QMI_BASE[QMI_DIRECT_CSR] &= ~(QMI_DIRECT_CSR_ASSERT_CS1N_BITS | QMI_DIRECT_CSR_EN_BITS);
 
+	// Keep PSRAM close to the same ~63MHz rate wili8jam uses at 252MHz.
+#ifdef PICO_SDK
+	uint32_t psram_clkdiv = (clock_get_hz(clk_sys) + 62999999u) / 63000000u;
+#else
+	uint32_t psram_clkdiv = (CLK_SYS + 62999999u) / 63000000u;
+#endif
+	if (psram_clkdiv < 2)
+		psram_clkdiv = 2;
+
 	XIP_QMI_BASE[QMI_M1_TIMING] =
 		QMI_M1_TIMING_PAGEBREAK_VALUE_1024 << QMI_M1_TIMING_PAGEBREAK_LSB | // Break between pages.
 		3 << QMI_M1_TIMING_SELECT_HOLD_LSB | // Delay releasing CS for 3 extra system cycles.
-		1 << QMI_M1_TIMING_COOLDOWN_LSB | 1 << QMI_M1_TIMING_RXDELAY_LSB |
-		16 << QMI_M1_TIMING_MAX_SELECT_LSB |  // In units of 64 system clock cycles. PSRAM says 8us max. 8 / 0.00752 /64
-											  // = 16.62
-		7 << QMI_M1_TIMING_MIN_DESELECT_LSB | // In units of system clock cycles. PSRAM says 50ns.50 / 7.52 = 6.64
-		2 << QMI_M1_TIMING_CLKDIV_LSB;
+		1 << QMI_M1_TIMING_COOLDOWN_LSB |
+		2 << QMI_M1_TIMING_RXDELAY_LSB |
+		29 << QMI_M1_TIMING_MAX_SELECT_LSB |
+		12 << QMI_M1_TIMING_MIN_DESELECT_LSB |
+		psram_clkdiv << QMI_M1_TIMING_CLKDIV_LSB;
 	XIP_QMI_BASE[QMI_M1_RFMT] = (QMI_M1_RFMT_PREFIX_WIDTH_VALUE_Q << QMI_M1_RFMT_PREFIX_WIDTH_LSB |
 						 QMI_M1_RFMT_ADDR_WIDTH_VALUE_Q << QMI_M1_RFMT_ADDR_WIDTH_LSB |
 						 QMI_M1_RFMT_SUFFIX_WIDTH_VALUE_Q << QMI_M1_RFMT_SUFFIX_WIDTH_LSB |
@@ -225,7 +238,7 @@ size_t setup_psram(void)
 		psram_size *= 4;
 
 	// Mark that we can write to PSRAM.
-	XIP_CTRL_BASE[XIP_CTRL_WRITABLE_M1_BITS] |= XIP_CTRL_WRITABLE_M1_BITS;
+	XIP_CTRL_BASE[XIP_CTRL_CTRL] |= XIP_CTRL_WRITABLE_M1_BITS;
 	//arch_local_irq_write(intr_stash);
 	printf("PSRAM ID: %x %x\n", kgd, eid);
 

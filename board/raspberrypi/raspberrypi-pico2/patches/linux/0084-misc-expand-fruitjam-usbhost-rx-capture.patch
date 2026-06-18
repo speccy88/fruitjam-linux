@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000084 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 00:55:00 -0400
+Subject: [PATCH] misc: expand Fruit Jam usbhost RX capture
+
+The Linux HCD path must be able to receive a complete full-speed data packet:
+sync, PID, up to 64 payload bytes, and the trailing CRC16.  Keep enough packet
+history for that full packet so enumeration and diagnostics do not truncate
+larger HID/XInput descriptor responses.
+---
+ drivers/misc/fruitjam_usbhost.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -60 +60 @@
+-#define FJ_USBHOST_RX_BYTES_MAX		32u
++#define FJ_USBHOST_RX_BYTES_MAX		72u
+-- 
+2.39.5

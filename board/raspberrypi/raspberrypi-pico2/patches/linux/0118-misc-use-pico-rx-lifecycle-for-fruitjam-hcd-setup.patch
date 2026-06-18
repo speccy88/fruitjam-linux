@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux Maintainers <fruitjam@example.com>
+Date: Thu, 18 Jun 2026 13:30:00 -0400
+Subject: [PATCH] misc: use Pico RX lifecycle for Fruit Jam HCD setup
+
+The wili8jam/Pico-PIO-USB host SETUP transaction path keeps the EOP state
+machine running and only resets/enables/disables the RX state machine around
+the handshake.  The Fruit Jam Linux bridge had grown broader receive cleanup
+that also stopped and restarted EOP, which is useful for some diagnostic gated
+probes but is not the closest match for the known-working upstream SETUP path.
+
+Add RX-only prepare/finish helpers for the Pico-style HCD SETUP handshake and
+use them on the upstream HCD SETUP attempt.  The arm-gap fallback path keeps
+its existing gated EOP handling for diagnostics.
+---
+ drivers/misc/fruitjam_usbhost.c | 34 ++++++++++++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 111111111111..222222222222 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -657,6 +657,23 @@ static void fj_usbhost_pio_prepare_receive(struct fruitjam_usbhost *uh)
+ 	fj_usbhost_pio_sm_enable(uh, uh->sm_eop);
+ }
+ 
++static void fj_usbhost_pio_prepare_receive_pico(struct fruitjam_usbhost *uh)
++{
++	void __iomem *rx_sm = fj_usbhost_pio_sm(uh, uh->sm_rx);
++
++	/*
++	 * Match Pico-PIO-USB pio_usb_bus_prepare_receive(): reset only the RX
++	 * state machine.  The EOP detector keeps running from root-port
++	 * configuration, avoiding an extra restart in the SETUP handshake window.
++	 */
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
++	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_rx);
++}
++
+ static void fj_usbhost_pio_clear_rx_irq(struct fruitjam_usbhost *uh)
+ {
+ 	u32 waited;
+@@ -692,6 +709,15 @@ static void fj_usbhost_pio_disable_receive(struct fruitjam_usbhost *uh)
+ static void fj_usbhost_pio_record_rx(struct fruitjam_usbhost *uh, int ret,
+ 				     u32 len);
+ 
++static void fj_usbhost_pio_finish_receive_pico(struct fruitjam_usbhost *uh,
++					       int ret, u32 len)
++{
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_record_rx(uh, ret, len);
++	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
++	fj_usbhost_pio_clear_rx_irq(uh);
++}
++
+ static void fj_usbhost_pio_finish_receive(struct fruitjam_usbhost *uh,
+ 					  int ret, u32 len)
+ {
+@@ -2124,9 +2150,9 @@ static int fj_usbhost_pio_send_setup_data0_upstream_addr(
+ 	/*
+ 	 * Match Pico-PIO-USB's host setup stage: prepare RX, send SETUP,
+ 	 * send DATA0, then clear RX IRQs and wait for the handshake.
+ 	 */
+-	fj_usbhost_pio_prepare_receive(uh);
++	fj_usbhost_pio_prepare_receive_pico(uh);
+ 	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_SETUP, addr, 0,
+ 					&token_len);
+ 	*encoded_len = token_len;
+ 	if (ret)
+@@ -3227,7 +3253,7 @@ static int fj_usbhost_pio_wait_handshake_pico(struct fruitjam_usbhost *uh)
+ 		ret = -EPROTO;
+ 
+ out:
+-	fj_usbhost_pio_finish_receive(uh, ret, len);
++	fj_usbhost_pio_finish_receive_pico(uh, ret, len);
+ 	return ret;
+ }
+ 
+-- 
+2.39.5

@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 13:45:00 +0000
+Subject: [PATCH] misc: drain Fruit Jam usbhost RX before data ACK
+
+RX_EOP can be observed before the final decoded bytes have reached the RX
+FIFO.  The DATA0/DATA1 ACK path was checking CRC immediately at EOP, before
+the quiet tail drain used by the non-ACK path, so packets with longer payloads
+could be rejected or ACKed based on a truncated buffer.
+
+Drain until the FIFO stays quiet first, then validate CRC and send ACK for
+DATA packets.  This keeps GET_DESCRIPTOR and HID interrupt report reads from
+failing on a receive-side race once the hub/device starts returning data.
+---
+ drivers/misc/fruitjam_usbhost.c | 42 +++++++++++++++++++++--------------------
+ 1 file changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1738,29 +1738,6 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data)
+ 			u32 drain_waited, quiet;
+ 
+ 			FJ_USBHOST_DRAIN_RX_FIFO();
+-			if (ack_data && len >= 2 &&
+-			    (uh->last_rx_bytes[1] == FJ_USB_PID_DATA0 ||
+-			     uh->last_rx_bytes[1] == FJ_USB_PID_DATA1)) {
+-				/*
+-				 * The ACK handshake belongs at RX-EOP time, not after the
+-				 * status/debug bookkeeping below.  The RX loop has drained
+-				 * bytes as they arrived, so the CRC can be checked before
+-				 * starting TX.
+-				 */
+-				if (!fj_usbhost_pio_rx_data_crc_ok(uh, len)) {
+-					ret = -EILSEQ;
+-					break;
+-				}
+-				ack_ret = fj_usbhost_pio_send_ack(uh);
+-				if (ack_ret) {
+-					ret = ack_ret;
+-					break;
+-				}
+-				ack_sent = true;
+-				ret = 0;
+-				break;
+-			}
+-
+ 			for (drain_waited = 0, quiet = 0;
+ 			     drain_waited < 50 && quiet < 8; drain_waited++) {
+ 				u32 before = len;
+@@ -1781,6 +1758,25 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data)
+ 				 */
+ 				writel(FJ_PIO_IRQ_RX_ALL, uh->pio + FJ_PIO_IRQ);
+ 				continue;
++			}
++			if (ack_data &&
++			    (uh->last_rx_bytes[1] == FJ_USB_PID_DATA0 ||
++			     uh->last_rx_bytes[1] == FJ_USB_PID_DATA1)) {
++				/*
++				 * The RX EOP IRQ can beat the decoder tail by a
++				 * few FIFO bytes. Validate and ACK only after the
++				 * bounded quiet drain has seen the complete packet.
++				 */
++				if (!fj_usbhost_pio_rx_data_crc_ok(uh, len)) {
++					ret = -EILSEQ;
++					break;
++				}
++				ack_ret = fj_usbhost_pio_send_ack(uh);
++				if (ack_ret) {
++					ret = ack_ret;
++					break;
++				}
++				ack_sent = true;
+ 			}
+ 			ret = len ? 0 : -ENODATA;
+ 			break;
+-- 
+2.39.5

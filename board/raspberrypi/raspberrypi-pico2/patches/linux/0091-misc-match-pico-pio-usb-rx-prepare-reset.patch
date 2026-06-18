@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000091 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 06:40:00 +0000
+Subject: [PATCH] misc: match Pico-PIO-USB RX prepare reset
+
+Pico-PIO-USB initializes the RX decoder OSR with `mov osr, !null` when the
+state machine is configured, then each receive prepare restarts RX, jumps the
+program counter back to the RX entry point, and executes only `set x, 0`.
+
+The Fruit Jam bridge also reloaded OSR before every external receive arm.  That
+worked for local self-RX probes, but hardware captures from the CH334F hub show
+shifted-looking four-byte responses (`015b0020` / `01ff0200`) where the setup
+ACK should be decoded as `80d2`.  Keep the one-time OSR initialization in state
+machine setup, and make the per-transaction reset sequence match the
+known-working Pico-PIO-USB engine more closely.
+---
+ drivers/misc/fruitjam_usbhost.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -602,7 +602,6 @@ static void fj_usbhost_pio_prepare_receive(struct fruitjam_usbhost *uh)
+ 	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
+ 	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+-	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_eop);
+ 	writel(FJ_PIO_EOP_INIT_INSTR, eop_sm + FJ_PIO_SM_INSTR);
+@@ -661,7 +660,6 @@ static void fj_usbhost_pio_prepare_receive_after_tx(struct fruitjam_usbhost *uh)
+ 
+ 	fj_usbhost_pio_sm_restart(uh, uh->sm_rx);
+ 	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+-	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	/*
+ 	 * Keep RX from decoding the host token.  The device's response starts
+-- 
+2.39.5

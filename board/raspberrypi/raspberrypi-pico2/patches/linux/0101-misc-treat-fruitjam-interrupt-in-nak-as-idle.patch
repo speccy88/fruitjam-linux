@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 05:10:00 -0400
+Subject: [PATCH] misc: treat Fruit Jam interrupt IN NAK as idle
+
+USB interrupt IN endpoints commonly NAK while they have no new report.  That is
+normal for HID keyboards and many gamepads: the host should poll again later,
+not complete the URB as an error.  wili8jam/TinyUSB leaves such transfers live
+and retries on later frames.
+
+This HCD is still synchronous, so approximate that behavior by retrying for the
+existing bounded frame window and then completing interrupt-IN polls that only
+saw NAK as a zero-length successful poll.  Keep bulk/control behavior unchanged;
+those paths still surface NAK exhaustion as `-EAGAIN`.
+---
+ drivers/misc/fruitjam_usbhost.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 333333333333..444444444444 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3854,7 +3854,8 @@
+ static int fj_usbhost_hcd_in(struct fruitjam_usbhost *uh,
+ 			     struct usb_device *udev, u8 addr, u8 ep,
+ 			     u8 *buf, u16 len, u16 maxpacket,
+-			     u32 *actual, const char *name)
++			     u32 *actual, const char *name,
++			     bool idle_nak_success)
+ {
+ 	u32 copied = 0;
+ 	int ret = 0;
+@@ -3923,6 +3924,15 @@
+ 			break;
+ 		}
+ 		if (!received) {
++			if (idle_nak_success && ret == -EAGAIN &&
++			    uh->last_rx_pid == FJ_USB_PID_NAK) {
++				*actual = copied;
++				scnprintf(uh->last_probe_summary,
++					  sizeof(uh->last_probe_summary),
++					  "%s in-idle-nak addr=%u ep=%u actual=%u",
++					  name, addr, ep, copied);
++				return 0;
++			}
+ 			scnprintf(uh->last_probe_summary,
+ 				  sizeof(uh->last_probe_summary),
+ 				  "%s in-fail addr=%u ep=%u copied=%u len=%u ret=%d pid=0x%02x rx-len=%u",
+@@ -4291,13 +4301,15 @@
+ 	} else if ((usb_pipeint(urb->pipe) || usb_pipebulk(urb->pipe)) &&
+ 		   usb_pipein(urb->pipe)) {
+ 		u16 maxpacket = usb_endpoint_maxp(&urb->ep->desc);
++		bool interrupt_in = usb_pipeint(urb->pipe);
+ 		const char *name = usb_pipeint(urb->pipe) ?
+ 				   "hcd-interrupt" : "hcd-bulk";
+ 
+ 		ret = fj_usbhost_hcd_in(uh, urb->dev, addr, ep,
+ 					 urb->transfer_buffer,
+ 					 urb->transfer_buffer_length,
+-					 maxpacket, &actual, name);
++					 maxpacket, &actual, name,
++					 interrupt_in);
+ 	} else if ((usb_pipeint(urb->pipe) || usb_pipebulk(urb->pipe)) &&
+ 		   usb_pipeout(urb->pipe)) {
+ 		u16 maxpacket = usb_endpoint_maxp(&urb->ep->desc);
+-- 
+2.39.5

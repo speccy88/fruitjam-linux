@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 19:25:00 -0400
+Subject: [PATCH] misc: send SOF between Fruit Jam usbhost control stages
+
+TinyUSB's PIO-USB host runs transfers from a 1 kHz frame timer, so the next
+control stage normally follows a real SOF rather than a silent sleep.  The
+Linux bridge's skip-ACK probes were waiting about one millisecond without
+sending SOF before the IN/status stage.
+
+Send one SOF frame between skip-ACK SETUP and the following control stage.  This
+keeps these probes closer to the working TinyUSB/Pico-PIO-USB enumeration
+timing.
+---
+ drivers/misc/fruitjam_usbhost.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -2784,8 +2784,9 @@ static int fj_usbhost_pio_get_device8_combo_skipack(struct fruitjam_usbhost *uh)
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+ 		  "combo-dma-skipack setup-tx-len=%u", encoded_len);
+ 
+-	usleep_range(FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US,
+-		     FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US + 100u);
++	ret = fj_usbhost_pio_sof_burst(uh, 1);
++	if (ret)
++		return ret;
+ 
+ 	fj_usbhost_pio_prepare_receive_after_tx(uh);
+ 	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, 0, 0, &encoded_len);
+@@ -3545,8 +3546,9 @@ static int fj_usbhost_pio_hub_set_address_skipack(struct fruitjam_usbhost *uh,
+ 		  "hub-set-address-skipack setup-tx-len=%u sof-frames=%u",
+ 		  encoded_len, sof_frames);
+ 
+-	usleep_range(FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US,
+-		     FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US + 100u);
++	ret = fj_usbhost_pio_sof_burst(uh, 1);
++	if (ret)
++		return ret;
+ 	ret = fj_usbhost_pio_control_status_in(uh, 0);
+ 	if (!ret)
+ 		scnprintf(uh->last_probe_summary,
+-- 
+2.39.5

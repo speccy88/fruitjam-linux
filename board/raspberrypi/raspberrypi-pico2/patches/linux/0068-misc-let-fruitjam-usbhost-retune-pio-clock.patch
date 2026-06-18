@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 16:20:00 -0400
+Subject: [PATCH] misc: let Fruit Jam usbhost retune PIO clock
+
+The USB host PIO bit timing depends on the RP2350 clk_sys value.  A local
+loopback decode can still pass if the assumed clock is wrong, because TX and RX
+share the same bad divisor, while a real USB hub will ignore off-speed packets.
+
+Add a tiny diagnostic command that changes the bridge's clk_sys_hz assumption
+and immediately reconfigures the PIO state machines.  This lets hardware tests
+try the board's possible clock rates without rebuilding and reflashing for each
+divider.
+---
+ drivers/misc/fruitjam_usbhost.c | 39 ++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 9840d51f7dcb..f82a25a4e5e8 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -45,6 +45,8 @@
+ #define FJ_USBHOST_SM_EOP_DEFAULT	2u
+ #define FJ_USBHOST_CLK_SYS_HZ_DEFAULT	144000000u
+ #define FJ_USBHOST_PIO_PROGRAM_WORDS	32u
++#define FJ_USBHOST_CLK_SYS_MIN_HZ	48000000u
++#define FJ_USBHOST_CLK_SYS_MAX_HZ	300000000u
+ #define FJ_USBHOST_PIO_PROGRAM_NAME	"pico-pio-usb-fs-host-32word"
+ #define FJ_USBHOST_TX_TIMEOUT_US	2000u
+ #define FJ_USBHOST_RX_TIMEOUT_US	2000u
+@@ -3578,6 +3580,41 @@ static int fj_usbhost_parse_reset_ms(char *text, u32 *reset_ms)
+ 	return 0;
+ }
+ 
++static int fj_usbhost_parse_clk_sys_hz(char *text, u32 *clk_sys_hz)
++{
++	char *arg;
++	unsigned long value;
++	int ret;
++
++	arg = strim(text);
++	if (!*arg)
++		return -EINVAL;
++
++	ret = kstrtoul(arg, 10, &value);
++	if (ret)
++		return ret;
++	if (value < FJ_USBHOST_CLK_SYS_MIN_HZ ||
++	    value > FJ_USBHOST_CLK_SYS_MAX_HZ)
++		return -EINVAL;
++
++	*clk_sys_hz = value;
++	return 0;
++}
++
++static int fj_usbhost_set_clk_sys_hz(struct fruitjam_usbhost *uh,
++				     u32 clk_sys_hz)
++{
++	int ret = 0;
++
++	uh->clk_sys_hz = clk_sys_hz;
++	if (uh->pio_ready)
++		ret = fj_usbhost_pio_configure_sms(uh);
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "clk-sys-hz=%u ret=%d", uh->clk_sys_hz, ret);
++
++	return ret;
++}
++
+ static int fj_usbhost_parse_u8_token(char **text, u8 min, u8 max, u8 *value)
+ {
+ 	char *arg = strsep(text, " \t");
+@@ -3687,6 +3724,11 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 			fj_usbhost_reset_bus(uh, reset_ms);
+ 	} else if (!strcmp(cmd, "pio-init")) {
+ 		ret = fj_usbhost_pio_configure_sms(uh);
++	} else if (!strncmp(cmd, "clk-sys-hz", 10) &&
++		   (cmd[10] == '\0' || cmd[10] == ' ' || cmd[10] == '\t')) {
++		ret = fj_usbhost_parse_clk_sys_hz(cmd + 10, &reset_ms);
++		if (!ret)
++			ret = fj_usbhost_set_clk_sys_hz(uh, reset_ms);
+ 	} else if (!strcmp(cmd, "tx-test")) {
+ 		ret = fj_usbhost_pio_tx_test(uh);
+ 	} else if (!strcmp(cmd, "self-rx")) {
+-- 
+2.39.5

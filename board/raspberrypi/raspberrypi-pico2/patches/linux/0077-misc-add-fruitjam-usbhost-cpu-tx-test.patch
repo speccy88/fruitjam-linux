@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 17:05:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost CPU TX test
+
+The CPU-fed self-RX probe still arms RX before transmit.  Add a CPU-fed
+TX-only SOF probe so hardware tests can verify whether active transmit returns
+cleanly before enabling receive-side PIO state machines.
+---
+ drivers/misc/fruitjam_usbhost.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 222222222222..333333333333 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -2321,6 +2321,37 @@ out_error:
+ 	return ret;
+ }
+ 
++static int fj_usbhost_pio_tx_test_cpu(struct fruitjam_usbhost *uh)
++{
++	u8 packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SOF, 0, 0 };
++	u16 frame = uh->packets & 0x7ff;
++	u16 token = frame;
++	u8 encoded_len = 0;
++	int ret;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		goto out_error;
++
++	packet[2] = token & 0xff;
++	packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
++		    ((token >> 8) & 0x7);
++
++	ret = fj_usbhost_pio_tx_packet_cpu(uh, packet, sizeof(packet),
++					    &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	return ret;
++
++out_error:
++	uh->last_tx_result = ret;
++	uh->last_tx_len = 0;
++	uh->tx_errors++;
++	uh->last_pio_fstat = uh->pio ? readl(uh->pio + FJ_PIO_FSTAT) : 0;
++	uh->last_pio_fdebug = uh->pio ? readl(uh->pio + FJ_PIO_FDEBUG) : 0;
++	uh->last_pio_irq = uh->pio ? readl(uh->pio + FJ_PIO_IRQ) : 0;
++	return ret;
++}
++
+ static int fj_usbhost_pio_in_token(struct fruitjam_usbhost *uh)
+ {
+ 	u8 encoded_len = 0;
+@@ -4187,6 +4220,8 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		ret = fj_usbhost_pio_self_rx(uh);
+ 	} else if (!strcmp(cmd, "self-rx-cpu")) {
+ 		ret = fj_usbhost_pio_self_rx_cpu(uh);
++	} else if (!strcmp(cmd, "tx-test-cpu")) {
++		ret = fj_usbhost_pio_tx_test_cpu(uh);
+ 	} else if (!strcmp(cmd, "sof-burst")) {
+ 		ret = fj_usbhost_pio_sof_burst(uh, FJ_USBHOST_SOF_BURST_FRAMES);
+ 	} else if (!strcmp(cmd, "in-token")) {
+-- 
+2.39.5

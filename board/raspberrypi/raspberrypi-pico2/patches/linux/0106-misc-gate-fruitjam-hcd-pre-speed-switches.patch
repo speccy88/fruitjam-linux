@@ -1,0 +1,70 @@
+From 5e2bb4432f403f50f019f6b6b0d4f2d9b3b4a106 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 00:00:00 +0000
+Subject: [PATCH] misc: gate Fruit Jam HCD PRE speed switches
+
+Pico-PIO-USB switches the PIO state machines off while restoring bus timing
+after a PRE transaction.  The Fruit Jam HCD PRE path already waits for TX to
+reach its idle stall point, but it still rewrites the TX program/clock and EOP
+clock while those state machines are enabled.
+
+Gate the PRE low-speed child switch and the full-speed restore with the same
+disable/retune/enable pattern used by the known-working wili8jam/Pico-PIO-USB
+path.  This keeps the Linux host controller from changing PIO timing while a
+state machine is actively running.
+---
+ drivers/misc/fruitjam_usbhost.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 42e4f0ff9f53..aad5b30f3bf1 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1576,17 +1576,26 @@ static int fj_usbhost_pio_wait_tx_stall(struct fruitjam_usbhost *uh)
+ static void fj_usbhost_pio_restore_full_speed(struct fruitjam_usbhost *uh)
+ {
+ 	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
++	void __iomem *rx_sm = fj_usbhost_pio_sm(uh, uh->sm_rx);
+ 	void __iomem *eop_sm = fj_usbhost_pio_sm(uh, uh->sm_eop);
+ 
+ 	if (!uh->pio_configured)
+ 		return;
+ 
++	fj_usbhost_pio_sm_disable(uh, uh->sm_tx);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_disable(uh, uh->sm_eop);
++
+ 	uh->hcd_need_pre = false;
+ 	uh->low_speed = false;
+ 	fj_usbhost_pio_load_tx_program(uh);
+ 	writel(fj_usbhost_clkdiv(uh, 48000000u), tx_sm + FJ_PIO_SM_CLKDIV);
++	writel(0x00010000u, rx_sm + FJ_PIO_SM_CLKDIV);
+ 	writel(fj_usbhost_clkdiv(uh, 96000000u), eop_sm + FJ_PIO_SM_CLKDIV);
+ 	writel(FJ_PIO_TX_INIT_INSTR, tx_sm + FJ_PIO_SM_INSTR);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_tx);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_rx);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_eop);
+ }
+ 
+ static int fj_usbhost_pio_send_pre(struct fruitjam_usbhost *uh)
+@@ -1625,9 +1633,17 @@ static int fj_usbhost_pio_send_pre(struct fruitjam_usbhost *uh)
+ 	udelay(4);
+ 	uh->hcd_need_pre = true;
+ 	uh->low_speed = true;
++
++	fj_usbhost_pio_sm_disable(uh, uh->sm_tx);
+ 	fj_usbhost_pio_load_tx_program(uh);
+ 	writel(fj_usbhost_clkdiv(uh, 6000000u), tx_sm + FJ_PIO_SM_CLKDIV);
+-	writel(fj_usbhost_clkdiv(uh, 12000000u), eop_sm + FJ_PIO_SM_CLKDIV);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_tx);
++
++	fj_usbhost_pio_sm_disable(uh, uh->sm_eop);
++	writel(fj_usbhost_clkdiv(uh, 12000000u),
++	       eop_sm + FJ_PIO_SM_CLKDIV);
++	fj_usbhost_pio_sm_enable(uh, uh->sm_eop);
++
+ 	return 0;
+ }
+ 
+-- 
+2.39.5

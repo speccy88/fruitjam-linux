@@ -135,12 +135,17 @@ Validated on hardware:
   runs, and regular user `.be` files directly under `/mnt/sd/berry`. Hardware
   actions use direct C/tiny-helper paths; Berry is only invoked by the Berry
   runner.
-* AirLift inbound telnet accepts a remote shell and echoed `TELNET_OK`.
+* AirLift inbound telnet accepts a remote shell and echoed `TELNET_OK`. AirLift
+  telnet sessions use a 60-second default idle timeout so a stale client does
+  not monopolize the single no-MMU shell bridge; a new connection can preempt a
+  stale idle session after 15 seconds.
 * Default AirLift startup is wrapped by `fruitjam-services airlift-monitor`,
   which reruns the inbound server if it exits after leaving ESP32-C6 TCP sockets
   open, removes stale monitor PID files, and treats a missing inbound heartbeat
-  for 60 seconds as a restart condition. Check `/tmp/airlift-start.log` for
-  probe/join and restart messages.
+  for 60 seconds as a restart condition. The inbound server also recycles
+  itself periodically and exits on listener accept failures so the monitor can
+  reopen NINA sockets. Check `/tmp/airlift-start.log` for probe/join and
+  restart messages.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps`/`netstat`, avoiding the no-MMU fragmentation regression
   that previously broke CGI after status checks.
@@ -209,8 +214,8 @@ Fruit Jam pin map in [docs/pinmap-fruitjam.md](docs/pinmap-fruitjam.md).
 | Telnet service | AirLift TCP/23; optional loopback TCP/23 | Supported | AirLift inbound shell and tiny `fruitjam-telnetd`/`fruitjam-shell`; telnet smoke tests pass. | Only one AirLift telnet session at a time. |
 | FTP service | AirLift TCP/21 plus passive data 2121+; optional loopback TCP/21 | Supported | AirLift passive FTP lists, uploads, and downloads files under `/mnt/sd`; FileZilla passive mode works. The optional loopback `fruitjam-ftpd` supports PASV/EPSV and PORT/EPRT, plus STOR/APPE/RETR/LIST/NLST/RNFR/RNTO/MKD/RMD/DELE. | Upload completion can be slow over the current NINA raw socket path. |
 | TFTP service | Optional loopback UDP/69 | Supported | BusyBox `tftpd` serves the TFTP area README when `fruitjam-services core` is started. | Not part of the default external AirLift service set. |
-| USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, and `/dev/fruitjam-usbhost` owns line state, bus-reset timing, PIO2 packet I/O, descriptor/HID decode diagnostics, parameterized `kbd-init`/`kbd-poll` boot-keyboard probes, bounded `kbd-find` target auto-scan, `kbd-text`/`kbd-events` polling loops, and `kbd-shell`/`kbd-auto-shell` for a tiny USB-keyboard-driven command loop. This is not a hub/composite/general USB stack. | Run `./scripts/cdc-smoke-test.py --usb-keyboard --usb-keyboard-require-input` on the current board, then decide whether to keep this as an explicit helper or integrate a broader console path. |
-| USB host 5V switch | GPIO11 | Partial | `fruitjamctl usb-power on/off` controls power enable. | Needs full USB host stack for devices. |
+| USB host data | GPIO1 D+, GPIO2 D- | Experimental | USB host 5V can be switched, `/dev/fruitjam-usbhost` owns line state, reset timing, and PIO packet diagnostics, and the Linux HCD is configured with the wili8jam PIO0/SM0/SM1/SM2/DMA9/252 MHz settings. The HCD now auto-registers after an 8 second boot service window, power-cycles host 5V before registration, waits 500 ms after port reset before EP0 enumeration for the CH334F hub, and schedules an automatic power-cycle recovery after repeated EP0 failures. `fruitjam-usbhost hcd-start` remains available as an idempotent retry path. Kernel config enables hub, HID, evdev/joydev, and xpad/Xbox support. | Flash the current image and prove Logitech receiver plus Xbox360 gamepad enumeration with `./scripts/usbhost-hcd-smoke.py`; live current-board proof is still required. |
+| USB host 5V switch | GPIO11 | Partial | `fruitjamctl usb-power on/off` controls power enable. | Keep power/reset behavior aligned with the Linux HCD path. |
 | DVI / HSTX output | GPIO12-GPIO19, `/dev/fruitjam-dvi` | Partial | Tiny RGB332 HSTX DVI misc driver plus `fruitjam-dvi` text/dashboard/helper command output; hardware commands were verified on the flashed image. | Full fbdev/console is not implemented. |
 | I2S data path | GPIO24 DIN, GPIO25 MCLK | Partial | Tiny generated-tone path exists for RTTTL and simple WAV tone tests. | Add complete streamed PCM driver/path. |
 | IR receiver | GPIO29 shared with LED | TODO | No decoder. | Decide conflict/ownership with red LED. |
@@ -655,6 +660,21 @@ UART, or telnet. They cover the features that have been brought up so far.
 
     This disconnects the running system and should make the RP2350 BOOTSEL volume
     appear on the host.
+
+    From the host, the repository helper can do the same recovery dance and then
+    flash the current UF2 once `picotool` sees BOOTSEL. It tries the AirLift HTTP
+    BOOTSEL action, the AirLift telnet shell, a DTR/RTS-disabled hardware UART
+    shell if one is available, and CDC recovery. On macOS, CDC recovery tries
+    both `/dev/cu.usbmodem*` and the matching `/dev/tty.usbmodem*` counterpart
+    unless `--no-tty-counterpart` is passed:
+
+    ```sh
+    FJ_HTTP_HOST=<board-ip> FJ_TELNET_HOST=<board-ip> \
+      ./scripts/fruitjam-recover-flash.py -v
+    ```
+
+    To force the hardware UART route, pass `--uart-port /dev/cu.usbserial-P97cvdxp`
+    or set `FJ_UART_PORT=/dev/cu.usbserial-P97cvdxp`.
 
 Build and flash:
 

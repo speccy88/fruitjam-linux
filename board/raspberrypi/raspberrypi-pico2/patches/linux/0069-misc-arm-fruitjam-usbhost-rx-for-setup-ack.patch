@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 00:00:00 -0400
+Subject: [PATCH] misc: arm fruitjam usbhost RX for SETUP ACK
+
+The Fruit Jam USB-A ports sit behind the onboard CH334F hub, so the first
+transaction that must work is the root hub SETUP/DATA0 handshake.  Sending
+SETUP and DATA0 as separate CPU-driven packets leaves too much timing jitter,
+while arming RX after the combined DMA transfer misses the ACK turnaround.
+
+Keep the SETUP token and DATA0 packet adjacent in one DMA transfer, but arm
+the gated RX path after the first host EOP.  The RX machines then wait for the
+second host EOP and are already listening when the hub should return ACK.
+Use this path for no-data control requests.
+---
+ drivers/misc/fruitjam_usbhost.c | 104 +++++++++++++++++++++++++++++---
+ 1 file changed, 94 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1503,6 +1503,89 @@ static int fj_usbhost_pio_tx_two_packets_dma(
+ 	return fj_usbhost_pio_wait_tx_stream_idle(uh);
+ }
+ 
++static int fj_usbhost_pio_tx_two_packets_dma_arm_rx_after_first_eop(
++	struct fruitjam_usbhost *uh, const u8 *packet_a, u8 packet_a_len,
++	const u8 *packet_b, u8 packet_b_len, u8 *encoded_len)
++{
++	u8 encoded_a[FJ_USBHOST_TX_ENCODED_MAX];
++	u8 encoded_b[FJ_USBHOST_TX_ENCODED_MAX];
++	u8 encoded[FJ_USBHOST_TX_ENCODED_MAX];
++	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
++	u8 len_a;
++	u8 len_b;
++	u32 ch = uh->tx_dma_channel;
++	u32 ctrl;
++	u32 waited;
++	bool armed = false;
++	int ret = -ETIMEDOUT;
++
++	len_a = fj_usbhost_encode_tx(packet_a, packet_a_len, encoded_a);
++	len_b = fj_usbhost_encode_tx(packet_b, packet_b_len, encoded_b);
++	if (len_a > sizeof(encoded) || len_b > sizeof(encoded) ||
++	    len_a + len_b > sizeof(encoded))
++		return -EOVERFLOW;
++	if (!uh->dma || !uh->pio_phys || ch > 15)
++		return -ENODEV;
++
++	memcpy(encoded, encoded_a, len_a);
++	memcpy(encoded + len_a, encoded_b, len_b);
++	*encoded_len = len_a + len_b;
++
++	fj_usbhost_dma_abort(uh);
++	memcpy(uh->tx_dma_buf, encoded, *encoded_len);
++	wmb();
++
++	ctrl = FJ_DMA_CTRL_TREQ(fj_usbhost_pio_tx_dreq(uh)) |
++	       FJ_DMA_CTRL_CHAIN_TO(ch) |
++	       FJ_DMA_CTRL_INCR_READ |
++	       FJ_DMA_CTRL_SIZE_BYTE |
++	       FJ_DMA_CTRL_HIGH_PRIORITY |
++	       FJ_DMA_CTRL_IRQ_QUIET |
++	       FJ_DMA_CTRL_EN;
++
++	writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++	writel(FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx), uh->pio + FJ_PIO_FDEBUG);
++	writel((u32)virt_to_phys(uh->tx_dma_buf),
++	       uh->dma + FJ_DMA_CH_READ_ADDR(ch));
++	writel((u32)(uh->pio_phys + FJ_PIO_TXF(uh->sm_tx)),
++	       uh->dma + FJ_DMA_CH_WRITE_ADDR(ch));
++	writel(*encoded_len, uh->dma + FJ_DMA_CH_TRANS_COUNT(ch));
++	writel(FJ_PIO_TX_START_INSTR, tx_sm + FJ_PIO_SM_INSTR);
++	writel(ctrl, uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++
++	for (waited = 0; waited < FJ_USBHOST_TX_TIMEOUT_US; waited++) {
++		if (!armed && (readl(uh->pio + FJ_PIO_IRQ) & FJ_PIO_IRQ_TX_EOP)) {
++			writel(FJ_PIO_IRQ_TX_EOP, uh->pio + FJ_PIO_IRQ);
++			fj_usbhost_pio_prepare_receive_after_tx(uh);
++			armed = true;
++		}
++		if (!(readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch)) &
++		      FJ_DMA_CTRL_BUSY) &&
++		    fj_usbhost_pio_dma_tx_idle(uh, tx_sm)) {
++			ret = armed ? 0 : -ENODATA;
++			break;
++		}
++		udelay(1);
++	}
++
++	for (waited = 0; waited < FJ_USBHOST_DMA_TIMEOUT_US; waited++) {
++		if (!(readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch)) &
++		      FJ_DMA_CTRL_BUSY))
++			break;
++		udelay(1);
++	}
++
++	uh->last_dma_ctrl = readl(uh->dma + FJ_DMA_CH_CTRL_TRIG(ch));
++	if (uh->last_dma_ctrl & (FJ_DMA_CTRL_AHB_ERROR |
++				 FJ_DMA_CTRL_READ_ERROR |
++				 FJ_DMA_CTRL_WRITE_ERROR))
++		ret = ret ?: -EIO;
++	uh->last_dma_result = ret;
++	if (!ret)
++		uh->tx_dma_packets++;
++	return ret;
++}
++
+ static int fj_usbhost_pio_send_token(struct fruitjam_usbhost *uh,
+ 				     u8 pid, u8 addr, u8 ep,
+ 				     u8 *encoded_len)
+@@ -1650,6 +1733,34 @@ static int fj_usbhost_pio_send_setup_data0_capture_dma_addr(
+ 		uh, encoded, *encoded_len, rx_len);
+ }
+ 
++static int fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
++	struct fruitjam_usbhost *uh, u8 addr, const u8 *payload, u8 payload_len,
++	u8 *encoded_len)
++{
++	u16 token = addr & 0x7f;
++	u8 setup_packet[4] = { FJ_USB_SYNC, FJ_USB_PID_SETUP, 0, 0 };
++	u8 data_packet[16];
++	u16 crc;
++
++	if (payload_len > 8)
++		return -EINVAL;
++
++	setup_packet[2] = token & 0xff;
++	setup_packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
++			  ((token >> 8) & 0x1f);
++
++	data_packet[0] = FJ_USB_SYNC;
++	data_packet[1] = FJ_USB_PID_DATA0;
++	memcpy(data_packet + 2, payload, payload_len);
++	crc = fj_usbhost_crc16_data(payload, payload_len);
++	data_packet[2 + payload_len] = crc & 0xff;
++	data_packet[3 + payload_len] = crc >> 8;
++
++	return fj_usbhost_pio_tx_two_packets_dma_arm_rx_after_first_eop(
++		uh, setup_packet, sizeof(setup_packet),
++		data_packet, payload_len + 4, encoded_len);
++}
++
+ static int fj_usbhost_pio_tx_two_packets_no_release(
+ 	struct fruitjam_usbhost *uh, const u8 *packet_a, u8 packet_a_len,
+ 	const u8 *packet_b, u8 packet_b_len, u8 *encoded_len)
+@@ -2638,17 +2755,25 @@ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 		goto out_error;
+ 
+ 	fj_usbhost_pio_disable_receive(uh);
+-	ret = fj_usbhost_pio_send_setup_data0_combo_dma_addr(
++	ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
+ 		uh, addr, setup, sizeof(setup), &encoded_len);
+ 	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+ 	if (ret)
+ 		return ret;
+ 
+	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+-		  "%s setup-dma-tx-len=%u", name, encoded_len);
+-
+-	usleep_range(FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US,
+-		     FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US + 100u);
++		  "%s setup-arm-ack tx-len=%u", name, encoded_len);
++
++	ret = fj_usbhost_pio_receive_raw(uh, false);
++	if (ret)
++		return ret;
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
++		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
++		return -EPROTO;
++	}
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "%s setup-ack-ok tx-len=%u", name, encoded_len);
+ 
+ 	ret = fj_usbhost_pio_control_status_in(uh, addr);
+ 	if (!ret)
+-- 
+2.39.5

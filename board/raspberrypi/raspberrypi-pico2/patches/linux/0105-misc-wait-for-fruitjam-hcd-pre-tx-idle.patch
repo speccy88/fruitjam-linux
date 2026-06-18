@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 11:45:00 -0400
+Subject: [PATCH] misc: wait for Fruit Jam HCD PRE TX idle
+
+Pico-PIO-USB's known-working PRE path waits for the TX state machine to reach
+its post-PRE stall/idle point before switching the transmitter and EOP timing to
+low speed.  The Fruit Jam HCD PRE path already waits for TX completion, but that
+can be satisfied from the TX-EOP/address-complete path before TXSTALL is
+observed.
+
+Add the same explicit TXSTALL wait before the low-speed child packet.  This
+keeps the hub-facing PRE sequence closer to wili8jam/Pico-PIO-USB and avoids
+starting a low-speed token while the PRE transmitter is still draining.
+---
+ drivers/misc/fruitjam_usbhost.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -1554,6 +1554,26 @@ static int fj_usbhost_pio_tx_packet_raw(struct fruitjam_usbhost *uh,
+ 	return fj_usbhost_pio_tx_packet(uh, packet, packet_len, encoded_len);
+ }
+ 
++static int fj_usbhost_pio_wait_tx_stall(struct fruitjam_usbhost *uh)
++{
++	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
++	u32 stall_mask = FJ_PIO_FDEBUG_TXSTALL(uh->sm_tx);
++	u32 waited;
++
++	writel(stall_mask, uh->pio + FJ_PIO_FDEBUG);
++	for (waited = 0; waited < FJ_USBHOST_FIFO_TIMEOUT_US; waited++) {
++		u32 tx_addr = readl(tx_sm + FJ_PIO_SM_ADDR) & 0x1f;
++		u32 fdebug = readl(uh->pio + FJ_PIO_FDEBUG);
++
++		if (tx_addr == FJ_PIO_TX_WRAP_TARGET &&
++		    (fdebug & stall_mask))
++			return 0;
++		udelay(1);
++	}
++
++	return -ETIMEDOUT;
++}
++
+ static void fj_usbhost_pio_restore_full_speed(struct fruitjam_usbhost *uh)
+ {
+ 	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
+@@ -1593,6 +1613,10 @@ static int fj_usbhost_pio_send_pre(struct fruitjam_usbhost *uh)
+ 		return ret;
+ 	}
+ 
++	ret = fj_usbhost_pio_wait_tx_stall(uh);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Match Pico-PIO-USB/wili8jam: PRE is full-speed, then the following
+ 	 * downstream child packet uses low-speed timing with full-speed idle
+-- 
+2.39.5

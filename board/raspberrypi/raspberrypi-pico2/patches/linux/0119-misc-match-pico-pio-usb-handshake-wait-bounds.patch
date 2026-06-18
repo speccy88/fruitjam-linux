@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux Maintainers <fruitjam@example.com>
+Date: Thu, 18 Jun 2026 14:40:00 -0400
+Subject: [PATCH] misc: match Pico-PIO-USB handshake wait bounds
+
+Pico-PIO-USB's host handshake reader waits while the elapsed microsecond count
+is less than or equal to the full-speed/low-speed start window, then does the
+same inclusive wait for the short handshake packet window. Keep the Fruit Jam
+HCD's Pico-style wait path aligned with those bounds instead of dropping the
+final microsecond slot.
+---
+ drivers/misc/fruitjam_usbhost.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 222222222222..333333333333 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3199,7 +3199,7 @@ static int fj_usbhost_pio_wait_handshake_pico(struct fruitjam_usbhost *uh)
+ 	int ret = -ETIMEDOUT;
+ 
+ 	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
+-	for (waited = 0; waited < start_timeout; waited++) {
++	for (waited = 0; waited <= start_timeout; waited++) {
+ 		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
+ 
+ 		if (irq & FJ_PIO_IRQ_RX_START)
+@@ -3209,10 +3209,10 @@ static int fj_usbhost_pio_wait_handshake_pico(struct fruitjam_usbhost *uh)
+ 		}
+ 		udelay(1);
+ 	}
+-	if (waited >= start_timeout)
++	if (waited > start_timeout)
+ 		goto out;
+ 
+-	for (waited = 0; waited < FJ_USBHOST_HCD_HANDSHAKE_PACKET_US;) {
++	for (waited = 0; waited <= FJ_USBHOST_HCD_HANDSHAKE_PACKET_US;) {
+ 		u32 before = len;
+ 		u32 irq;
+ 		int drain_ret;
+@@ -3263,7 +3262,8 @@ static int fj_usbhost_pio_wait_handshake_scan(struct fruitjam_usbhost *uh,
+ 	int ret = -ETIMEDOUT;
+ 
+ 	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
+-	for (waited = 0; waited < start_timeout; waited++) {
++	/* Keep the diagnostic scanner's start window aligned with Pico-PIO-USB. */
++	for (waited = 0; waited <= start_timeout; waited++) {
+ 		u32 irq = readl(uh->pio + FJ_PIO_IRQ);
+ 
+ 		if (irq & FJ_PIO_IRQ_RX_START)
+@@ -3273,10 +3273,10 @@ static int fj_usbhost_pio_wait_handshake_scan(struct fruitjam_usbhost *uh,
+ 		}
+ 		udelay(1);
+ 	}
+-	if (waited >= start_timeout)
++	if (waited > start_timeout)
+ 		goto out;
+ 
+-	for (waited = 0; waited < FJ_USBHOST_HCD_HANDSHAKE_PACKET_US;) {
++	for (waited = 0; waited <= FJ_USBHOST_HCD_HANDSHAKE_PACKET_US;) {
+ 		u32 before = len;
+ 		u32 irq;
+ 		int drain_ret;
+-- 
+2.39.5

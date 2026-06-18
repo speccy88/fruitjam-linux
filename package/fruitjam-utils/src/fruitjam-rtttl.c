@@ -34,6 +34,14 @@ enum tone_backend {
 	TONE_BACKEND_I2S,
 };
 
+enum i2s_waveform {
+	I2S_WAVE_SINE = 0,
+	I2S_WAVE_SQUARE = 1,
+	I2S_WAVE_SAW = 2,
+	I2S_WAVE_TRIANGLE = 3,
+	I2S_WAVE_NOISE = 4,
+};
+
 struct builtin_tune {
 	const char *name;
 	const char *text;
@@ -51,7 +59,8 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: fruitjam-rtttl [--i2s|--beep] [--loud] [--list|NAME|RTTTL|FILE.rtttl]\n"
-		"       fruitjam-rtttl [--i2s|--beep] [--loud] --tone HZ [MS]\n"
+		"       fruitjam-rtttl [--i2s|--beep] [--loud] [--waveform WAVE] --tone HZ [MS]\n"
+		"       waveforms: sine square saw triangle noise\n"
 		"       names: default scale startup retro chime\n");
 }
 
@@ -82,6 +91,58 @@ static void sleep_ms(unsigned int ms)
 	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
 	while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
 		;
+}
+
+static const char *waveform_name(enum i2s_waveform waveform)
+{
+	switch (waveform) {
+	case I2S_WAVE_SINE:
+		return "sine";
+	case I2S_WAVE_SQUARE:
+		return "square";
+	case I2S_WAVE_SAW:
+		return "saw";
+	case I2S_WAVE_TRIANGLE:
+		return "triangle";
+	case I2S_WAVE_NOISE:
+		return "noise";
+	default:
+		return "sine";
+	}
+}
+
+static int parse_waveform(const char *text, enum i2s_waveform *waveform)
+{
+	char *end;
+	unsigned long value;
+
+	if (!strcmp(text, "sine")) {
+		*waveform = I2S_WAVE_SINE;
+		return 0;
+	}
+	if (!strcmp(text, "square")) {
+		*waveform = I2S_WAVE_SQUARE;
+		return 0;
+	}
+	if (!strcmp(text, "saw")) {
+		*waveform = I2S_WAVE_SAW;
+		return 0;
+	}
+	if (!strcmp(text, "triangle")) {
+		*waveform = I2S_WAVE_TRIANGLE;
+		return 0;
+	}
+	if (!strcmp(text, "noise")) {
+		*waveform = I2S_WAVE_NOISE;
+		return 0;
+	}
+	errno = 0;
+	value = strtoul(text, &end, 0);
+	if (!errno && end && *end == '\0' && value <= I2S_WAVE_NOISE) {
+		*waveform = (enum i2s_waveform)value;
+		return 0;
+	}
+	return -1;
 }
 
 static const int16_t sine_q15[] = {
@@ -197,7 +258,8 @@ static void release_peripheral_reset(void)
 	sleep_ms(50);
 }
 
-static int audio_tone(unsigned int hz, unsigned int ms)
+static int audio_tone(unsigned int hz, unsigned int ms,
+		      enum i2s_waveform waveform)
 {
 	char cmd[32];
 
@@ -207,7 +269,8 @@ static int audio_tone(unsigned int hz, unsigned int ms)
 	}
 	if (ms > 15000u)
 		ms = 15000u;
-	snprintf(cmd, sizeof(cmd), "tone %u %u", hz, ms);
+	snprintf(cmd, sizeof(cmd), "tone %u %u %s", hz, ms,
+		 waveform_name(waveform));
 	return audio_clock_cmd(cmd);
 }
 
@@ -301,10 +364,11 @@ static int codec_beep_tone(int fd, unsigned int hz, unsigned int ms,
 }
 
 static int play_tone(int fd, enum tone_backend backend, unsigned int hz,
-		     unsigned int ms, unsigned int beep_volume)
+		     unsigned int ms, unsigned int beep_volume,
+		     enum i2s_waveform waveform)
 {
 	if (backend == TONE_BACKEND_I2S)
-		return audio_tone(hz, ms);
+		return audio_tone(hz, ms, waveform);
 	return codec_beep_tone(fd, hz, ms, beep_volume);
 }
 
@@ -501,7 +565,7 @@ static int read_rtttl_file(const char *path, char *buf, size_t len)
 }
 
 static int play_rtttl(const char *text, int i2c_fd, enum tone_backend backend,
-		      unsigned int beep_volume)
+		      unsigned int beep_volume, enum i2s_waveform waveform)
 {
 	char copy[MAX_RTTTL_TEXT];
 	char *defaults;
@@ -581,7 +645,8 @@ static int play_rtttl(const char *text, int i2c_fd, enum tone_backend backend,
 		if (dotted)
 			ms += ms / 2;
 		hz = name == 'p' ? 0 : note_hz(name, sharp, oct);
-		if (play_tone(i2c_fd, backend, hz, ms ? ms : 1, beep_volume) < 0) {
+		if (play_tone(i2c_fd, backend, hz, ms ? ms : 1, beep_volume,
+			      waveform) < 0) {
 			return -1;
 		}
 		if (backend == TONE_BACKEND_I2S)
@@ -602,6 +667,7 @@ int main(int argc, char **argv)
 	unsigned int tone_hz = 0;
 	unsigned int tone_ms = 1000;
 	unsigned int beep_volume;
+	enum i2s_waveform waveform = I2S_WAVE_SINE;
 	enum tone_backend backend = TONE_BACKEND_I2S;
 	int loud = 0;
 	int tone_mode = 0;
@@ -624,6 +690,13 @@ int main(int argc, char **argv)
 		}
 		if (!strcmp(argv[argi], "--loud")) {
 			loud = 1;
+			continue;
+		}
+		if (!strcmp(argv[argi], "--waveform")) {
+			if (++argi >= argc || parse_waveform(argv[argi], &waveform) < 0) {
+				usage();
+				return 1;
+			}
 			continue;
 		}
 		if (!strcmp(argv[argi], "--list") || !strcmp(argv[argi], "list")) {
@@ -675,19 +748,22 @@ int main(int argc, char **argv)
 		goto out_close;
 	codec_print_status(i2c_fd);
 	if (tone_mode) {
-		if (play_tone(i2c_fd, backend, tone_hz, tone_ms, beep_volume) < 0) {
+		if (play_tone(i2c_fd, backend, tone_hz, tone_ms, beep_volume,
+			      waveform) < 0) {
 			fprintf(stderr, "fruitjam-rtttl: failed to play tone\n");
 			goto out_close;
 		}
-		printf("fruitjam-rtttl: played %s tone %u Hz %u ms\n",
+		printf("fruitjam-rtttl: played %s %s tone %u Hz %u ms\n",
 		       backend == TONE_BACKEND_I2S ? "i2s" : "beep",
-		       tone_hz, tone_ms);
-	} else if (play_rtttl(song, i2c_fd, backend, beep_volume) < 0) {
+		       waveform_name(waveform), tone_hz, tone_ms);
+	} else if (play_rtttl(song, i2c_fd, backend, beep_volume,
+			      waveform) < 0) {
 		fprintf(stderr, "fruitjam-rtttl: failed to play RTTTL\n");
 		goto out_close;
 	} else {
-		printf("fruitjam-rtttl: played %s via %s\n", song,
-		       backend == TONE_BACKEND_I2S ? "i2s" : "beep");
+		printf("fruitjam-rtttl: played %s via %s %s\n", song,
+		       backend == TONE_BACKEND_I2S ? "i2s" : "beep",
+		       waveform_name(waveform));
 	}
 	ret = 0;
 

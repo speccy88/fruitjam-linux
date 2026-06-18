@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 19:35:00 -0400
+Subject: [PATCH] misc: bound Fruit Jam HCD IN IRQ window
+
+The HCD IN transaction wants wili8jam/Pico-PIO-USB-style tight timing around
+the IN token, receive start, packet drain, and DATA ACK.  Keep that critical
+section, but do not let a dead or missing response hold local IRQs off for the
+generic 2 ms receive timeout.
+
+Split the raw receive helper so the HCD IN path can use a short USB-response
+window while older diagnostics and probes keep their wider timeout.  A hub EP0
+DATA/NAK response should arrive immediately after the IN token; if nothing is
+visible inside this bounded window, the existing higher-level retry/SOF pacing
+handles the failure.
+---
+ drivers/misc/fruitjam_usbhost.c | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+index 0ca0190fd310..3af8f67e7d51 100644
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -55,6 +55,7 @@
+ #define FJ_USBHOST_PIO_PROGRAM_NAME	"pico-pio-usb-fs-host-32word"
+ #define FJ_USBHOST_TX_TIMEOUT_US	2000u
+ #define FJ_USBHOST_RX_TIMEOUT_US	2000u
++#define FJ_USBHOST_HCD_IN_IRQ_RX_TIMEOUT_US 120u
+ #define FJ_USBHOST_FIFO_TIMEOUT_US	1000u
+ #define FJ_USBHOST_HCD_MAXPACKET	8u
+ #define FJ_USBHOST_HCD_POWER_BUDGET	500u
+@@ -2392,7 +2393,8 @@ static bool fj_usbhost_pio_rx_data_crc_ok(struct fruitjam_usbhost *uh, u32 len)
+ 	return expected == got;
+ }
+ 
+-static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data)
++static int fj_usbhost_pio_receive_raw_timeout(struct fruitjam_usbhost *uh,
++					      bool ack_data, u32 timeout_us)
+ {
+ 	bool ack_sent = false;
+ 	u32 waited;
+@@ -2414,7 +2416,7 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ 	} while (0)
+ 
+ 	memset(uh->last_rx_bytes, 0, sizeof(uh->last_rx_bytes));
+-	for (waited = 0; waited < FJ_USBHOST_RX_TIMEOUT_US; waited++) {
++	for (waited = 0; waited < timeout_us; waited++) {
+ 		u32 irq;
+ 
+ 		FJ_USBHOST_DRAIN_RX_FIFO();
+@@ -2471,6 +2473,13 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ #undef FJ_USBHOST_DRAIN_RX_FIFO
+ }
+ 
++static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh,
++				      bool ack_data)
++{
++	return fj_usbhost_pio_receive_raw_timeout(uh, ack_data,
++						 FJ_USBHOST_RX_TIMEOUT_US);
++}
++
+ static int fj_usbhost_pio_receive_raw_noeop_stop(struct fruitjam_usbhost *uh)
+ {
+ 	u32 waited;
+@@ -2605,8 +2614,12 @@ static int fj_usbhost_pio_hcd_in_token_receive(struct fruitjam_usbhost *uh,
+ 	/*
+ 	 * wili8jam/Pico-PIO-USB performs this transaction without operating
+ 	 * system interrupt gaps. Keep the RX arm, IN token, RX IRQ clear,
+-	 * packet drain, and optional ACK in one local critical section so Linux
+-	 * does not miss the hub's EP0 DATA turnaround window.
++	 * short packet drain, and optional ACK in one local critical section so
++	 * Linux does not miss the hub's EP0 DATA turnaround window.
++	 *
++	 * Use an HCD-specific bounded receive window here. Generic diagnostics
++	 * can afford the wider 2 ms receive timeout; this critical section
++	 * should only cover the immediate USB response/handshake interval.
+ 	 */
+ 	local_irq_save(flags);
+ 	fj_usbhost_pio_prepare_receive_pico(uh);
+@@ -2615,7 +2628,8 @@ static int fj_usbhost_pio_hcd_in_token_receive(struct fruitjam_usbhost *uh,
+ 	fj_usbhost_pio_record_tx(uh, ret, *encoded_len);
+ 	if (!ret) {
+ 		fj_usbhost_pio_start_receive(uh);
+-		ret = fj_usbhost_pio_receive_raw(uh, ack_data);
++		ret = fj_usbhost_pio_receive_raw_timeout(
++			uh, ack_data, FJ_USBHOST_HCD_IN_IRQ_RX_TIMEOUT_US);
+ 	}
+ 	local_irq_restore(flags);
+ 
+-- 
+2.39.5

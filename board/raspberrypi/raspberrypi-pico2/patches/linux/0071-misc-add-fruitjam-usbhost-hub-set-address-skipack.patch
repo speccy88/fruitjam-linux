@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 16:05:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost hub set-address skip-ack probe
+
+The CH334F hub on Fruit Jam still times out when the bridge waits for the
+SET_ADDRESS setup ACK.  Add a companion diagnostic that sends the setup stage,
+intentionally ignores that handshake, then attempts the control status IN
+stage at address zero.
+
+If the status stage succeeds, the hub accepted SET_ADDRESS and the remaining
+bug is ACK capture timing.  If it still times out, the setup packet shape or
+host timing is not acceptable to the hub.
+---
+ drivers/misc/fruitjam_usbhost.c | 56 +++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3402,6 +3402,53 @@ static int fj_usbhost_pio_hub_set_address_noreset(struct fruitjam_usbhost *uh,
+ 		"hub-set-address-noreset");
+ }
+ 
++static int fj_usbhost_pio_hub_set_address_skipack(struct fruitjam_usbhost *uh,
++						  u32 sof_frames)
++{
++	u8 setup[8] = {
++		0x00, 0x05,
++		FJ_USBHOST_HUB_ADDR, 0x00,
++		0x00, 0x00,
++		0x00, 0x00,
++	};
++	u8 encoded_len = 0;
++	int ret;
++
++	if (sof_frames > FJ_USBHOST_HUB_SOF_MAX_FRAMES)
++		return -EINVAL;
++
++	if (sof_frames) {
++		ret = fj_usbhost_pio_sof_burst(uh, sof_frames);
++		if (ret)
++			return ret;
++	}
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		return ret;
++
++	fj_usbhost_pio_disable_receive(uh);
++	ret = fj_usbhost_pio_send_setup_data0_combo_dma_addr(
++		uh, 0, setup, sizeof(setup), &encoded_len);
++	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++	if (ret)
++		return ret;
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hub-set-address-skipack setup-tx-len=%u sof-frames=%u",
++		  encoded_len, sof_frames);
++
++	usleep_range(FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US,
++		     FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US + 100u);
++	ret = fj_usbhost_pio_control_status_in(uh, 0);
++	if (!ret)
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "hub-set-address-skipack status-in-ok sof-frames=%u",
++			  sof_frames);
++	return ret;
++}
++
+ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh)
+ {
+ 	int ret;
+@@ -3975,6 +4022,15 @@ static ssize_t fj_usbhost_write(struct file *file, const char __user *buf,
+ 		if (!ret)
+ 			ret = fj_usbhost_pio_hub_set_address_noreset(
+ 				uh, sof_frames);
++	} else if (!strncmp(cmd, "hub-set-address-skipack", 23) &&
++		   (cmd[23] == '\0' || cmd[23] == ' ' ||
++		    cmd[23] == '\t')) {
++		ret = fj_usbhost_parse_optional_u32(
++			cmd + 23, FJ_USBHOST_HUB_SOF_MAX_FRAMES,
++			&sof_frames);
++		if (!ret)
++			ret = fj_usbhost_pio_hub_set_address_skipack(
++				uh, sof_frames);
+ 	} else if (!strncmp(cmd, "hub-kbd-init", 12) &&
+ 		   (cmd[12] == '\0' || cmd[12] == ' ' ||
+ 		    cmd[12] == '\t')) {
+-- 
+2.39.5

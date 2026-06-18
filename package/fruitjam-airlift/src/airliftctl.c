@@ -52,6 +52,9 @@
 #define AIRLIFT_READY_GPIO 3u
 #define USBHOST_RESET_MS 50u
 #define USBHOST_POST_RESET_US 100000u
+#define USBHOST_HCD_POWER_OFF_US 250000u
+#define USBHOST_HCD_POWER_ON_US 750000u
+#define USBHOST_HCD_POST_RESET_US 250000u
 #define USBHOST_KBD_WEB_SECONDS "3"
 #define AIRLIFT_IRQ_GPIO 23u
 #define AIRLIFT_MISO_GPIO 28u
@@ -137,7 +140,10 @@
 #define BERRY_SCRIPT_MAX 63
 #define WAV_FILE_MAX 95
 #define WAV_LIST_MAX 32
-#define AIRLIFT_SHELL_IDLE_MS 300000L
+#define AIRLIFT_SHELL_IDLE_MS 60000L
+#define AIRLIFT_TELNET_MAX_MS 300000L
+#define AIRLIFT_SHELL_PREEMPT_IDLE_MS 15000L
+#define AIRLIFT_INBOUND_RECYCLE_MS 300000L
 #define AIRLIFT_HTTP_IDLE_MS 1200L
 #define AIRLIFT_HTTP_HEADER_DRAIN_MS 10L
 #define AIRLIFT_FTP_IDLE_MS 5000L
@@ -145,6 +151,8 @@
 #define AIRLIFT_SEND_RETRY_US 5000
 #define AIRLIFT_SERVICE_POLL_US 5000
 #define AIRLIFT_TELNET_DRAIN_LIMIT 4
+#define AIRLIFT_TELNET_BOOTSEL_PEEK_MS 1200L
+#define AIRLIFT_ACCEPTED_CLIENT_GRACE_MS 900L
 #define AIRLIFT_WIFI_JOIN_POLLS 1500
 #define AIRLIFT_LOCK_PATH "/run/airliftctl.lock"
 #define AIRLIFT_START_LOG "/tmp/airlift-start.log"
@@ -248,8 +256,11 @@ struct telnet_session {
 	int child_in;
 	int child_out;
 	int child_alive;
+	long opened_ms;
+	long last_activity_ms;
 	long idle_deadline;
 	long idle_ms;
+	long max_ms;
 };
 
 static struct response response_buf;
@@ -1672,6 +1683,14 @@ static void tcp_close_client(struct airlift *air, uint8_t sock)
 	usleep(750000);
 }
 
+static void tcp_drop_client(struct airlift *air, uint8_t sock)
+{
+	if (sock == NINA_NO_SOCKET)
+		return;
+	tcp_stop_client(air, sock);
+	usleep(50000);
+}
+
 static int tcp_wait_connected(struct airlift *air, uint8_t sock)
 {
 	uint8_t state = 0;
@@ -1703,6 +1722,42 @@ static int tcp_avail(struct airlift *air, uint8_t sock, uint16_t *avail)
 	if (resp->len[0] < 2)
 		return -1;
 	*avail = get_le16(resp->data[0]);
+	return 0;
+}
+
+static int tcp_wait_accepted_client_ready(struct airlift *air, uint8_t sock)
+{
+	long deadline = now_ms() + AIRLIFT_ACCEPTED_CLIENT_GRACE_MS;
+	uint8_t state = 0xff;
+	uint16_t avail = 0;
+	int state_failures = 0;
+	int avail_failures = 0;
+
+	while (!stop_requested && now_ms() < deadline) {
+		if (tcp_client_state(air, sock, &state) < 0) {
+			if (++state_failures >= 3)
+				return -1;
+		} else {
+			state_failures = 0;
+			if (state == ESTABLISHED)
+				return 0;
+		}
+
+		if (tcp_avail(air, sock, &avail) < 0) {
+			if (++avail_failures >= 3)
+				return -1;
+		} else {
+			avail_failures = 0;
+			if (avail)
+				return 0;
+		}
+
+		usleep(20000);
+	}
+
+	fprintf(stderr,
+		"airliftctl: AirLift accepted socket %u proceeding without ESTABLISHED state %u avail %u\n",
+		sock, state, avail);
 	return 0;
 }
 
@@ -1900,6 +1955,15 @@ static long env_ms(const char *name, long fallback, long min_value)
 	if (*end || parsed < min_value)
 		return fallback;
 	return parsed;
+}
+
+static int reboot_bootsel_after_delay(unsigned int delay_ms)
+{
+	if (delay_ms)
+		usleep(delay_ms * 1000u);
+	sync();
+	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
 }
 
 static int spawn_shell(const char *shell, int *in_fd, int *out_fd, pid_t *pid)
@@ -2139,6 +2203,92 @@ static int write_telnet_payload(struct airlift *air, uint8_t sock, int fd,
 	return 0;
 }
 
+static int telnet_payload_contains_ascii(const uint8_t *buf, uint16_t len,
+					 const char *needle)
+{
+	size_t needle_len = strlen(needle);
+	uint16_t i;
+
+	if (!needle_len || len < needle_len)
+		return 0;
+	for (i = 0; i + needle_len <= len; i++) {
+		size_t j;
+
+		for (j = 0; j < needle_len; j++) {
+			if (tolower(buf[i + j]) !=
+			    tolower((unsigned char)needle[j]))
+				break;
+		}
+		if (j == needle_len)
+			return 1;
+	}
+	return 0;
+}
+
+static int read_initial_telnet_payload(struct airlift *air, uint8_t sock,
+				       uint8_t *buf, uint16_t cap,
+				       uint16_t *len)
+{
+	long deadline = now_ms() + AIRLIFT_TELNET_BOOTSEL_PEEK_MS;
+	uint16_t avail = 0;
+	int avail_failures = 0;
+
+	*len = 0;
+	while (!stop_requested && now_ms() < deadline) {
+		uint16_t room;
+		uint16_t chunk_len;
+
+		if (tcp_avail(air, sock, &avail) < 0) {
+			if (*len &&
+			    telnet_payload_contains_ascii(buf, *len, "bootsel"))
+				break;
+			if (++avail_failures >= 3)
+				break;
+			usleep(10000);
+			continue;
+		}
+		avail_failures = 0;
+		if (!avail) {
+			usleep(10000);
+			continue;
+		}
+		room = cap - *len;
+		if (!room)
+			break;
+		chunk_len = avail > room ? room : avail;
+		if (tcp_read_buf(air, sock, buf + *len, &chunk_len) < 0) {
+			if (*len &&
+			    telnet_payload_contains_ascii(buf, *len, "bootsel"))
+				break;
+			return *len ? 0 : -1;
+		}
+		if (!chunk_len) {
+			usleep(10000);
+			continue;
+		}
+		*len += chunk_len;
+		if (telnet_payload_contains_ascii(buf, *len, "bootsel"))
+			break;
+		if (*len >= cap)
+			break;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int maybe_airlift_telnet_bootsel(struct airlift *air, uint8_t sock,
+					const uint8_t *buf, uint16_t len)
+{
+	if (!telnet_payload_contains_ascii(buf, len, "bootsel"))
+		return 0;
+
+	tcp_send_fmt(air, sock, "BOOTSEL\r\n");
+	if (reboot_bootsel_after_delay(250) < 0)
+		fprintf(stderr, "airliftctl: telnet reboot bootsel: %s\n",
+			strerror(errno));
+	return 1;
+}
+
 static void telnet_session_init(struct telnet_session *session)
 {
 	memset(session, 0, sizeof(*session));
@@ -2150,6 +2300,15 @@ static void telnet_session_init(struct telnet_session *session)
 static int telnet_session_active(const struct telnet_session *session)
 {
 	return session->sock != NINA_NO_SOCKET;
+}
+
+static long telnet_session_idle_ms(const struct telnet_session *session)
+{
+	long now = now_ms();
+
+	if (now < session->last_activity_ms)
+		return 0;
+	return now - session->last_activity_ms;
 }
 
 static void reap_child_deadline(pid_t pid)
@@ -2185,7 +2344,7 @@ static void telnet_session_close(struct airlift *air, struct telnet_session *ses
 		reap_child_deadline(session->pid);
 	}
 	if (session->sock != NINA_NO_SOCKET)
-		tcp_close_client(air, session->sock);
+		tcp_drop_client(air, session->sock);
 	telnet_session_init(session);
 }
 
@@ -2202,7 +2361,10 @@ static int telnet_session_start(struct telnet_session *session, uint8_t sock,
 	session->sock = sock;
 	session->child_alive = 1;
 	session->idle_ms = env_ms("AIRLIFT_TELNET_IDLE_MS", AIRLIFT_SHELL_IDLE_MS, 60000L);
-	session->idle_deadline = now_ms() + session->idle_ms;
+	session->max_ms = env_ms("AIRLIFT_TELNET_MAX_MS", AIRLIFT_TELNET_MAX_MS, 60000L);
+	session->opened_ms = now_ms();
+	session->last_activity_ms = session->opened_ms;
+	session->idle_deadline = session->last_activity_ms + session->idle_ms;
 	return 0;
 }
 
@@ -2218,7 +2380,16 @@ static int telnet_session_poll(struct airlift *air, struct telnet_session *sessi
 	if (!telnet_session_active(session))
 		return 0;
 	if (now_ms() >= session->idle_deadline) {
-		tcp_send_fmt(air, session->sock, "\r\nFruit Jam telnet shell idle timeout\r\n");
+		fprintf(stderr, "airliftctl: AirLift telnet idle timeout\n");
+		telnet_session_close(air, session);
+		return 0;
+	}
+	if (now_ms() >= session->opened_ms + session->max_ms) {
+		fprintf(stderr, "airliftctl: AirLift telnet max session timeout\n");
+		telnet_session_close(air, session);
+		return 0;
+	}
+	if (tcp_client_state(air, session->sock, &state) == 0 && state == CLOSED) {
 		telnet_session_close(air, session);
 		return 0;
 	}
@@ -2247,7 +2418,6 @@ static int telnet_session_poll(struct airlift *air, struct telnet_session *sessi
 				telnet_session_close(air, session);
 				return -1;
 			}
-			session->idle_deadline = now_ms() + session->idle_ms;
 		} else if (got == 0) {
 			session->child_alive = 0;
 			break;
@@ -2273,7 +2443,8 @@ static int telnet_session_poll(struct airlift *air, struct telnet_session *sessi
 				telnet_session_close(air, session);
 				return -1;
 			}
-			session->idle_deadline = now_ms() + session->idle_ms;
+			session->last_activity_ms = now_ms();
+			session->idle_deadline = session->last_activity_ms + session->idle_ms;
 		}
 		if (tcp_avail(air, session->sock, &avail) < 0) {
 			telnet_session_close(air, session);
@@ -2296,14 +2467,33 @@ static int bridge_shell_client(struct airlift *air, uint8_t client_sock,
 			       const char *shell)
 {
 	uint8_t buf[256];
+	uint16_t initial_len = 0;
 	pid_t pid;
 	int child_in;
 	int child_out;
 	int child_alive = 1;
 	long idle_deadline = now_ms() + AIRLIFT_SHELL_IDLE_MS;
+	int ret;
+
+	ret = read_initial_telnet_payload(air, client_sock, buf, sizeof(buf),
+					  &initial_len);
+	if (ret < 0)
+		return -1;
+	if (initial_len &&
+	    maybe_airlift_telnet_bootsel(air, client_sock, buf, initial_len))
+		return 0;
 
 	if (spawn_shell(shell, &child_in, &child_out, &pid) < 0)
 		return -1;
+	if (initial_len &&
+	    write_telnet_payload(air, client_sock, child_in, buf, initial_len) < 0) {
+		close(child_in);
+		close(child_out);
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, 0);
+		tcp_close_client(air, client_sock);
+		return -1;
+	}
 
 	while (!stop_requested && now_ms() < idle_deadline) {
 		uint16_t avail = 0;
@@ -2899,6 +3089,22 @@ static int http_usbhost_bus_reset(void)
 	return ret;
 }
 
+static int http_usbhost_hcd_start(void)
+{
+	if (access(USBHOST_DEV, W_OK) != 0)
+		return -1;
+	if (http_write_existing_file(USBHOST_DEV, "off") < 0)
+		return -1;
+	usleep(USBHOST_HCD_POWER_OFF_US);
+	if (http_write_existing_file(USBHOST_DEV, "on") < 0)
+		return -1;
+	usleep(USBHOST_HCD_POWER_ON_US);
+	if (http_write_existing_file(USBHOST_DEV, "reset 100") < 0)
+		return -1;
+	usleep(USBHOST_HCD_POST_RESET_US);
+	return http_write_existing_file(USBHOST_DEV, "hcd-start");
+}
+
 static int http_is_mounted(const char *mountpoint)
 {
 	FILE *fp = fopen("/proc/mounts", "r");
@@ -2982,15 +3188,6 @@ static int http_parse_uint_limited(const char *s, unsigned int min_value,
 		return -1;
 	*out = (unsigned int)parsed;
 	return 0;
-}
-
-static int http_reboot_bootsel_after_delay(unsigned int delay_ms)
-{
-	if (delay_ms)
-		usleep(delay_ms * 1000u);
-	sync();
-	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
-		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
 }
 
 static int http_run_capture_timeout(char *const argv[], char *out,
@@ -3540,6 +3737,7 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 	char cmd[48];
 	char bridge_status[1024] = "";
 	char last_rx_hex[65] = "";
+	char probe_summary[192] = "";
 	char helper_output[512] = "";
 	int helper_ran = 0;
 	int helper_ret = 0;
@@ -3547,15 +3745,32 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 	int bridge_ok = 0;
 	int pio_ready = 0;
 	int pio_configured = 0;
+	int pio_index = 0;
+	int sm_tx = 0;
+	int sm_rx = 0;
+	int sm_eop = 0;
+	int clk_sys_hz = 0;
 	int packets = 0;
 	int tx_errors = 0;
 	int last_tx_result = 0;
 	int last_tx_len = 0;
+	int dma = 0;
+	int tx_dma_channel = 0;
+	int tx_dma_packets = 0;
 	int rx_attempts = 0;
 	int rx_errors = 0;
 	int last_rx_result = 0;
 	int last_rx_len = 0;
 	int last_rx_pid = 0;
+	int hcd_registered = 0;
+	int hcd_manual_start = 0;
+	int hcd_faulted = 0;
+	int hcd_ep0_failures = 0;
+	int hcd_delay_ms = 0;
+	int hcd_port_reset_settle_ms = 0;
+	int hcd_port_reset_sof_frames = 0;
+	int hcd_data_ack_tail_drain_us = 0;
+	int hcd_sof = 0;
 	int power;
 	int dp;
 	int dm;
@@ -3601,8 +3816,28 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 			http_json_error_body(body, body_len, "cannot reset USB host bus");
 			return;
 		}
+	} else if (!strcmp(cmd, "hcd-start")) {
+		if (http_usbhost_hcd_start() < 0) {
+			http_json_error_body(body, body_len, "cannot start USB host HCD");
+			return;
+		}
+	} else if (!strcmp(cmd, "hcd-clear-fault")) {
+		if (access(USBHOST_DEV, W_OK) != 0 ||
+		    http_write_existing_file(USBHOST_DEV, "hcd-clear-fault") < 0) {
+			http_json_error_body(body, body_len,
+					     "cannot clear USB host HCD fault");
+			return;
+		}
 	} else if (!strcmp(cmd, "kbd-find")) {
 		char *const argv[] = { USBHOST_BIN, "kbd-find", NULL };
+
+		helper_ret = http_run_capture_timeout(argv, helper_output,
+						      sizeof(helper_output), 9000);
+		helper_ran = 1;
+	} else if (!strcmp(cmd, "usb-devices") ||
+		   !strcmp(cmd, "dev-input") ||
+		   !strcmp(cmd, "input-registry")) {
+		char *const argv[] = { USBHOST_BIN, cmd, NULL };
 
 		helper_ret = http_run_capture_timeout(argv, helper_output,
 						      sizeof(helper_output), 9000);
@@ -3632,17 +3867,39 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 		dm = http_status_text_int(bridge_status, "dm", -1);
 		pio_ready = http_status_text_int(bridge_status, "pio_ready", 0);
 		pio_configured = http_status_text_int(bridge_status, "pio_configured", 0);
+		pio_index = http_status_text_int(bridge_status, "pio_index", 0);
+		sm_tx = http_status_text_int(bridge_status, "tx_sm", 0);
+		sm_rx = http_status_text_int(bridge_status, "rx_sm", 0);
+		sm_eop = http_status_text_int(bridge_status, "eop_sm", 0);
+		clk_sys_hz = http_status_text_int(bridge_status, "clk_sys_hz", 0);
 		packets = http_status_text_int(bridge_status, "packets", 0);
 		tx_errors = http_status_text_int(bridge_status, "tx_errors", 0);
 		last_tx_result = http_status_text_int(bridge_status, "last_tx_result", 0);
 		last_tx_len = http_status_text_int(bridge_status, "last_tx_len", 0);
+		dma = http_status_text_int(bridge_status, "tx_dma", 0);
+		tx_dma_channel = http_status_text_int(bridge_status, "tx_dma_channel", 0);
+		tx_dma_packets = http_status_text_int(bridge_status, "tx_dma_packets", 0);
 		rx_attempts = http_status_text_int(bridge_status, "rx_attempts", 0);
 		rx_errors = http_status_text_int(bridge_status, "rx_errors", 0);
 		last_rx_result = http_status_text_int(bridge_status, "last_rx_result", 0);
 		last_rx_len = http_status_text_int(bridge_status, "last_rx_len", 0);
 		last_rx_pid = http_status_text_int(bridge_status, "last_rx_pid", 0);
+		hcd_registered = http_status_text_int(bridge_status, "hcd_registered", 0);
+		hcd_manual_start = http_status_text_int(bridge_status, "hcd_manual_start", 0);
+		hcd_faulted = http_status_text_int(bridge_status, "hcd_faulted", 0);
+		hcd_ep0_failures = http_status_text_int(bridge_status, "hcd_ep0_failures", 0);
+		hcd_delay_ms = http_status_text_int(bridge_status, "hcd_delay_ms", 0);
+		hcd_port_reset_settle_ms =
+			http_status_text_int(bridge_status, "hcd_port_reset_settle_ms", 0);
+		hcd_port_reset_sof_frames =
+			http_status_text_int(bridge_status, "hcd_port_reset_sof_frames", 0);
+		hcd_data_ack_tail_drain_us =
+			http_status_text_int(bridge_status, "hcd_data_ack_tail_drain_us", 0);
+		hcd_sof = http_status_text_int(bridge_status, "hcd_sof", 0);
 		http_status_text_string(bridge_status, "last_rx_hex", last_rx_hex,
 					sizeof(last_rx_hex));
+		http_status_text_string(bridge_status, "probe_summary",
+					probe_summary, sizeof(probe_summary));
 	} else {
 		power = http_gpio_value(11);
 		dp = http_gpio_value(1);
@@ -3657,27 +3914,57 @@ static void http_api_usbhost_body(const char *query, char *body, size_t body_len
 	http_buf_printf(&b, ",\"power\":%d,\"dp\":%d,\"dm\":%d,\"stack\":",
 			power, dp, dm);
 	http_buf_json_string(&b, access(USBHOST_DEV, R_OK) == 0 ?
-			     "kernel bridge line-state; PIO2 host program staged; experimental boot-keyboard init/poll available" :
+			     "kernel bridge line-state; PIO host program staged; Linux HCD plus boot-keyboard probes available" :
 			     "sysfs line-state only; PIO USB host/HID report polling not implemented yet");
 	http_buf_printf(&b, ",\"present\":%s,\"hid\":false,"
 			"\"driver\":\"%s\","
 			"\"pio_ready\":%s,"
 			"\"pio_configured\":%s,"
+			"\"pio_index\":%d,"
+			"\"sm_tx\":%d,"
+			"\"sm_rx\":%d,"
+			"\"sm_eop\":%d,"
+			"\"clk_sys_hz\":%d,"
 			"\"packets\":%d,\"tx_errors\":%d,"
 			"\"last_tx_result\":%d,\"last_tx_len\":%d,"
+			"\"dma\":%d,"
+			"\"tx_dma_channel\":%d,"
+			"\"tx_dma_packets\":%d,"
 			"\"rx_attempts\":%d,\"rx_errors\":%d,"
 			"\"last_rx_result\":%d,\"last_rx_len\":%d,"
-			"\"last_rx_pid\":%d,\"last_rx_hex\":",
+			"\"last_rx_pid\":%d,"
+			"\"hcd_registered\":%s,"
+			"\"hcd_manual_start\":%s,"
+			"\"hcd_faulted\":%s,"
+			"\"hcd_ep0_failures\":%d,"
+			"\"hcd_delay_ms\":%d,"
+			"\"hcd_port_reset_settle_ms\":%d,"
+			"\"hcd_port_reset_sof_frames\":%d,"
+			"\"hcd_data_ack_tail_drain_us\":%d,"
+			"\"hcd_sof\":%s,"
+			"\"last_rx_hex\":",
 			power > 0 &&
 			((dp == 1 && dm == 0) || (dp == 0 && dm == 1)) ?
 			"true" : "false",
 			bridge_ok ? "kernel-line-state" : "sysfs-line-state",
 			pio_ready ? "true" : "false",
 			pio_configured ? "true" : "false",
+			pio_index, sm_tx, sm_rx, sm_eop, clk_sys_hz,
 			packets, tx_errors, last_tx_result, last_tx_len,
+			dma, tx_dma_channel, tx_dma_packets,
 			rx_attempts, rx_errors, last_rx_result, last_rx_len,
-			last_rx_pid);
+			last_rx_pid,
+			hcd_registered ? "true" : "false",
+			hcd_manual_start ? "true" : "false",
+			hcd_faulted ? "true" : "false",
+			hcd_ep0_failures, hcd_delay_ms,
+			hcd_port_reset_settle_ms,
+			hcd_port_reset_sof_frames,
+			hcd_data_ack_tail_drain_us,
+			hcd_sof ? "true" : "false");
 	http_buf_json_string(&b, last_rx_hex);
+	http_buf_puts(&b, ",\"probe_summary\":");
+	http_buf_json_string(&b, probe_summary);
 	http_buf_printf(&b,
 			",\"probe_ok\":%s,\"next\":\"pio-packet-io\","
 			"\"first_milestone\":\"boot-protocol-keyboard\"",
@@ -3953,8 +4240,7 @@ static int http_send_fruitjam_api(struct airlift *air, uint8_t sock,
 		http_json_error_body(body, sizeof(body), "unknown action");
 
 	ret = http_reply_json(air, sock, body);
-	if (!ret && reboot_bootsel &&
-	    http_reboot_bootsel_after_delay(1500) < 0)
+	if (reboot_bootsel && reboot_bootsel_after_delay(1500) < 0)
 		fprintf(stderr, "airliftctl: reboot bootsel: %s\n", strerror(errno));
 	return ret;
 }
@@ -4155,6 +4441,7 @@ static int serve_http_client(struct airlift *air, uint8_t sock)
 	const char *file_target;
 	char *query;
 	char *sp;
+	int ret = 0;
 
 	if (http_read_line_recv(air, sock, line, sizeof(line),
 				AIRLIFT_HTTP_IDLE_MS) <= 0)
@@ -4185,11 +4472,13 @@ static int serve_http_client(struct airlift *air, uint8_t sock)
 	if (query)
 		*query++ = '\0';
 	if (!strcmp(target, "/cgi-bin/fruitjam.cgi")) {
-		http_send_fruitjam_api(air, sock, query);
+		if (http_send_fruitjam_api(air, sock, query) < 0)
+			ret = -1;
 		goto out;
 	}
 	if (!strcmp(target, "/cgi-bin/env.cgi")) {
-		http_send_env_cgi(air, sock, query);
+		if (http_send_env_cgi(air, sock, query) < 0)
+			ret = -1;
 		goto out;
 	}
 	if (!strncmp(target, "/cgi-bin/", 9)) {
@@ -4211,11 +4500,12 @@ static int serve_http_client(struct airlift *air, uint8_t sock)
 		http_reply_text(air, sock, 403, "Forbidden", "bad path\n");
 		goto out;
 	}
-	http_send_file(air, sock, path);
+	if (http_send_file(air, sock, path) < 0)
+		ret = -1;
 
 out:
 	nina_socket_close(air, sock);
-	return 0;
+	return ret;
 }
 
 static int get_ipaddr(struct airlift *air, uint8_t ip[4])
@@ -5225,6 +5515,8 @@ static int serve_inbound(struct airlift *air)
 	uint8_t http_sock = NINA_NO_SOCKET;
 	uint8_t local_ip[4] = { 0, 0, 0, 0 };
 	struct telnet_session telnet;
+	long recycle_ms;
+	long recycle_deadline;
 
 	stop_all_nina_sockets(air);
 
@@ -5262,6 +5554,9 @@ static int serve_inbound(struct airlift *air)
 	signal(SIGTERM, request_stop);
 	inbound_heartbeat_active = 1;
 	inbound_heartbeat_touch();
+	recycle_ms = env_ms("AIRLIFT_INBOUND_RECYCLE_MS",
+			    AIRLIFT_INBOUND_RECYCLE_MS, 60000L);
+	recycle_deadline = now_ms() + recycle_ms;
 	if (ftp_sock != NINA_NO_SOCKET)
 		printf("airlift inbound ftp listening on port %u socket %u\n",
 		       DEFAULT_FTP_PORT, ftp_sock);
@@ -5275,57 +5570,144 @@ static int serve_inbound(struct airlift *air)
 
 	while (!stop_requested) {
 		uint8_t client_sock = NINA_NO_SOCKET;
+		int accept_ret;
+
+		if (now_ms() >= recycle_deadline) {
+			fprintf(stderr, "airliftctl: AirLift inbound periodic recycle\n");
+			break;
+		}
 
 		inbound_heartbeat_poll();
-		telnet_session_poll(air, &telnet);
+		if (telnet_session_poll(air, &telnet) < 0) {
+			fprintf(stderr, "airliftctl: AirLift telnet poll failed; closing session\n");
+			continue;
+		}
 
 		client_sock = NINA_NO_SOCKET;
-		if (tcp_accept_server(air, shell_sock, 1, &client_sock) == 0 &&
-		    client_sock != NINA_NO_SOCKET) {
+		accept_ret = tcp_accept_server(air, shell_sock, 1, &client_sock);
+		if (accept_ret < 0) {
+			fprintf(stderr, "airliftctl: AirLift shell accept failed; recycling\n");
+			break;
+		}
+		if (client_sock != NINA_NO_SOCKET) {
 			printf("airlift inbound shell accepted socket %u\n", client_sock);
 			fflush(stdout);
-			if (tcp_wait_connected(air, client_sock) < 0) {
-				tcp_close_client(air, client_sock);
-			} else if (telnet_session_active(&telnet)) {
-				tcp_send_fmt(air, client_sock,
-					     "Fruit Jam telnet shell is busy; try again later\r\n");
-				tcp_close_client(air, client_sock);
-			} else if (telnet_session_start(&telnet, client_sock,
-							DEFAULT_SHELL_PATH) < 0) {
-				tcp_send_fmt(air, client_sock,
-					     "Fruit Jam telnet shell failed to start\r\n");
+			if (tcp_wait_accepted_client_ready(air, client_sock) < 0) {
+				uint8_t initial[128];
+				uint16_t initial_len = 0;
+
+				fprintf(stderr,
+					"airliftctl: AirLift telnet closed before shell attach; checking BOOTSEL payload\n");
+				if (read_initial_telnet_payload(air, client_sock,
+							 initial,
+							 sizeof(initial),
+							 &initial_len) == 0 &&
+				    initial_len &&
+				    maybe_airlift_telnet_bootsel(air, client_sock,
+								 initial,
+								 initial_len)) {
+					tcp_close_client(air, client_sock);
+					continue;
+				}
 				tcp_close_client(air, client_sock);
 			} else {
-				telnet_send_negotiation(air, client_sock);
+				uint8_t initial[128];
+				uint16_t initial_len = 0;
+				int initial_ret;
+
+				initial_ret = read_initial_telnet_payload(air, client_sock,
+									 initial,
+									 sizeof(initial),
+									 &initial_len);
+				if (initial_ret < 0) {
+					tcp_close_client(air, client_sock);
+					continue;
+				}
+				if (initial_len &&
+				    maybe_airlift_telnet_bootsel(air, client_sock,
+								 initial,
+								 initial_len)) {
+					tcp_close_client(air, client_sock);
+					continue;
+				}
+				if (telnet_session_active(&telnet) &&
+				    telnet_session_idle_ms(&telnet) >=
+				    AIRLIFT_SHELL_PREEMPT_IDLE_MS) {
+					fprintf(stderr,
+						"airliftctl: AirLift telnet stale session preempted\n");
+					telnet_session_close(air, &telnet);
+				}
+				if (telnet_session_active(&telnet)) {
+					tcp_send_fmt(air, client_sock,
+						     "Fruit Jam telnet shell is busy; try again later\r\n");
+					tcp_close_client(air, client_sock);
+				} else if (telnet_session_start(&telnet, client_sock,
+								 DEFAULT_SHELL_PATH) < 0) {
+					tcp_send_fmt(air, client_sock,
+						     "Fruit Jam telnet shell failed to start\r\n");
+					tcp_close_client(air, client_sock);
+				} else {
+					telnet_send_negotiation(air, client_sock);
+					if (initial_len &&
+					    write_telnet_payload(air, client_sock,
+								 telnet.child_in,
+								 initial,
+								 initial_len) < 0)
+						telnet_session_close(air, &telnet);
+				}
 			}
 		}
 
-		telnet_session_poll(air, &telnet);
+		if (telnet_session_poll(air, &telnet) < 0) {
+			fprintf(stderr, "airliftctl: AirLift telnet poll failed; closing session\n");
+			continue;
+		}
 
 		client_sock = NINA_NO_SOCKET;
-		if (nina_socket_accept(air, http_sock, &client_sock) == 0 &&
-		    client_sock != NINA_NO_SOCKET) {
+		accept_ret = nina_socket_accept(air, http_sock, &client_sock);
+		if (accept_ret < 0) {
+			fprintf(stderr, "airliftctl: AirLift HTTP accept failed; recycling\n");
+			break;
+		}
+		if (client_sock != NINA_NO_SOCKET) {
 			printf("airlift inbound http accepted socket %u\n", client_sock);
 			fflush(stdout);
 			nina_socket_set_nonblock(air, client_sock);
-			serve_http_client(air, client_sock);
+			if (serve_http_client(air, client_sock) < 0) {
+				fprintf(stderr, "airliftctl: AirLift HTTP client failed; keeping inbound server alive\n");
+				continue;
+			}
 		}
 
-		telnet_session_poll(air, &telnet);
+		if (telnet_session_poll(air, &telnet) < 0) {
+			fprintf(stderr, "airliftctl: AirLift telnet poll failed; closing session\n");
+			continue;
+		}
 
 		client_sock = NINA_NO_SOCKET;
-		if (ftp_sock != NINA_NO_SOCKET &&
-		    nina_socket_accept(air, ftp_sock, &client_sock) == 0 &&
-		    client_sock != NINA_NO_SOCKET) {
-			printf("airlift inbound ftp accepted socket %u\n", client_sock);
-			fflush(stdout);
-			nina_socket_set_nonblock(air, client_sock);
-			serve_ftp_client(air, client_sock, NINA_NO_SOCKET,
-					 ftp_sock, http_sock, shell_sock,
-					 local_ip);
+		if (ftp_sock != NINA_NO_SOCKET) {
+			accept_ret = nina_socket_accept(air, ftp_sock, &client_sock);
+			if (accept_ret < 0) {
+				fprintf(stderr, "airliftctl: AirLift FTP accept failed; recycling\n");
+				break;
+			}
+			if (client_sock != NINA_NO_SOCKET) {
+				printf("airlift inbound ftp accepted socket %u\n", client_sock);
+				fflush(stdout);
+				nina_socket_set_nonblock(air, client_sock);
+				if (serve_ftp_client(air, client_sock, NINA_NO_SOCKET,
+						     ftp_sock, http_sock, shell_sock,
+						     local_ip) < 0) {
+					fprintf(stderr, "airliftctl: AirLift FTP client failed; keeping inbound server alive\n");
+					continue;
+				}
+			}
 		}
 
-		telnet_session_poll(air, &telnet);
+		if (telnet_session_poll(air, &telnet) < 0) {
+			fprintf(stderr, "airliftctl: AirLift telnet poll failed; closing session\n");
+			continue;
+		}
 
 		usleep(20000);
 	}

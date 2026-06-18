@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 18:10:00 -0400
+Subject: [PATCH] misc: keep Fruit Jam usbhost bus active after reset
+
+The Fruit Jam PIO host bridge waited tens of milliseconds after releasing USB
+reset before sending the first SOF.  A full-speed device may treat a bus with
+no SOFs for more than a few milliseconds as suspend, while Pico-PIO-USB resumes
+frame traffic almost immediately after reset.
+
+Fill the active enumeration reset recovery with SOF/keepalive frames instead of
+silence, and make the hub SET_ADDRESS probes start from that fresh active
+reset.  This keeps the bus behavior closer to the known-good bare-metal host
+path.
+---
+ drivers/misc/fruitjam_usbhost.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -56,6 +56,7 @@
+ #define FJ_USBHOST_SOF_BURST_FRAMES	20u
+ #define FJ_USBHOST_ACTIVE_RESET_MS	50u
+ #define FJ_USBHOST_RESET_RECOVERY_MS	25u
++#define FJ_USBHOST_RESET_RECOVERY_FRAMES 25u
+ #define FJ_USBHOST_SETUP_ACK_SKIP_DELAY_US 1000u
+ #define FJ_USBHOST_HANDSHAKE_START_TIMEOUT_US 20u
+ #define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
+@@ -3519,6 +3519,10 @@
+ 
+ 	if (sof_frames > FJ_USBHOST_HUB_SOF_MAX_FRAMES)
+ 		return -EINVAL;
++
++	ret = fj_usbhost_pio_reset_active(uh);
++	if (ret)
++		return ret;
+ 
+ 	if (sof_frames) {
+ 		ret = fj_usbhost_pio_sof_burst(uh, sof_frames);
+@@ -3566,6 +3570,10 @@
+ 
+ 	if (sof_frames > FJ_USBHOST_HUB_SOF_MAX_FRAMES)
+ 		return -EINVAL;
++
++	ret = fj_usbhost_pio_reset_active(uh);
++	if (ret)
++		return ret;
+ 
+ 	if (sof_frames) {
+ 		ret = fj_usbhost_pio_sof_burst(uh, sof_frames);
+@@ -3572,12 +3581,15 @@ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh)
+ 	fj_usbhost_bus_reset_override(uh, true);
+ 	msleep(FJ_USBHOST_ACTIVE_RESET_MS);
+ 	fj_usbhost_bus_reset_override(uh, false);
+-	msleep(FJ_USBHOST_RESET_RECOVERY_MS);
++	usleep_range(100, 200);
+ 
+ 	ret = fj_usbhost_pio_configure_sms(uh);
+ 	if (ret)
+ 		return ret;
+ 	uh->last_reset_ms = FJ_USBHOST_ACTIVE_RESET_MS;
++	ret = fj_usbhost_pio_sof_burst(uh, FJ_USBHOST_RESET_RECOVERY_FRAMES);
++	if (ret)
++		return ret;
+ 	return fj_usbhost_pio_sof_burst(uh, FJ_USBHOST_SOF_BURST_FRAMES);
+ }
+ 
+-- 
+2.39.5

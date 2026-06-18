@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 12:45:00 +0000
+Subject: [PATCH] misc: gate Fruit Jam usbhost RX on TX-EOP
+
+The gated receive path armed the EOP detector so it would ignore the host
+packet and start looking only after the host TX-EOP IRQ.  The RX state
+machine itself was still enabled during host transmit, though, so it could
+consume host-token edges and enter the device-response window misaligned.
+
+Make the RX state machine wait on the same TX-EOP IRQ before it starts
+decoding.  This keeps both RX and EOP aligned to the device-response
+turnaround window without depending on CPU timing.
+---
+ drivers/misc/fruitjam_usbhost.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -546,6 +546,12 @@ static void fj_usbhost_pio_prepare_receive_after_tx(struct fruitjam_usbhost *uh)
+ 	writel(FJ_PIO_RX_INIT_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_OSR_ONES_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 	writel(FJ_PIO_RX_SET_X_ZERO_INSTR, rx_sm + FJ_PIO_SM_INSTR);
++	/*
++	 * Keep RX from decoding the host token.  The device's response starts
++	 * shortly after host EOP, so let PIO release RX on the same IRQ that
++	 * releases the EOP detector.
++	 */
++	writel(FJ_PIO_WAIT_TX_EOP_INSTR, rx_sm + FJ_PIO_SM_INSTR);
+ 
+ 	/*
+ 	 * Jump past the EOP program's self-synchronizing entry point, then stall
+-- 
+2.39.5

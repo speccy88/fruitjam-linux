@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000092 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 07:35:00 +0000
+Subject: [PATCH] misc: use gated setup ACK for Fruit Jam usbhost HCD
+
+The stream-capture setup path is useful as a diagnostic, but the HCD must not
+make enumeration decisions from bytes captured while the host is still
+transmitting.  On hardware the capture window reports four bytes with
+`setup_rx_len=4`, and the bytes are the host SETUP token shifted by one bit
+(`015b0020` instead of the expected `802d0010`), not a post-DATA0 device ACK.
+
+Return the HCD control setup stages to the gated ACK helper: keep SETUP and
+DATA0 in one DMA stream, arm RX/EOP after the token EOP, release receive at the
+DATA0 EOP in PIO timing, and then wait for the real device handshake.  This is
+closer to Pico-PIO-USB's setup transaction flow while preserving the Linux-side
+idle padding that gives the ACK gate time to arm.
+---
+ drivers/misc/fruitjam_usbhost.c | 43 +++++++++++++++------------------
+ 1 file changed, 20 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3161,36 +3161,32 @@
+ 		0x00, 0x00,
+ 	};
+ 	u8 encoded_len = 0;
+-	u32 setup_rx_len = 0;
+ 	int ret;
+ 
+ 	ret = fj_usbhost_pio_require_configured(uh);
+ 	if (ret)
+ 		goto out_error;
+ 
+-	fj_usbhost_pio_prepare_receive(uh);
+-	fj_usbhost_pio_clear_rx_irq(uh);
+-	ret = fj_usbhost_pio_send_setup_data0_capture_dma_addr(
+-		uh, addr, setup, sizeof(setup), &encoded_len, &setup_rx_len);
++	fj_usbhost_pio_disable_receive(uh);
++	ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
++		uh, addr, setup, sizeof(setup), &encoded_len);
+ 	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+ 	if (ret)
+ 		return ret;
+ 
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+-		  "%s setup-capture tx-len=%u rx-len=%u", name,
+-		  encoded_len, setup_rx_len);
++		  "%s setup-arm-ack tx-len=%u", name, encoded_len);
+ 
+-	ret = fj_usbhost_pio_receive_capture(uh, 100, 8, setup_rx_len);
++	ret = fj_usbhost_pio_receive_raw(uh, false);
+ 	if (ret)
+ 		return ret;
+-	if (!fj_usbhost_rx_has_pid(uh, FJ_USB_PID_ACK)) {
++	if (uh->last_rx_pid != FJ_USB_PID_ACK) {
+ 		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
+ 		return -EPROTO;
+ 	}
+ 
+ 	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
+-		  "%s setup-capture-ack tx-len=%u rx-len=%u", name,
+-		  encoded_len, uh->last_rx_len);
++		  "%s setup-ack-ok tx-len=%u", name, encoded_len);
+ 
+ 	ret = fj_usbhost_pio_control_status_in(uh, addr);
+ 	if (!ret)
+@@ -3320,7 +3316,6 @@
+ 	u8 expected_pid;
+ 	u32 copied;
+ 	u32 attempt;
+-	u32 setup_rx_len;
+ 	int last_ret = -ETIMEDOUT;
+ 	int ret;
+ 
+@@ -3347,18 +3342,15 @@
+ 		if (ret)
+ 			return ret;
+ 
+-		setup_rx_len = 0;
+-		fj_usbhost_pio_prepare_receive(uh);
+-		fj_usbhost_pio_clear_rx_irq(uh);
+-		ret = fj_usbhost_pio_send_setup_data0_capture_dma_addr(
+-			uh, addr, setup, 8, &encoded_len, &setup_rx_len);
++		fj_usbhost_pio_disable_receive(uh);
++		ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
++			uh, addr, setup, 8, &encoded_len);
+ 		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = fj_usbhost_pio_receive_capture(uh, 100, 8,
+-						     setup_rx_len);
+-		if (!ret && fj_usbhost_rx_has_pid(uh, FJ_USB_PID_ACK)) {
++		ret = fj_usbhost_pio_receive_raw(uh, false);
++		if (!ret && uh->last_rx_pid == FJ_USB_PID_ACK) {
+ 			setup_seen = true;
+ 		} else if (!ret) {
+ 			fj_usbhost_pio_record_rx(uh, -EPROTO,
+@@ -3368,14 +3360,14 @@
+ 		if (ret) {
+ 			scnprintf(uh->last_probe_summary,
+ 				  sizeof(uh->last_probe_summary),
+-				  "hcd-control-read setup-capture addr=%u len=%u attempt=%u ret=%d pid=0x%02x rx-len=%u",
++				  "hcd-control-read setup-arm-ack addr=%u len=%u attempt=%u ret=%d pid=0x%02x rx-len=%u",
+ 				  addr, len, attempt + 1, ret,
+ 				  uh->last_rx_pid, uh->last_rx_len);
+ 			last_ret = ret;
+ 		} else {
+ 			scnprintf(uh->last_probe_summary,
+ 				  sizeof(uh->last_probe_summary),
+-				  "hcd-control-read setup-capture-ack addr=%u len=%u attempt=%u rx-len=%u",
++				  "hcd-control-read setup-ack-ok addr=%u len=%u attempt=%u rx-len=%u",
+ 				  addr, len, attempt + 1,
+ 				  uh->last_rx_len);
+ 		}
+-- 
+2.39.5

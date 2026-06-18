@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 09:10:00 -0400
+Subject: [PATCH] misc: add Fruit Jam HCD PRE for low-speed hub devices
+
+wili8jam's known-working Fruit Jam USB host stack keeps a full-speed hub on
+the root port, but marks low-speed child endpoints with need_pre.  Before each
+low-speed child packet it sends a full-speed PRE PID, then switches the PIO TX
+clock to low-speed while keeping the upstream full-speed idle polarity.  Once
+that endpoint transaction is done, it restores the full-speed bus.
+
+The Linux HCD previously only selected low-speed mode from the root-port line
+state.  That works for a directly-connected low-speed device, but not for the
+common keyboard path where a full-speed hub exposes a low-speed HID child.  Add
+a per-URB PRE mode for low-speed devices with a parent hub, send PRE before
+token/data/ACK packets, and force those control transfers through the sequential
+upstream-style path where PRE can be inserted before each packet.
+---
+ drivers/misc/fruitjam_usbhost.c | 144 +++++++++++++++++++++++++++++--
+ 1 file changed, 138 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -115,6 +115,7 @@
+ #define FJ_USB_PID_ACK			0xd2u
+ #define FJ_USB_PID_NAK			0x5au
+ #define FJ_USB_PID_STALL		0x1eu
++#define FJ_USB_PID_PRE			0x3cu
+ 
+ #define FJ_USB_TX_ENCODED_SE0		0u
+ #define FJ_USB_TX_ENCODED_K		1u
+@@ -300,6 +301,7 @@ struct fruitjam_usbhost {
+ 	bool pio_ready;
+ 	bool pio_configured;
+ 	bool low_speed;
++	bool hcd_need_pre;
+ 	char last_probe_summary[FJ_USBHOST_PROBE_SUMMARY_MAX];
+ };
+ 
+@@ -571,7 +591,15 @@ static u32 fj_usbhost_clkdiv(struct fruitjam_usbhost *uh, u32 target_hz)
+ 
+ static u32 fj_usbhost_pio_tx_idle_side(struct fruitjam_usbhost *uh)
+ {
+-	return uh->low_speed ? FJ_PIO_TX_SIDE_LOW : FJ_PIO_TX_SIDE_FULL;
++	return (uh->low_speed && !uh->hcd_need_pre) ?
++	       FJ_PIO_TX_SIDE_LOW : FJ_PIO_TX_SIDE_FULL;
++}
++
++static u8 fj_usbhost_pio_gap_idle_byte(struct fruitjam_usbhost *uh)
++{
++	return (uh->low_speed && !uh->hcd_need_pre) ?
++	       FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE :
++	       FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE;
+ }
+ 
+ static u32 fj_usbhost_pio_tx_start_instr(struct fruitjam_usbhost *uh)
+@@ -1519,6 +1537,67 @@ static int fj_usbhost_pio_tx_packet(struct fruitjam_usbhost *uh,
+ 	return fj_usbhost_pio_tx_encoded(uh, encoded, len);
+ }
+ 
++static int fj_usbhost_pio_tx_packet_raw(struct fruitjam_usbhost *uh,
++					const u8 *packet, u8 packet_len,
++					u8 *encoded_len)
++{
++	return fj_usbhost_pio_tx_packet(uh, packet, packet_len, encoded_len);
++}
++
++static void fj_usbhost_pio_restore_full_speed(struct fruitjam_usbhost *uh)
++{
++	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
++	void __iomem *eop_sm = fj_usbhost_pio_sm(uh, uh->sm_eop);
++
++	if (!uh->pio_configured)
++		return;
++
++	uh->hcd_need_pre = false;
++	uh->low_speed = false;
++	fj_usbhost_pio_load_tx_program(uh);
++	writel(fj_usbhost_clkdiv(uh, 48000000u), tx_sm + FJ_PIO_SM_CLKDIV);
++	writel(fj_usbhost_clkdiv(uh, 96000000u), eop_sm + FJ_PIO_SM_CLKDIV);
++	writel(FJ_PIO_TX_INIT_INSTR, tx_sm + FJ_PIO_SM_INSTR);
++}
++
++static int fj_usbhost_pio_send_pre(struct fruitjam_usbhost *uh)
++{
++	void __iomem *tx_sm = fj_usbhost_pio_sm(uh, uh->sm_tx);
++	void __iomem *eop_sm = fj_usbhost_pio_sm(uh, uh->sm_eop);
++	u8 packet[2] = { FJ_USB_SYNC, FJ_USB_PID_PRE };
++	u8 encoded_len = 0;
++	bool saved_need_pre = uh->hcd_need_pre;
++	bool saved_low_speed = uh->low_speed;
++	int ret;
++
++	uh->hcd_need_pre = false;
++	uh->low_speed = false;
++	fj_usbhost_pio_load_tx_pre_program(uh);
++	writel(fj_usbhost_clkdiv(uh, 48000000u), tx_sm + FJ_PIO_SM_CLKDIV);
++
++	ret = fj_usbhost_pio_tx_packet_raw(uh, packet, sizeof(packet),
++					   &encoded_len);
++	if (ret) {
++		uh->hcd_need_pre = saved_need_pre;
++		uh->low_speed = saved_low_speed;
++		fj_usbhost_pio_load_tx_program(uh);
++		return ret;
++	}
++
++	/*
++	 * Match Pico-PIO-USB/wili8jam: PRE is full-speed, then the following
++	 * downstream child packet uses low-speed timing with full-speed idle
++	 * polarity until the HCD restores the upstream bus.
++	 */
++	udelay(4);
++	uh->hcd_need_pre = true;
++	uh->low_speed = true;
++	fj_usbhost_pio_load_tx_program(uh);
++	writel(fj_usbhost_clkdiv(uh, 6000000u), tx_sm + FJ_PIO_SM_CLKDIV);
++	writel(fj_usbhost_clkdiv(uh, 12000000u), eop_sm + FJ_PIO_SM_CLKDIV);
++	return 0;
++}
++
+ static int fj_usbhost_pio_tx_packet_cpu(struct fruitjam_usbhost *uh,
+ 					const u8 *packet, u8 packet_len,
+ 					u8 *encoded_len)
+@@ -1694,6 +1835,13 @@ static int fj_usbhost_pio_send_token(struct fruitjam_usbhost *uh,
+ 	packet[2] = token & 0xff;
+ 	packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
+ 		    ((token >> 8) & 0x1f);
++	if (uh->hcd_need_pre) {
++		int ret;
++
++		ret = fj_usbhost_pio_send_pre(uh);
++		if (ret)
++			return ret;
++	}
+ 	return fj_usbhost_pio_tx_packet(uh, packet, sizeof(packet), encoded_len);
+ }
+ 
+@@ -1707,6 +1855,13 @@ static int fj_usbhost_pio_send_token_cpu(struct fruitjam_usbhost *uh,
+ 	packet[2] = token & 0xff;
+ 	packet[3] = ((u16)fj_usbhost_crc5_token(token) << 3) |
+ 		    ((token >> 8) & 0x1f);
++	if (uh->hcd_need_pre) {
++		int ret;
++
++		ret = fj_usbhost_pio_send_pre(uh);
++		if (ret)
++			return ret;
++	}
+ 	return fj_usbhost_pio_tx_packet_cpu(uh, packet, sizeof(packet),
+ 					    encoded_len);
+ }
+@@ -1789,6 +1944,13 @@ static int fj_usbhost_pio_send_data_packet(struct fruitjam_usbhost *uh,
+ 	crc = fj_usbhost_crc16_data(payload, payload_len);
+ 	packet[2 + payload_len] = crc & 0xff;
+ 	packet[3 + payload_len] = crc >> 8;
++	if (uh->hcd_need_pre) {
++		int ret;
++
++		ret = fj_usbhost_pio_send_pre(uh);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return fj_usbhost_pio_tx_packet(uh, packet, payload_len + 4,
+ 					encoded_len);
+@@ -2013,6 +2175,13 @@ static int fj_usbhost_pio_send_ack(struct fruitjam_usbhost *uh)
+ 	 * Handshakes are timing-sensitive.  For this 5-byte encoded packet,
+ 	 * direct FIFO writes avoid DMA setup latency.
+ 	 */
++	if (uh->hcd_need_pre) {
++		int ret;
++
++		ret = fj_usbhost_pio_send_pre(uh);
++		if (ret)
++			return ret;
++	}
+ 	return fj_usbhost_pio_tx_encoded_cpu(uh, ack_encoded, sizeof(ack_encoded));
+ }
+ 
+@@ -3216,7 +3384,8 @@ static int fj_usbhost_pio_control_no_data(struct fruitjam_usbhost *uh,
+ 	if (ret)
+ 		goto out_error;
+ 
+-	for (attempt = 0; attempt < FJ_USBHOST_HCD_CONTROL_ATTEMPTS;
++	for (attempt = 0;
++	     attempt < (uh->hcd_need_pre ? 1 : FJ_USBHOST_HCD_CONTROL_ATTEMPTS);
+ 	     attempt++) {
+ 		bool upstream_mode = attempt == 0;
+ 		u32 gap_attempt = upstream_mode ? 0 : attempt - 1;
+@@ -3442,6 +3611,9 @@ static int fj_usbhost_hcd_control_status_out(struct fruitjam_usbhost *uh,
+ 	if (!upstream_ret)
+ 		return 0;
+ 
++	if (uh->hcd_need_pre)
++		return upstream_ret;
++
+ 	fj_usbhost_pio_disable_receive(uh);
+ 	ret = fj_usbhost_pio_control_status_out_arm_gap(uh, addr);
+ 	if (ret)
+@@ -3470,7 +3642,8 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 	else if (maxpacket > 64)
+ 		maxpacket = 64;
+ 
+-	for (attempt = 0; attempt < FJ_USBHOST_HCD_CONTROL_ATTEMPTS;
++	for (attempt = 0;
++	     attempt < (uh->hcd_need_pre ? 1 : FJ_USBHOST_HCD_CONTROL_ATTEMPTS);
+ 	     attempt++) {
+ 		bool upstream_mode = attempt == 0;
+ 		u32 gap_attempt = upstream_mode ? 0 : attempt - 1;
+@@ -3779,7 +3952,8 @@ static int fj_usbhost_hcd_control_write(struct fruitjam_usbhost *uh,
+ 	else if (maxpacket > 64)
+ 		maxpacket = 64;
+ 
+-	for (attempt = 0; attempt < FJ_USBHOST_HCD_CONTROL_ATTEMPTS;
++	for (attempt = 0;
++	     attempt < (uh->hcd_need_pre ? 1 : FJ_USBHOST_HCD_CONTROL_ATTEMPTS);
+ 	     attempt++) {
+ 		bool upstream_mode = attempt == 0;
+ 		u32 gap_attempt = upstream_mode ? 0 : attempt - 1;
+@@ -4268,6 +4444,11 @@ static int fj_usbhost_hcd_out(struct fruitjam_usbhost *uh,
+ 	return 0;
+ }
+ 
++static bool fj_usbhost_hcd_device_needs_pre(struct usb_device *udev)
++{
++	return udev && udev->speed == USB_SPEED_LOW && udev->parent;
++}
++
+ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ {
+ 	u8 addr = usb_pipedevice(urb->pipe);
+@@ -4275,8 +4455,15 @@ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ 	u32 actual = 0;
+ 	int ret;
+ 
++	uh->hcd_need_pre = fj_usbhost_hcd_device_needs_pre(urb->dev);
+ 	urb->actual_length = 0;
+-	if (usb_pipecontrol(urb->pipe)) {
++	if (uh->hcd_need_pre) {
++		ret = fj_usbhost_pio_require_configured(uh);
++		if (ret)
++			goto out_restore_speed;
++	}
++
++	if (usb_pipecontrol(urb->pipe)) {
+ 		struct usb_ctrlrequest *setup;
+ 		u16 len;
+ 		u16 maxpacket;
+@@ -4332,8 +4515,12 @@ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ 		ret = -EOPNOTSUPP;
+ 	}
+ 	if (!ret)
+ 		urb->actual_length = actual;
++out_restore_speed:
++	if (uh->hcd_need_pre)
++		fj_usbhost_pio_restore_full_speed(uh);
++	uh->hcd_need_pre = false;
+ 	return ret;
+ }
+ 
+ static int fj_usbhost_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
+-- 
+2.39.5

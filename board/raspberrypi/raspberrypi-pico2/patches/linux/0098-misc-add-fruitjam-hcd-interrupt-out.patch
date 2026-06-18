@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 04:45:00 -0400
+Subject: [PATCH] misc: add Fruit Jam HCD interrupt OUT transfers
+
+wili8jam enables TinyUSB XInput support, and its Xbox 360 wireless path sends
+interrupt OUT packets such as the presence probe and LED/rumble commands. The
+Fruit Jam Linux HCD could only issue control transfers and interrupt IN URBs, so
+Linux gamepad drivers had no way to complete those output reports even after
+enumeration.
+
+Add a small upstream-style OUT transaction helper: prepare RX, send OUT token,
+send DATA0/DATA1 according to the Linux endpoint toggle, start RX, and wait for
+ACK. Wire it to interrupt OUT and bulk OUT URBs so xpad/XInput-style devices and
+future CDC/MSC paths can progress past `-EOPNOTSUPP`.
+---
+ drivers/misc/fruitjam_usbhost.c | 92 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3841,6 +3841,95 @@ static int fj_usbhost_hcd_hub_control(struct usb_hcd *hcd, u16 type_req,
+ 	return ret;
+ }
+ 
++static int fj_usbhost_hcd_out(struct fruitjam_usbhost *uh,
++			      struct usb_device *udev, u8 addr, u8 ep,
++			      const u8 *buf, u16 len, u16 maxpacket,
++			      u32 *actual, const char *name)
++{
++	u32 copied = 0;
++	bool zero_packet = !len;
++	int ret = 0;
++
++	if (len && !buf)
++		return -EINVAL;
++	if (!maxpacket)
++		maxpacket = FJ_USBHOST_HCD_MAXPACKET;
++	else if (maxpacket > 64)
++		maxpacket = 64;
++
++	do {
++		u16 packet_len = zero_packet ? 0 :
++				 min_t(u16, maxpacket, len - copied);
++		const u8 *packet = packet_len ? buf + copied : NULL;
++		u8 data_pid = usb_gettoggle(udev, ep, 1) ?
++			      FJ_USB_PID_DATA1 : FJ_USB_PID_DATA0;
++		u32 nak_attempt;
++		bool acked = false;
++
++		for (nak_attempt = 0;
++		     nak_attempt < FJ_USBHOST_HCD_IN_NAK_ATTEMPTS;
++		     nak_attempt++) {
++			u8 encoded_len = 0;
++
++			ret = fj_usbhost_pio_require_configured(uh);
++			if (ret)
++				return ret;
++			ret = fj_usbhost_pio_sof_burst(uh, 1);
++			if (ret)
++				return ret;
++
++			fj_usbhost_pio_prepare_receive(uh);
++			ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_OUT,
++							addr, ep,
++							&encoded_len);
++			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++			if (ret)
++				return ret;
++			ret = fj_usbhost_pio_send_data_packet(
++				uh, data_pid, packet, packet_len,
++				&encoded_len);
++			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++			if (ret)
++				return ret;
++
++			fj_usbhost_pio_start_receive(uh);
++			ret = fj_usbhost_pio_wait_handshake_fast(uh);
++			if (ret)
++				continue;
++			if (uh->last_rx_pid == FJ_USB_PID_ACK) {
++				acked = true;
++				break;
++			}
++			if (uh->last_rx_pid == FJ_USB_PID_STALL)
++				return -EPIPE;
++			if (uh->last_rx_pid != FJ_USB_PID_NAK) {
++				fj_usbhost_pio_record_rx(uh, -EPROTO,
++							 uh->last_rx_len);
++				ret = -EPROTO;
++				break;
++			}
++			ret = -EAGAIN;
++		}
++		if (!acked) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "%s out-fail addr=%u ep=%u copied=%u len=%u ret=%d pid=0x%02x rx-len=%u",
++				  name, addr, ep, copied, len, ret,
++				  uh->last_rx_pid, uh->last_rx_len);
++			return ret ?: -EIO;
++		}
++
++		usb_dotoggle(udev, ep, 1);
++		copied += packet_len;
++	} while (!zero_packet && copied < len);
++
++	*actual = copied;
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "%s out-ok addr=%u ep=%u actual=%u",
++		  name, addr, ep, copied);
++	return 0;
++}
++
+ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ {
+ 	u8 addr = usb_pipedevice(urb->pipe);
+@@ -3874,6 +3956,16 @@ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ 		ret = fj_usbhost_hcd_interrupt_in(
+ 			uh, addr, ep, urb->transfer_buffer,
+ 			urb->transfer_buffer_length, &actual);
++	} else if ((usb_pipeint(urb->pipe) || usb_pipebulk(urb->pipe)) &&
++		   usb_pipeout(urb->pipe)) {
++		u16 maxpacket = usb_endpoint_maxp(&urb->ep->desc);
++		const char *name = usb_pipeint(urb->pipe) ?
++				   "hcd-interrupt" : "hcd-bulk";
++
++		ret = fj_usbhost_hcd_out(uh, urb->dev, addr, ep,
++					 urb->transfer_buffer,
++					 urb->transfer_buffer_length,
++					 maxpacket, &actual, name);
+ 	} else {
+ 		ret = -EOPNOTSUPP;
+ 	}
+-- 
+2.39.5

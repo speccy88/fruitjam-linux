@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 20:20:00 -0400
+Subject: [PATCH] misc: power-cycle Fruit Jam HCD before registration
+
+The CH334F hub path is most fragile between reset release and the first EP0
+descriptor request. The manual `fruitjam-usbhost hcd-start` and AirLift HTTP
+HCD start helpers already precondition the bus by cycling host power before
+starting the HCD, but the delayed automatic HCD registration path can bypass
+that sequence.
+
+Move the same pre-start conditioning into the kernel HCD registration path:
+turn host power off, release the D+/D- pins, wait for the hub to discharge,
+turn power back on, wait for the hub to settle, then issue a short bus reset
+before registering the root hub. This makes automatic boot enumeration use the
+same safer power/reset timing as the manual retry path.
+---
+ drivers/misc/fruitjam_usbhost.c | 43 +++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -63,6 +63,9 @@
+ #define FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT 0u
+ #define FJ_USBHOST_HCD_EP0_FAULT_LIMIT 4u
+ #define FJ_USBHOST_HCD_PORT_RESET_SETTLE_MS_DEFAULT 500u
++#define FJ_USBHOST_HCD_PRESTART_POWER_OFF_MS 250u
++#define FJ_USBHOST_HCD_PRESTART_POWER_ON_MS 750u
++#define FJ_USBHOST_HCD_PRESTART_RESET_MS 100u
+ /*
+  * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
+  * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
+@@ -4570,7 +4573,46 @@
+ 
+ 	return uh->hcd_frame++ & 0x7ff;
+ }
++
++static void fj_usbhost_hcd_prestart_power_cycle(struct fruitjam_usbhost *uh)
++{
++	mutex_lock(&uh->lock);
++
++	fj_usbhost_hcd_clear_fault_locked(uh);
++	fj_usbhost_pio_release(uh);
++	fj_gpio_output(uh, uh->power_gpio, false);
++	fj_gpio_input(uh, uh->dp_gpio);
++	fj_gpio_input(uh, uh->dm_gpio);
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-prestart-power-off-ms=%u",
++		  FJ_USBHOST_HCD_PRESTART_POWER_OFF_MS);
+ 
++	mutex_unlock(&uh->lock);
++	msleep(FJ_USBHOST_HCD_PRESTART_POWER_OFF_MS);
++	mutex_lock(&uh->lock);
++
++	fj_gpio_output(uh, uh->power_gpio, true);
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-prestart-power-on-ms=%u",
++		  FJ_USBHOST_HCD_PRESTART_POWER_ON_MS);
++
++	mutex_unlock(&uh->lock);
++	msleep(FJ_USBHOST_HCD_PRESTART_POWER_ON_MS);
++	mutex_lock(&uh->lock);
++
++	if (uh->pio_ready)
++		fj_usbhost_pio_configure_sms(uh);
++	fj_usbhost_reset_bus(uh, FJ_USBHOST_HCD_PRESTART_RESET_MS);
++	fj_usbhost_hcd_refresh_port(uh);
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-prestart-power-cycle off-ms=%u on-ms=%u reset-ms=%u",
++		  FJ_USBHOST_HCD_PRESTART_POWER_OFF_MS,
++		  FJ_USBHOST_HCD_PRESTART_POWER_ON_MS,
++		  FJ_USBHOST_HCD_PRESTART_RESET_MS);
++
++	mutex_unlock(&uh->lock);
++}
++
+ static int fj_usbhost_hcd_hub_status_data(struct usb_hcd *hcd, char *buf)
+ {
+ 	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
+@@ -4901,6 +4943,9 @@
+ 
+ 	if (!uh->hcd || uh->hcd_registered)
+ 		return 0;
++
++	fj_usbhost_hcd_prestart_power_cycle(uh);
++	dev_info(uh->dev, "USB host HCD pre-start power cycle complete\n");
+ 
+ 	ret = usb_add_hcd(uh->hcd, 0, 0);
+ 	if (ret) {
+-- 
+2.39.5

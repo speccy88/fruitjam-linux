@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 21:05:00 -0400
+Subject: [PATCH] misc: auto-recover Fruit Jam HCD EP0 faults
+
+The EP0 fault latch protects the no-MMU image from endless synchronous USB
+control retries, but leaving the HCD faulted until userspace notices is too
+passive for a boot-time CH334F hub margin problem. After the fault latch trips,
+schedule one delayed recovery pass that uses the same host-power preconditioning
+as HCD registration, then clears the fault and asks usbcore to poll the root
+hub again.
+
+This keeps the observable fault summary and back-pressure behavior, while
+allowing the board to retry enumeration without requiring a shell command.
+---
+ drivers/misc/fruitjam_usbhost.c | 53 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 45 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -66,6 +66,7 @@
+ #define FJ_USBHOST_HCD_PRESTART_POWER_OFF_MS 250u
+ #define FJ_USBHOST_HCD_PRESTART_POWER_ON_MS 750u
+ #define FJ_USBHOST_HCD_PRESTART_RESET_MS 100u
++#define FJ_USBHOST_HCD_FAULT_RECOVER_DELAY_MS 1000u
+ /*
+  * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
+  * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
+@@ -306,11 +307,13 @@ struct fruitjam_usbhost {
+ 	struct usb_hcd *hcd;
+ 	struct task_struct *hcd_sof_task;
+ 	struct delayed_work hcd_register_work;
++	struct delayed_work hcd_fault_recover_work;
+ 	u32 hcd_port_status;
+ 	u32 hcd_start_delay_ms;
+ 	u32 hcd_port_reset_settle_ms;
+ 	bool hcd_manual_start;
+ 	u32 hcd_ep0_failures;
++	u32 hcd_fault_recoveries;
+ 	u16 hcd_frame;
+ 	bool hcd_sof_enabled;
+ 	bool hcd_registered;
+@@ -4412,9 +4415,12 @@ static void fj_usbhost_hcd_fault_locked(struct fruitjam_usbhost *uh, int ret)
+ 		  uh->hcd_ep0_failures, ret, uh->last_rx_pid,
+ 		  uh->last_rx_len, prev_summary);
+ 	dev_warn(uh->dev,
+-		 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u prev=%s; use fruitjam-usbhost hcd-clear-fault to retry\n",
++		 "USB host HCD faulted after %u EP0 failures ret=%d pid=0x%02x rx-len=%u prev=%s; scheduling automatic recovery\n",
+ 		 uh->hcd_ep0_failures, ret, uh->last_rx_pid,
+ 		 uh->last_rx_len, prev_summary);
++	if (uh->hcd_registered)
++		schedule_delayed_work(&uh->hcd_fault_recover_work,
++			msecs_to_jiffies(FJ_USBHOST_HCD_FAULT_RECOVER_DELAY_MS));
+ }
+ 
+ static void fj_usbhost_hcd_note_urb_result(struct fruitjam_usbhost *uh,
+@@ -4574,11 +4580,13 @@ static int fj_usbhost_hcd_get_frame_number(struct usb_hcd *hcd)
+ 	return uh->hcd_frame++ & 0x7ff;
+ }
+ 
+-static void fj_usbhost_hcd_prestart_power_cycle(struct fruitjam_usbhost *uh)
++static void fj_usbhost_hcd_prestart_power_cycle(struct fruitjam_usbhost *uh,
++						  bool clear_fault)
+ {
+ 	mutex_lock(&uh->lock);
+ 
+-	fj_usbhost_hcd_clear_fault_locked(uh);
++	if (clear_fault)
++		fj_usbhost_hcd_clear_fault_locked(uh);
+ 	fj_usbhost_pio_release(uh);
+ 	fj_gpio_output(uh, uh->power_gpio, false);
+ 	fj_gpio_input(uh, uh->dp_gpio);
+@@ -4613,6 +4621,40 @@ static void fj_usbhost_hcd_prestart_power_cycle(struct fruitjam_usbhost *uh)
+ 	mutex_unlock(&uh->lock);
+ }
+ 
++static void fj_usbhost_hcd_fault_recover_work(struct work_struct *work)
++{
++	struct fruitjam_usbhost *uh =
++		container_of(to_delayed_work(work), struct fruitjam_usbhost,
++			     hcd_fault_recover_work);
++	u32 recovery;
++
++	mutex_lock(&uh->lock);
++	if (!uh->hcd || !uh->hcd_registered || !uh->hcd_faulted) {
++		mutex_unlock(&uh->lock);
++		return;
++	}
++	recovery = ++uh->hcd_fault_recoveries;
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-auto-recover %u start", recovery);
++	mutex_unlock(&uh->lock);
++
++	fj_usbhost_hcd_prestart_power_cycle(uh, false);
++
++	mutex_lock(&uh->lock);
++	if (uh->hcd && uh->hcd_registered) {
++		fj_usbhost_hcd_clear_fault_locked(uh);
++		uh->hcd_sof_enabled = true;
++		fj_usbhost_hcd_refresh_port(uh);
++		scnprintf(uh->last_probe_summary,
++			  sizeof(uh->last_probe_summary),
++			  "hcd-auto-recover %u done", recovery);
++	}
++	mutex_unlock(&uh->lock);
++
++	if (uh->hcd)
++		usb_hcd_poll_rh_status(uh->hcd);
++}
++
+ static int fj_usbhost_hcd_hub_status_data(struct usb_hcd *hcd, char *buf)
+ {
+ 	struct fruitjam_usbhost *uh = fj_usbhost_hcd_to_uh(hcd);
+@@ -4944,7 +4986,7 @@ static int fj_usbhost_register_hcd(struct fruitjam_usbhost *uh)
+ 	if (!uh->hcd || uh->hcd_registered)
+ 		return 0;
+ 
+-	fj_usbhost_hcd_prestart_power_cycle(uh);
++	fj_usbhost_hcd_prestart_power_cycle(uh, true);
+ 	dev_info(uh->dev, "USB host HCD pre-start power cycle complete\n");
+ 
+ 	ret = usb_add_hcd(uh->hcd, 0, 0);
+@@ -6515,6 +6557,8 @@ static int fj_usbhost_probe(struct platform_device *pdev)
+ 		return ret;
+ 	INIT_DELAYED_WORK(&uh->hcd_register_work,
+ 			  fj_usbhost_hcd_register_work);
++	INIT_DELAYED_WORK(&uh->hcd_fault_recover_work,
++			  fj_usbhost_hcd_fault_recover_work);
+ 	hcd = usb_create_hcd(&fj_usbhost_hc_driver, &pdev->dev,
+ 			     dev_name(&pdev->dev));
+ 	if (!hcd) {
+@@ -6547,6 +6591,7 @@ static void fj_usbhost_remove(struct platform_device *pdev)
+ 
+ 	fj_usbhost_hcd_sof_stop(uh);
+ 	cancel_delayed_work_sync(&uh->hcd_register_work);
++	cancel_delayed_work_sync(&uh->hcd_fault_recover_work);
+ 
+ 	if (uh->hcd) {
+ 		if (uh->hcd_registered)
+-- 
+2.39.5

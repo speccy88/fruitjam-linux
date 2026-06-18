@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 01:20:00 +0000
+Subject: [PATCH] misc: keep Fruit Jam usbhost PIO configured across reset
+
+The wili8jam/Pico-PIO-USB host keeps its PIO USB engine configured while it
+asserts and releases the root-port reset. The Linux bridge was reloading the
+PIO state machines immediately after releasing SE0, which can disturb the
+first post-reset full-speed idle/SOF window seen by the CH334F hub.
+
+Configure the PIO engine before reset if needed, then leave it intact across
+reset release and resume recovery SOFs/keepalives through that same engine.
+Apply the same behavior to the HCD root-port reset helper and the manual
+active probes so both paths exercise the same wili8jam-style timing.
+---
+ drivers/misc/fruitjam_usbhost.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -4483,9 +4483,6 @@ static int fj_usbhost_pio_reset_active(struct fruitjam_usbhost *uh)
+ 	fj_usbhost_bus_reset_override(uh, false);
+ 	usleep_range(100, 200);
+ 
+-	ret = fj_usbhost_pio_configure_sms(uh);
+-	if (ret)
+-		return ret;
+ 	uh->last_reset_ms = FJ_USBHOST_ACTIVE_RESET_MS;
+ 	ret = fj_usbhost_pio_sof_burst(uh, FJ_USBHOST_RESET_RECOVERY_FRAMES);
+ 	if (ret)
+@@ -4596,11 +4592,14 @@ static void fj_usbhost_reset_bus(struct fruitjam_usbhost *uh, u32 reset_ms)
+ 	if (use_pio) {
+ 		fj_usbhost_bus_reset_override(uh, true);
+ 		msleep(reset_ms);
+ 		fj_usbhost_bus_reset_override(uh, false);
+ 		usleep_range(100, 200);
+-		if (fj_usbhost_pio_configure_sms(uh))
++		if (uh->pio_configured)
++			fj_usbhost_pio_sof_burst(
++				uh, FJ_USBHOST_RESET_RECOVERY_FRAMES);
++		else if (fj_usbhost_pio_configure_sms(uh))
+ 			msleep(FJ_USBHOST_POST_RESET_MS);
+ 		else
+ 			fj_usbhost_pio_sof_burst(
+ 				uh, FJ_USBHOST_RESET_RECOVERY_FRAMES);
+ 	} else {
+-- 
+2.39.5

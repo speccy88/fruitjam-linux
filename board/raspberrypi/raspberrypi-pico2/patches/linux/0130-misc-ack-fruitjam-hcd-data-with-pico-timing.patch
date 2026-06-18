@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Thu, 18 Jun 2026 00:00:00 -0400
+Subject: [PATCH] misc: ACK Fruit Jam HCD data with Pico timing
+
+Pico-PIO-USB receives a data packet and sends the ACK from the same
+RX-EOP handling path as soon as the CRC matches. The Fruit Jam Linux HCD
+waited for a longer quiet drain before ACKing DATA packets. That makes the
+host less like the known-working wili8jam path and can miss the device's
+strict post-EOP handshake window during control reads and interrupt IN
+transfers.
+
+Keep a tiny bounded tail drain for the RP2350 PIO decoder, but ACK as soon
+as the packet CRC validates instead of waiting for an extended quiet window.
+---
+ drivers/misc/fruitjam_usbhost.c | 38 ++++++++++++++++++++++++--------------
+ 1 file changed, 24 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -97,6 +97,7 @@
+ #define FJ_USBHOST_HCD_HANDSHAKE_START_FS_US 3u
+ #define FJ_USBHOST_HCD_HANDSHAKE_START_LS_US 12u
+ #define FJ_USBHOST_HCD_HANDSHAKE_PACKET_US 7u
++#define FJ_USBHOST_HCD_DATA_ACK_TAIL_DRAIN_US 4u
+ #define FJ_USBHOST_HANDSHAKE_SCAN_QUIET_US 80u
+ #define FJ_USBHOST_SHIFTED_SYNC		0x01u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+@@ -2428,21 +2429,9 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ 		}
+ 		if (irq & FJ_PIO_IRQ_RX_EOP) {
+ 			int ack_ret;
+-			u32 drain_waited, quiet;
++			u32 drain_waited;
+ 
+ 			FJ_USBHOST_DRAIN_RX_FIFO();
+-			for (drain_waited = 0, quiet = 0;
+-			     drain_waited < 50 && quiet < 8; drain_waited++) {
+-				u32 before = len;
+-
+-				FJ_USBHOST_DRAIN_RX_FIFO();
+-				if (len == before)
+-					quiet++;
+-				else
+-					quiet = 0;
+-				if (quiet < 8)
+-					udelay(1);
+-			}
+ 			if (!len) {
+ 				/*
+ 				 * Gated receive can start in the host EOP window:
+@@ -2456,10 +2445,21 @@ static int fj_usbhost_pio_receive_raw(struct fruitjam_usbhost *uh, bool ack_data
+ 			    (uh->last_rx_bytes[1] == FJ_USB_PID_DATA0 ||
+ 			     uh->last_rx_bytes[1] == FJ_USB_PID_DATA1)) {
+ 				/*
+-				 * The RX EOP IRQ can beat the decoder tail by a
+-				 * few FIFO bytes. Validate and ACK only after the
+-				 * bounded quiet drain has seen the complete packet.
++				 * Match Pico-PIO-USB's data receive path: once EOP is
++				 * visible, ACK as soon as the decoder tail is present
++				 * and CRC validates. Do not wait for a long quiet window;
++				 * the device expects the handshake immediately after EOP.
+ 				 */
++				for (drain_waited = 0;
++				     drain_waited <= FJ_USBHOST_HCD_DATA_ACK_TAIL_DRAIN_US;
++				     drain_waited++) {
++					FJ_USBHOST_DRAIN_RX_FIFO();
++					if (fj_usbhost_pio_rx_data_crc_ok(uh, len))
++						break;
++					if (drain_waited <
++					    FJ_USBHOST_HCD_DATA_ACK_TAIL_DRAIN_US)
++						udelay(1);
++				}
+ 				if (!fj_usbhost_pio_rx_data_crc_ok(uh, len)) {
+ 					ret = -EILSEQ;
+ 					break;
+@@ -5930,6 +5930,7 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh, char *buf, size
+ 			 "hcd_delay_ms %u\n"
+ 			 "hcd_port_reset_settle_ms %u\n"
+ 			 "hcd_port_reset_sof_frames %u\n"
++			 "hcd_data_ack_tail_drain_us %u\n"
+ 			 "hcd_sof %u\n"
+ 			 "pio_configured %u\n"
+ 			 "pio_program %s\n"
+@@ -5985,6 +5986,7 @@ static int fj_usbhost_format_status(struct fruitjam_usbhost *uh, char *buf, size
+ 			 uh->hcd_ep0_failures, uh->hcd_start_delay_ms,
+ 			 uh->hcd_port_reset_settle_ms,
+ 			 uh->hcd_port_reset_sof_frames,
++			 FJ_USBHOST_HCD_DATA_ACK_TAIL_DRAIN_US,
+ 			 uh->hcd_sof_enabled ? 1 : 0, uh->pio_configured,
+ 			 uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+ 			 uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->clk_sys_hz,
+@@ -6040,6 +6042,7 @@ static ssize_t fj_usbhost_read(struct file *file, char __user *buf,
+ 			"hcd_delay_ms %u\n"
+ 			"hcd_port_reset_settle_ms %u\n"
+ 			"hcd_port_reset_sof_frames %u\n"
++			"hcd_data_ack_tail_drain_us %u\n"
+ 			"hcd_sof %u\n"
+ 			"pio_configured %u\n"
+ 			"pio_program %s\n"
+@@ -6068,6 +6071,7 @@ static ssize_t fj_usbhost_read(struct file *file, char __user *buf,
+ 			uh->hcd_ep0_failures, uh->hcd_start_delay_ms,
+ 			uh->hcd_port_reset_settle_ms,
+ 			uh->hcd_port_reset_sof_frames,
++			FJ_USBHOST_HCD_DATA_ACK_TAIL_DRAIN_US,
+ 			uh->hcd_sof_enabled ? 1 : 0, uh->pio_configured,
+ 			uh->pio_ready ? FJ_USBHOST_PIO_PROGRAM_NAME : "none",
+ 			uh->sm_tx, uh->sm_rx, uh->sm_eop, uh->clk_sys_hz,

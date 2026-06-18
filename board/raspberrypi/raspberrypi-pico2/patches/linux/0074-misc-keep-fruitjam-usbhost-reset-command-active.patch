@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 18:25:00 -0400
+Subject: [PATCH] misc: keep Fruit Jam usbhost reset command active
+
+After the active enumeration path was changed to fill reset recovery with
+SOF/keepalive frames, do the same for the user-visible reset command.  This
+prevents `fruitjam-usbhost reset` from leaving a full-speed device idle long
+enough to enter suspend before the next probe command runs.
+---
+ drivers/misc/fruitjam_usbhost.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3730,16 +3730,22 @@
+ 		fj_usbhost_bus_reset_override(uh, true);
+ 		msleep(reset_ms);
+ 		fj_usbhost_bus_reset_override(uh, false);
++		usleep_range(100, 200);
++		if (fj_usbhost_pio_configure_sms(uh))
++			msleep(FJ_USBHOST_POST_RESET_MS);
++		else
++			fj_usbhost_pio_sof_burst(
++				uh, FJ_USBHOST_RESET_RECOVERY_FRAMES);
+ 	} else {
+ 		fj_gpio_output(uh, uh->dp_gpio, false);
+ 		fj_gpio_output(uh, uh->dm_gpio, false);
+ 		msleep(reset_ms);
+ 		fj_gpio_input(uh, uh->dp_gpio);
+ 		fj_gpio_input(uh, uh->dm_gpio);
++		msleep(FJ_USBHOST_POST_RESET_MS);
++		if (uh->pio_ready)
++			fj_usbhost_pio_configure_sms(uh);
+ 	}
+-	msleep(FJ_USBHOST_POST_RESET_MS);
+-	if (!use_pio && uh->pio_ready)
+-		fj_usbhost_pio_configure_sms(uh);
+ 	uh->last_reset_ms = reset_ms;
+ }
+ 
+-- 
+2.39.5

@@ -1,0 +1,421 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 07:10:00 -0400
+Subject: [PATCH] misc: expand Fruit Jam HCD transfer types
+
+wili8jam's TinyUSB host stack enables hub, HID, CDC, MSC, and XInput support.
+The Fruit Jam Linux HCD had moved past root-hub registration, control reads,
+interrupt IN, and interrupt/bulk OUT, but it still rejected control OUT requests
+with a data stage and bulk IN URBs. It also accepted interrupt IN data without
+tracking the Linux USB core's endpoint data toggle.
+
+Add the missing pieces needed by the broader wili8jam-style host stack:
+
+  * control write transfers with DATA1/DATA0 OUT packets and DATA1 status IN
+  * a shared interrupt/bulk IN helper with Linux endpoint-toggle tracking
+  * bulk IN dispatch for future CDC/MSC paths
+
+The current hardware blocker is still endpoint-zero enumeration of the onboard
+hub, but these paths remove the next `-EOPNOTSUPP` failures for keyboard,
+gamepad, CDC, and MSC class drivers once the hub starts responding.
+---
+ drivers/misc/fruitjam_usbhost.c | 340 ++++++++++++++++++++++++++++++-
+ 1 file changed, 328 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -3580,49 +3580,326 @@ static int fj_usbhost_hcd_control_read(struct fruitjam_usbhost *uh,
+ 	return last_ret;
+ }
+ 
+-static int fj_usbhost_hcd_interrupt_in(struct fruitjam_usbhost *uh,
+-				       u8 addr, u8 ep, u8 *buf,
+-				       u16 len, u32 *actual)
++static int fj_usbhost_hcd_control_data_out(struct fruitjam_usbhost *uh,
++					     u8 addr, const u8 *buf, u16 len,
++					     u16 maxpacket, u32 *actual)
+ {
+-	u8 encoded_len = 0;
+-	u32 payload_len;
+-	int ret;
++	u32 copied = 0;
++	u8 data_pid = FJ_USB_PID_DATA1;
++	int ret = 0;
+ 
+ 	if (len && !buf)
+ 		return -EINVAL;
+-	ret = fj_usbhost_pio_require_configured(uh);
+-	if (ret)
+-		return ret;
+-	ret = fj_usbhost_pio_sof_burst(uh, 1);
+-	if (ret)
+-		return ret;
++	if (!maxpacket)
++		maxpacket = FJ_USBHOST_HCD_MAXPACKET;
++	else if (maxpacket > 64)
++		maxpacket = 64;
+ 
++	while (copied < len) {
++		u16 packet_len = min_t(u16, maxpacket, len - copied);
++		u32 nak_attempt;
++		bool acked = false;
+ 
+-	fj_usbhost_pio_prepare_receive(uh);
+-	ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, addr, ep,
+-					&encoded_len);
+-	fj_usbhost_pio_record_tx(uh, ret, encoded_len);
+-	if (ret)
+-		return ret;
+-	fj_usbhost_pio_start_receive(uh);
+-	ret = fj_usbhost_pio_receive_raw(uh, true);
+-	if (ret)
+-		return ret;
+-	if (uh->last_rx_pid == FJ_USB_PID_NAK)
+-		return -EAGAIN;
+-	if (uh->last_rx_pid == FJ_USB_PID_STALL)
+-		return -EPIPE;
+-	if ((uh->last_rx_pid != FJ_USB_PID_DATA0 &&
+-	     uh->last_rx_pid != FJ_USB_PID_DATA1) ||
+-	    !fj_usbhost_pio_rx_data_crc_ok(uh, uh->last_rx_len)) {
+-		fj_usbhost_pio_record_rx(uh, -EPROTO, uh->last_rx_len);
+-		return -EPROTO;
++		for (nak_attempt = 0;
++		     nak_attempt < FJ_USBHOST_HCD_IN_NAK_ATTEMPTS;
++		     nak_attempt++) {
++			u8 encoded_len = 0;
++
++			ret = fj_usbhost_pio_require_configured(uh);
++			if (ret)
++				return ret;
++			ret = fj_usbhost_pio_sof_burst(uh, 1);
++			if (ret)
++				return ret;
++
++			fj_usbhost_pio_prepare_receive(uh);
++			ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_OUT,
++							addr, 0,
++							&encoded_len);
++			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++			if (ret)
++				return ret;
++			ret = fj_usbhost_pio_send_data_packet(
++				uh, data_pid, buf + copied, packet_len,
++				&encoded_len);
++			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++			if (ret)
++				return ret;
++
++			fj_usbhost_pio_start_receive(uh);
++			ret = fj_usbhost_pio_wait_handshake_fast(uh);
++			if (ret)
++				continue;
++			if (uh->last_rx_pid == FJ_USB_PID_ACK) {
++				acked = true;
++				break;
++			}
++			if (uh->last_rx_pid == FJ_USB_PID_STALL)
++				return -EPIPE;
++			if (uh->last_rx_pid != FJ_USB_PID_NAK) {
++				fj_usbhost_pio_record_rx(uh, -EPROTO,
++							 uh->last_rx_len);
++				ret = -EPROTO;
++				break;
++			}
++			ret = -EAGAIN;
++		}
++		if (!acked) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "hcd-control-write data-out-fail addr=%u copied=%u len=%u ret=%d pid=0x%02x rx-len=%u",
++				  addr, copied, len, ret,
++				  uh->last_rx_pid, uh->last_rx_len);
++			return ret ?: -EIO;
++		}
++
++		copied += packet_len;
++		data_pid = data_pid == FJ_USB_PID_DATA1 ?
++			   FJ_USB_PID_DATA0 : FJ_USB_PID_DATA1;
++	}
++
++	*actual = copied;
++	return 0;
++}
++
++static int fj_usbhost_hcd_control_status_in(struct fruitjam_usbhost *uh,
++					    u8 addr)
++{
++	u32 nak_attempt;
++	int ret = 0;
++
++	for (nak_attempt = 0;
++	     nak_attempt < FJ_USBHOST_HCD_IN_NAK_ATTEMPTS;
++	     nak_attempt++) {
++		u8 encoded_len = 0;
++
++		ret = fj_usbhost_pio_require_configured(uh);
++		if (ret)
++			return ret;
++		ret = fj_usbhost_pio_sof_burst(uh, 1);
++		if (ret)
++			return ret;
++
++		fj_usbhost_pio_prepare_receive(uh);
++		ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN, addr, 0,
++						&encoded_len);
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		if (ret)
++			return ret;
++		fj_usbhost_pio_start_receive(uh);
++		ret = fj_usbhost_pio_receive_raw(uh, true);
++		if (ret)
++			continue;
++		if (uh->last_rx_pid == FJ_USB_PID_NAK) {
++			ret = -EAGAIN;
++			continue;
++		}
++		if (uh->last_rx_pid == FJ_USB_PID_STALL)
++			return -EPIPE;
++		if (uh->last_rx_pid != FJ_USB_PID_DATA1 ||
++		    uh->last_rx_len != 4 ||
++		    !fj_usbhost_pio_rx_data_crc_ok(uh, uh->last_rx_len)) {
++			fj_usbhost_pio_record_rx(uh, -EPROTO,
++						 uh->last_rx_len);
++			return -EPROTO;
++		}
++		return 0;
++	}
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-control-write status-in-fail addr=%u ret=%d pid=0x%02x rx-len=%u",
++		  addr, ret, uh->last_rx_pid, uh->last_rx_len);
++	return ret ?: -EIO;
++}
++
++static int fj_usbhost_hcd_control_write(struct fruitjam_usbhost *uh,
++					u8 addr, const u8 *setup,
++					const u8 *buf, u16 len,
++					u16 maxpacket, u32 *actual)
++{
++	u8 encoded_len;
++	u32 copied;
++	u32 attempt;
++	int last_ret = -ETIMEDOUT;
++	int ret;
++
++	if (len && !buf)
++		return -EINVAL;
++	if (!maxpacket)
++		maxpacket = FJ_USBHOST_HCD_MAXPACKET;
++	else if (maxpacket > 64)
++		maxpacket = 64;
++
++	for (attempt = 0; attempt < FJ_USBHOST_HCD_CONTROL_ATTEMPTS;
++	     attempt++) {
++		bool upstream_mode = attempt == 0;
++		u32 gap_attempt = upstream_mode ? 0 : attempt - 1;
++		u8 arm_gap = fj_usbhost_hcd_ack_arm_gap_for_attempt(gap_attempt);
++		u8 report_gap = upstream_mode ? 0 : arm_gap;
++		const char *mode = upstream_mode ? "mode=upstream" :
++						 "mode=arm-gap";
++
++		encoded_len = 0;
++		copied = 0;
++
++		ret = fj_usbhost_pio_require_configured(uh);
++		if (ret)
++			return ret;
++		ret = fj_usbhost_pio_sof_burst(uh, 1);
++		if (ret)
++			return ret;
++
++		if (upstream_mode) {
++			ret = fj_usbhost_pio_send_setup_data0_upstream_addr(
++				uh, addr, setup, 8, &encoded_len);
++		} else {
++			fj_usbhost_pio_disable_receive(uh);
++			ret = fj_usbhost_pio_send_setup_data0_dma_addr_arm_ack(
++				uh, addr, setup, 8, arm_gap, &encoded_len);
++		}
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		if (ret)
++			return ret;
++
++		ret = upstream_mode ?
++		      fj_usbhost_pio_wait_handshake_fast(uh) :
++		      fj_usbhost_pio_receive_raw(uh, false);
++		if (!ret && uh->last_rx_pid != FJ_USB_PID_ACK) {
++			fj_usbhost_pio_record_rx(uh, -EPROTO,
++						 uh->last_rx_len);
++			ret = -EPROTO;
++		}
++		if (ret) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "hcd-control-write setup-fail %s addr=%u len=%u attempt=%u gap=%u tx-len=%u ret=%d pid=0x%02x rx-len=%u",
++				  mode, addr, len, attempt + 1, report_gap,
++				  encoded_len, ret, uh->last_rx_pid,
++				  uh->last_rx_len);
++			last_ret = ret;
++			continue;
++		}
++
++		ret = fj_usbhost_hcd_control_data_out(uh, addr, buf, len,
++						      maxpacket, &copied);
++		if (ret) {
++			last_ret = ret;
++			continue;
++		}
++
++		ret = fj_usbhost_hcd_control_status_in(uh, addr);
++		if (!ret) {
++			*actual = copied;
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "hcd-control-write ok %s addr=%u requested=%u actual=%u attempt=%u gap=%u",
++				  mode, addr, len, copied, attempt + 1,
++				  report_gap);
++			return 0;
++		}
++		last_ret = ret;
++	}
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "hcd-control-write failed modes=upstream,arm-gap last-ret=%d pid=0x%02x rx-len=%u",
++		  last_ret, uh->last_rx_pid, uh->last_rx_len);
++	return last_ret;
++}
++
++static int fj_usbhost_hcd_in(struct fruitjam_usbhost *uh,
++			     struct usb_device *udev, u8 addr, u8 ep,
++			     u8 *buf, u16 len, u16 maxpacket,
++			     u32 *actual, const char *name)
++{
++	u32 copied = 0;
++	int ret = 0;
++
++	if (len && !buf)
++		return -EINVAL;
++	if (!maxpacket)
++		maxpacket = FJ_USBHOST_HCD_MAXPACKET;
++	else if (maxpacket > 64)
++		maxpacket = 64;
++	if (!len) {
++		*actual = 0;
++		return 0;
+ 	}
+-	payload_len = uh->last_rx_len - 4;
+-	if (payload_len > len)
+-		payload_len = len;
+-	memcpy(buf, uh->last_rx_bytes + 2, payload_len);
+-	*actual = payload_len;
++
++	do {
++		u32 payload_len;
++		u32 nak_attempt;
++		u8 expected_pid;
++		bool received = false;
++
++		for (nak_attempt = 0;
++		     nak_attempt < FJ_USBHOST_HCD_IN_NAK_ATTEMPTS;
++		     nak_attempt++) {
++			u8 encoded_len = 0;
++
++			expected_pid = usb_gettoggle(udev, ep, 0) ?
++				       FJ_USB_PID_DATA1 : FJ_USB_PID_DATA0;
++			ret = fj_usbhost_pio_require_configured(uh);
++			if (ret)
++				return ret;
++			ret = fj_usbhost_pio_sof_burst(uh, 1);
++			if (ret)
++				return ret;
++
++			fj_usbhost_pio_prepare_receive(uh);
++			ret = fj_usbhost_pio_send_token(uh, FJ_USB_PID_IN,
++							addr, ep,
++							&encoded_len);
++			fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++			if (ret)
++				return ret;
++			fj_usbhost_pio_start_receive(uh);
++			ret = fj_usbhost_pio_receive_raw(uh, true);
++			if (ret)
++				continue;
++			if (uh->last_rx_pid == FJ_USB_PID_NAK) {
++				ret = -EAGAIN;
++				continue;
++			}
++			if (uh->last_rx_pid == FJ_USB_PID_STALL)
++				return -EPIPE;
++			if ((uh->last_rx_pid != FJ_USB_PID_DATA0 &&
++			     uh->last_rx_pid != FJ_USB_PID_DATA1) ||
++			    !fj_usbhost_pio_rx_data_crc_ok(uh, uh->last_rx_len)) {
++				fj_usbhost_pio_record_rx(uh, -EPROTO,
++							 uh->last_rx_len);
++				ret = -EPROTO;
++				break;
++			}
++			if (uh->last_rx_pid != expected_pid) {
++				ret = -EAGAIN;
++				continue;
++			}
++			received = true;
++			break;
++		}
++		if (!received) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "%s in-fail addr=%u ep=%u copied=%u len=%u ret=%d pid=0x%02x rx-len=%u",
++				  name, addr, ep, copied, len, ret,
++				  uh->last_rx_pid, uh->last_rx_len);
++			return ret ?: -EIO;
++		}
++
++		payload_len = uh->last_rx_len - 4;
++		if (payload_len > len - copied)
++			payload_len = len - copied;
++		memcpy(buf + copied, uh->last_rx_bytes + 2, payload_len);
++		copied += payload_len;
++		usb_dotoggle(udev, ep, 0);
++		if (payload_len < maxpacket)
++			break;
++	} while (copied < len);
++
++	*actual = copied;
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "%s in-ok addr=%u ep=%u actual=%u",
++		  name, addr, ep, copied);
+ 	return 0;
+ }
+ 
+@@ -3960,12 +4233,22 @@ static int fj_usbhost_hcd_do_urb(struct fruitjam_usbhost *uh, struct urb *urb)
+ 				uh, addr, urb->setup_packet,
+ 				urb->transfer_buffer, len, maxpacket, &actual);
+ 		}
+-		else
+-			ret = -EOPNOTSUPP;
+-	} else if (usb_pipeint(urb->pipe) && usb_pipein(urb->pipe)) {
+-		ret = fj_usbhost_hcd_interrupt_in(
+-			uh, addr, ep, urb->transfer_buffer,
+-			urb->transfer_buffer_length, &actual);
++		else {
++			maxpacket = usb_endpoint_maxp(&urb->ep->desc);
++			ret = fj_usbhost_hcd_control_write(
++				uh, addr, urb->setup_packet,
++				urb->transfer_buffer, len, maxpacket, &actual);
++		}
++	} else if ((usb_pipeint(urb->pipe) || usb_pipebulk(urb->pipe)) &&
++		   usb_pipein(urb->pipe)) {
++		u16 maxpacket = usb_endpoint_maxp(&urb->ep->desc);
++		const char *name = usb_pipeint(urb->pipe) ?
++				   "hcd-interrupt" : "hcd-bulk";
++
++		ret = fj_usbhost_hcd_in(uh, urb->dev, addr, ep,
++					 urb->transfer_buffer,
++					 urb->transfer_buffer_length,
++					 maxpacket, &actual, name);
+ 	} else if ((usb_pipeint(urb->pipe) || usb_pipebulk(urb->pipe)) &&
+ 		   usb_pipeout(urb->pipe)) {
+ 		u16 maxpacket = usb_endpoint_maxp(&urb->ep->desc);
+-- 
+2.39.5

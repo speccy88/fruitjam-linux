@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fruit Jam Linux <fruitjam-linux@local>
+Date: Thu, 18 Jun 2026 10:45:00 -0400
+Subject: [PATCH] misc: delay Fruit Jam USB host HCD registration
+
+wili8jam configures the Fruit Jam PIO USB host early, but it does not let USB
+enumeration monopolize boot forever: the application comes up, then TinyUSB is
+polled for a bounded boot scan.
+
+On the no-MMU Linux image, a marginal downstream EP0 path can make the kernel
+USB core retry enumeration immediately during early userspace startup. Keep the
+misc diagnostic bridge available at probe time, but allow the board DTS to
+delay usb_add_hcd(). This gives CDC, telnet, HTTP, and recovery helpers a window
+to come up before automatic HID/XInput enumeration starts.
+---
+ drivers/misc/fruitjam_usbhost.c | 59 ++++++++++++++++++++++++++------
+ 1 file changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -30,6 +30,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/usb.h>
+ #include <linux/usb/hcd.h>
++#include <linux/workqueue.h>
+ 
+ #include <asm/page.h>
+ 
+@@ -59,6 +60,7 @@
+ #define FJ_USBHOST_HCD_CONTROL_ATTEMPTS 9u
+ #define FJ_USBHOST_HCD_IN_NAK_ATTEMPTS 16u
+ #define FJ_USBHOST_HCD_IDLE_SLEEP_MS	20u
++#define FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT 0u
+ /*
+  * Enough for a worst-case bit-stuffed full-speed DATA packet carrying a
+  * 64-byte HID/XInput payload: sync + PID + payload + CRC16 + EOP/alignment.
+@@ -298,9 +300,12 @@
+ 	int last_rx_result;
+ 	struct usb_hcd *hcd;
+ 	struct task_struct *hcd_sof_task;
++	struct delayed_work hcd_register_work;
+ 	u32 hcd_port_status;
++	u32 hcd_start_delay_ms;
+ 	u16 hcd_frame;
+ 	bool hcd_sof_enabled;
++	bool hcd_registered;
+ 	u8 last_rx_bytes[FJ_USBHOST_RX_BYTES_MAX];
+ 	u8 tx_dma_buf[FJ_USBHOST_TX_ENCODED_MAX];
+ 	bool pio_ready;
+@@ -4760,6 +4765,36 @@
+ 	.hub_control = fj_usbhost_hcd_hub_control,
+ };
+ 
++static int fj_usbhost_register_hcd(struct fruitjam_usbhost *uh)
++{
++	int ret;
++
++	if (!uh->hcd || uh->hcd_registered)
++		return 0;
++
++	ret = usb_add_hcd(uh->hcd, 0, 0);
++	if (ret) {
++		dev_warn(uh->dev, "USB host HCD registration failed: %d\n",
++			 ret);
++		fj_usbhost_hcd_sof_stop(uh);
++		usb_put_hcd(uh->hcd);
++		uh->hcd = NULL;
++		return ret;
++	}
++
++	uh->hcd_registered = true;
++	return 0;
++}
++
++static void fj_usbhost_hcd_register_work(struct work_struct *work)
++{
++	struct fruitjam_usbhost *uh =
++		container_of(to_delayed_work(work), struct fruitjam_usbhost,
++			     hcd_register_work);
++
++	fj_usbhost_register_hcd(uh);
++}
++
+ static int fj_usbhost_pio_hub_port_no_data(struct fruitjam_usbhost *uh,
+ 					   u8 request, u16 feature,
+ 					   u8 port, const char *name)
+@@ -6197,6 +6232,7 @@
+ 	uh->sm_eop = FJ_USBHOST_SM_EOP_DEFAULT;
+ 	uh->clk_sys_hz = FJ_USBHOST_CLK_SYS_HZ_DEFAULT;
+ 	uh->tx_dma_channel = FJ_USBHOST_TX_DMA_CHANNEL_DEFAULT;
++	uh->hcd_start_delay_ms = FJ_USBHOST_HCD_START_DELAY_MS_DEFAULT;
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dp-gpio", &uh->dp_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,dm-gpio", &uh->dm_gpio);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,power-gpio", &uh->power_gpio);
+@@ -6206,6 +6242,7 @@
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,sm-eop", &uh->sm_eop);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,tx-dma-channel", &uh->tx_dma_channel);
+ 	device_property_read_u32(&pdev->dev, "raspberrypi,clk-sys-hz", &uh->clk_sys_hz);
++	device_property_read_u32(&pdev->dev, "raspberrypi,hcd-start-delay-ms", &uh->hcd_start_delay_ms);
+ 
+ 	uh->sio = fj_ioremap_byname(pdev, "sio");
+ 	if (IS_ERR(uh->sio))
+@@ -6250,6 +6287,8 @@
+ 	ret = misc_register(&uh->miscdev);
+ 	if (ret)
+ 		return ret;
++	INIT_DELAYED_WORK(&uh->hcd_register_work,
++			  fj_usbhost_hcd_register_work);
+ 	hcd = usb_create_hcd(&fj_usbhost_hc_driver, &pdev->dev,
+ 			     dev_name(&pdev->dev));
+ 	if (!hcd) {
+@@ -6257,22 +6296,20 @@
+ 	} else {
+ 		*(struct fruitjam_usbhost **)hcd->hcd_priv = uh;
+ 		uh->hcd = hcd;
+-		ret = usb_add_hcd(hcd, 0, 0);
+-		if (ret) {
+-			dev_warn(&pdev->dev,
+-				 "USB host HCD registration failed: %d\n",
+-				 ret);
+-			fj_usbhost_hcd_sof_stop(uh);
+-			usb_put_hcd(hcd);
+-			uh->hcd = NULL;
+-		}
++		if (uh->hcd_start_delay_ms)
++			schedule_delayed_work(
++				&uh->hcd_register_work,
++				msecs_to_jiffies(uh->hcd_start_delay_ms));
++		else
++			fj_usbhost_register_hcd(uh);
+ 	}
+ 
+ 	dev_info(&pdev->dev,
+-		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u clk_sys_hz=%u dma=%u ch=%u\n",
++		 "Fruit Jam USB host bridge on GPIO%u/GPIO%u power GPIO%u PIO%u ready=%u configured=%u clk_sys_hz=%u dma=%u ch=%u hcd_delay_ms=%u\n",
+ 		 uh->dp_gpio, uh->dm_gpio, uh->power_gpio, uh->pio_index,
+ 		 uh->pio_ready, uh->pio_configured, uh->clk_sys_hz,
+-		 uh->dma ? 1 : 0, uh->tx_dma_channel);
++		 uh->dma ? 1 : 0, uh->tx_dma_channel,
++		 uh->hcd_start_delay_ms);
+ 	return 0;
+ }
+ 
+@@ -6281,9 +6318,11 @@
+ 	struct fruitjam_usbhost *uh = platform_get_drvdata(pdev);
+ 
+ 	fj_usbhost_hcd_sof_stop(uh);
++	cancel_delayed_work_sync(&uh->hcd_register_work);
+ 
+ 	if (uh->hcd) {
+-		usb_remove_hcd(uh->hcd);
++		if (uh->hcd_registered)
++			usb_remove_hcd(uh->hcd);
+ 		usb_put_hcd(uh->hcd);
+ 		uh->hcd = NULL;
+ 	}
+-- 
+2.39.5

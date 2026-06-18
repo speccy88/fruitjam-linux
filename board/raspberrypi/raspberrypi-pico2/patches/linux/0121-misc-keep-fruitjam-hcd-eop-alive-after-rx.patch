@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 19:15:00 -0400
+Subject: [PATCH] misc: keep Fruit Jam HCD EOP alive after RX
+
+Pico-PIO-USB/wili8jam leaves the EOP detector running across host
+transactions and only disables the RX state machine after receiving a packet.
+The Fruit Jam Linux HCD setup path now has an RX-only Pico-style receive tail,
+but the shared receive helper used by IN data and status handshakes still
+stopped EOP after every packet.
+
+Keep EOP alive in the generic receive finish path too.  We still record the
+diagnostic RX state first, then disable/clear RX and clear stale IRQ state
+before the next token.  This moves the remaining EP0 control phases closer to
+the known-working wili8jam transaction lifecycle.
+---
+ drivers/misc/fruitjam_usbhost.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -726,13 +726,14 @@ static void fj_usbhost_pio_finish_receive(struct fruitjam_usbhost *uh,
+ 					  int ret, u32 len)
+ {
+ 	/*
+-	 * Preserve the receive diagnostics first.  Then match Pico-PIO-USB's
+-	 * transaction tail by leaving RX idle with no stale FIFO/IRQ state for
+-	 * the next SETUP/IN/OUT retry.
++	 * Preserve the receive diagnostics first.  Then match the
++	 * Pico-PIO-USB/wili8jam transaction tail: disable and clear RX, but
++	 * leave the EOP detector running between EP0 phases.
+ 	 */
+ 	fj_usbhost_pio_sm_disable(uh, uh->sm_rx);
+ 	fj_usbhost_pio_record_rx(uh, ret, len);
+-	fj_usbhost_pio_disable_receive(uh);
++	fj_usbhost_pio_sm_clear_fifos(uh, uh->sm_rx);
++	fj_usbhost_pio_clear_rx_irq(uh);
+ }
+ 
+ static void fj_usbhost_pio_prepare_receive_after_tx(struct fruitjam_usbhost *uh)
+-- 
+2.39.5

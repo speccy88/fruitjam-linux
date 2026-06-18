@@ -25,6 +25,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <linux/reboot.h>
+#include <sys/syscall.h>
+#else
+#define LINUX_REBOOT_MAGIC1 0xfee1dead
+#define LINUX_REBOOT_MAGIC2 672274793
+#define LINUX_REBOOT_CMD_RESTART2 0xa1b2c3d4
+#define SYS_reboot (-1)
+#endif
+
 #define DEFAULT_PORT 80
 #ifndef PLAYGROUND_ROOT
 #define PLAYGROUND_ROOT "/www"
@@ -204,6 +214,63 @@ static int serve_cgi(int fd, const char *script, const char *method,
 	return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
+static int query_has_bootsel_action(const char *query)
+{
+	const char *p = query;
+
+	while (p && *p) {
+		const char *next = strchr(p, '&');
+		size_t len = next ? (size_t)(next - p) : strlen(p);
+
+		if (len == strlen("action=bootsel") &&
+		    !strncmp(p, "action=bootsel", len))
+			return 1;
+		if (!next)
+			break;
+		p = next + 1;
+	}
+	return 0;
+}
+
+static int reboot_bootsel_after_delay(unsigned int delay_ms)
+{
+	if (delay_ms)
+		usleep(delay_ms * 1000u);
+	sync();
+	return syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+		       LINUX_REBOOT_CMD_RESTART2, "bootsel");
+}
+
+static int serve_direct_bootsel(int fd)
+{
+	static const char body[] =
+		"{\"ok\":true,\"accepted\":true,\"verified\":false,"
+		"\"source\":\"direct-httpd\","
+		"\"message\":\"BOOTSEL request accepted; verify from host with picotool info -a\"}\n";
+	char header[192];
+	int n;
+	int ret = 0;
+
+	n = snprintf(header, sizeof(header),
+		     "HTTP/1.0 200 OK\r\n"
+		     "Content-Type: application/json\r\n"
+		     "Cache-Control: no-store\r\n"
+		     "Connection: close\r\n"
+		     "Content-Length: %lu\r\n"
+		     "\r\n",
+		     (unsigned long)strlen(body));
+	if (n < 0 || n >= (int)sizeof(header) ||
+	    write_all(fd, header, (size_t)n) < 0 ||
+	    write_all(fd, body, strlen(body)) < 0) {
+		ret = 1;
+	}
+	(void)shutdown(fd, SHUT_WR);
+	if (reboot_bootsel_after_delay(1200) < 0)
+		fprintf(stderr, "fruitjam-httpd: reboot bootsel: %s\n",
+			strerror(errno));
+	return ret;
+}
+
 static int read_request(int fd, char *buf, size_t len)
 {
 	size_t used = 0;
@@ -268,8 +335,11 @@ static void serve_client(int client)
 		(void)serve_cgi(client, "/www/cgi-bin/env.cgi", method, query, proto,
 				remote_addr, remote_port);
 	} else if (!strcmp(target, "/cgi-bin/fruitjam.cgi")) {
-		(void)serve_cgi(client, "/www/cgi-bin/fruitjam.cgi", method, query, proto,
-				remote_addr, remote_port);
+		if (query_has_bootsel_action(query))
+			(void)serve_direct_bootsel(client);
+		else
+			(void)serve_cgi(client, "/www/cgi-bin/fruitjam.cgi", method,
+					query, proto, remote_addr, remote_port);
 	} else {
 		(void)serve_file(client, target);
 	}

@@ -1,0 +1,472 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 18 Jun 2026 19:40:00 -0400
+Subject: [PATCH] misc: add wili8jam RGB565 DVI mode
+
+The first Fruit Jam Linux DVI path exposes a raw 640x480 RGB332 buffer for
+small Linux dashboards.  wili8jam's known-working video path uses a different
+contract: a 128x128 RGB565 framebuffer, HSTX RGB565 TMDS expansion, 3x pixel
+scaling, and black borders centered inside the same 640x480 timing.
+
+Add that wili8jam-compatible mode as an explicit /dev/fruitjam-dvi command set
+without removing the existing raw Linux dashboard mode.  The old "show" and
+"test" commands still drive the 640x480 RGB332 buffer; "wili-show",
+"wili-forever", and "wili-test" select the RGB565/scaled path and reprogram the
+HSTX expander before DMA starts.
+---
+ drivers/misc/fruitjam_dvi.c | 205 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 182 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/misc/fruitjam_dvi.c b/drivers/misc/fruitjam_dvi.c
+--- a/drivers/misc/fruitjam_dvi.c
++++ b/drivers/misc/fruitjam_dvi.c
+@@ -3,8 +3,10 @@
+  * Minimal Adafruit Fruit Jam RP2350 HSTX DVI helper.
+  *
+  * This is a bring-up display path, not a full fbdev/DRM driver. It exposes
+- * /dev/fruitjam-dvi as a raw 640x480 RGB332 buffer and accepts short text
+- * commands such as "pattern", "show", "start", "forever", and "stop".
++ * /dev/fruitjam-dvi as a raw 640x480 RGB332 buffer and also accepts explicit
++ * wili8jam-compatible commands.  The wili8jam mode uses a 128x128 RGB565
++ * framebuffer, HSTX RGB565 expansion, 3x scaling, and black borders inside
++ * the same 640x480 timing.
+  *
+  * The HSTX/DMA programming follows Raspberry Pi's RP2350
+  * hstx/dvi_out_hstx_encoder Pico SDK example.
+@@ -31,6 +33,10 @@
+ #define FJ_DVI_HEIGHT			480u
+ #define FJ_DVI_FB_SIZE			(FJ_DVI_WIDTH * FJ_DVI_HEIGHT)
+ 
++#define FJ_DVI_WILI_FB_WIDTH		128u
++#define FJ_DVI_WILI_FB_HEIGHT		128u
++#define FJ_DVI_WILI_SCALE		3u
++
+ #define FJ_DVI_DMACH_PING		0u
+ #define FJ_DVI_DMACH_PONG		1u
+ #define FJ_DVI_DREQ_HSTX		52u
+@@ -98,6 +104,7 @@
+ #define DMA_CTRL_CHAIN_TO(v)		(((v) & 0xf) << 13)
+ #define DMA_CTRL_INCR_READ		BIT(4)
+ #define DMA_CTRL_SIZE_WORD		(2u << 2)
++#define DMA_CTRL_SIZE_HALFWORD		(1u << 2)
+ #define DMA_CTRL_EN			BIT(0)
+ 
+ #define TMDS_CTRL_00			0x354u
+@@ -120,9 +127,18 @@
+ #define MODE_H_TOTAL_PIXELS		(MODE_H_FRONT_PORCH + MODE_H_SYNC_WIDTH + MODE_H_BACK_PORCH + MODE_H_ACTIVE_PIXELS)
+ #define MODE_V_TOTAL_LINES		(MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH + MODE_V_BACK_PORCH + MODE_V_ACTIVE_LINES)
+ #define MODE_V_ACTIVE_START		(MODE_V_TOTAL_LINES - MODE_V_ACTIVE_LINES)
++#define FJ_DVI_WILI_ACTIVE_START	(MODE_V_SYNC_WIDTH + MODE_V_BACK_PORCH)
++#define FJ_DVI_WILI_ACTIVE_END		(FJ_DVI_WILI_ACTIVE_START + MODE_V_ACTIVE_LINES)
++#define FJ_DVI_WILI_CONTENT_LINES	(FJ_DVI_WILI_FB_HEIGHT * FJ_DVI_WILI_SCALE)
++#define FJ_DVI_WILI_H_BORDER		((MODE_H_ACTIVE_PIXELS - (FJ_DVI_WILI_FB_WIDTH * FJ_DVI_WILI_SCALE)) / 2u)
++#define FJ_DVI_WILI_V_BORDER		((MODE_V_ACTIVE_LINES - FJ_DVI_WILI_CONTENT_LINES) / 2u)
++#define FJ_DVI_WILI_CONTENT_START	(FJ_DVI_WILI_ACTIVE_START + FJ_DVI_WILI_V_BORDER)
++#define FJ_DVI_WILI_CONTENT_END		(FJ_DVI_WILI_CONTENT_START + FJ_DVI_WILI_CONTENT_LINES)
++#define FJ_DVI_WILI_FB_SIZE		(FJ_DVI_WILI_FB_WIDTH * FJ_DVI_WILI_FB_HEIGHT)
+ 
+ #define HSTX_CMD_RAW_REPEAT		(0x1u << 12)
+ #define HSTX_CMD_TMDS			(0x2u << 12)
++#define HSTX_CMD_TMDS_REPEAT		(0x3u << 12)
+ #define HSTX_CMD_NOP			(0xfu << 12)
+ 
+ static u32 fj_dvi_vblank_vsync_off[] = {
+@@ -157,8 +173,47 @@
+ 	HSTX_CMD_TMDS | MODE_H_ACTIVE_PIXELS,
+ };
+ 
++static u32 fj_dvi_wili_active_pre[] = {
++	HSTX_CMD_RAW_REPEAT | MODE_H_FRONT_PORCH,
++	SYNC_V1_H1,
++	HSTX_CMD_NOP,
++	HSTX_CMD_RAW_REPEAT | MODE_H_SYNC_WIDTH,
++	SYNC_V1_H0,
++	HSTX_CMD_NOP,
++	HSTX_CMD_RAW_REPEAT | MODE_H_BACK_PORCH,
++	SYNC_V1_H1,
++	HSTX_CMD_TMDS_REPEAT | FJ_DVI_WILI_H_BORDER,
++	0x00000000,
++	HSTX_CMD_TMDS | (FJ_DVI_WILI_FB_WIDTH * FJ_DVI_WILI_SCALE),
++};
++
++static u32 fj_dvi_wili_active_post[] = {
++	HSTX_CMD_TMDS_REPEAT | FJ_DVI_WILI_H_BORDER,
++	0x00000000,
++};
++
++static u32 fj_dvi_wili_active_black[] = {
++	HSTX_CMD_RAW_REPEAT | MODE_H_FRONT_PORCH,
++	SYNC_V1_H1,
++	HSTX_CMD_NOP,
++	HSTX_CMD_RAW_REPEAT | MODE_H_SYNC_WIDTH,
++	SYNC_V1_H0,
++	HSTX_CMD_NOP,
++	HSTX_CMD_RAW_REPEAT | MODE_H_BACK_PORCH,
++	SYNC_V1_H1,
++	HSTX_CMD_TMDS_REPEAT | MODE_H_ACTIVE_PIXELS,
++	0x00000000,
++};
++
+ static u8 fj_dvi_framebuf[FJ_DVI_FB_SIZE] __aligned(4);
++static u16 fj_dvi_wili_framebuf[FJ_DVI_WILI_FB_SIZE] __aligned(4);
+ 
++enum fj_dvi_wili_stage {
++	FJ_DVI_WILI_STAGE_PRE,
++	FJ_DVI_WILI_STAGE_PIXELS,
++	FJ_DVI_WILI_STAGE_POST,
++};
++
+ struct fj_dvi {
+ 	struct device *dev;
+ 	struct miscdevice miscdev;
+@@ -176,9 +231,11 @@
+ 	u32 scanline;
+ 	u32 frames;
+ 	u32 frames_left;
++	u8 wili_stage;
+ 	bool dma_pong;
+ 	bool active_cmd_posted;
+ 	bool running;
++	bool wili_mode;
+ };
+ 
+ static void __iomem *fj_dvi_ioremap_byname(struct platform_device *pdev,
+@@ -198,6 +255,13 @@
+ 	return ((r & 0xc0) >> 6) | ((g & 0xe0) >> 3) | (b & 0xe0);
+ }
+ 
++static u16 fj_dvi_rgb565(u8 r, u8 g, u8 b)
++{
++	return ((u16)(r & 0xf8) << 8) |
++	       ((u16)(g & 0xfc) << 3) |
++	       ((u16)b >> 3);
++}
++
+ static void fj_dvi_fill_clear(u8 colour)
+ {
+ 	memset(fj_dvi_framebuf, colour, sizeof(fj_dvi_framebuf));
+@@ -227,6 +291,30 @@
+ 	}
+ }
+ 
++static void fj_dvi_fill_wili_pattern(void)
++{
++	static const u16 bars[] = {
++		0x0000, 0x001f, 0x07e0, 0xf800, 0x07ff, 0xf81f, 0xffe0, 0xffff,
++	};
++	u32 x;
++	u32 y;
++
++	for (y = 0; y < FJ_DVI_WILI_FB_HEIGHT; y++) {
++		for (x = 0; x < FJ_DVI_WILI_FB_WIDTH; x++) {
++			u16 c;
++
++			if (y < 24) {
++				c = bars[(x * ARRAY_SIZE(bars)) / FJ_DVI_WILI_FB_WIDTH];
++			} else if (y < 112) {
++				c = fj_dvi_rgb565((u8)(x * 2u), (u8)(y * 2u), (u8)(x + y));
++			} else {
++				c = ((x / 8u) ^ (y / 8u)) & 1u ? 0xffff : 0x0000;
++			}
++			fj_dvi_wili_framebuf[y * FJ_DVI_WILI_FB_WIDTH + x] = c;
++		}
++	}
++}
++
+ static int fj_dvi_unreset(struct fj_dvi *fj, u32 bitno)
+ {
+ 	u32 bit = BIT(bitno);
+@@ -276,18 +364,33 @@
+ 	u32 lane;
+ 
+ 	writel(0, fj->hstx_ctrl + HSTX_CTRL_CSR);
+-	writel(HSTX_EXPAND_TMDS_L2_NBITS(2) |
+-	       HSTX_EXPAND_TMDS_L2_ROT(0) |
+-	       HSTX_EXPAND_TMDS_L1_NBITS(2) |
+-	       HSTX_EXPAND_TMDS_L1_ROT(29) |
+-	       HSTX_EXPAND_TMDS_L0_NBITS(1) |
+-	       HSTX_EXPAND_TMDS_L0_ROT(26),
+-	       fj->hstx_ctrl + HSTX_CTRL_EXPAND_TMDS);
+-	writel(HSTX_EXPAND_SHIFT_ENC_N(4) |
++	if (fj->wili_mode) {
++		writel(HSTX_EXPAND_TMDS_L2_NBITS(4) |
++		       HSTX_EXPAND_TMDS_L2_ROT(8) |
++		       HSTX_EXPAND_TMDS_L1_NBITS(5) |
++		       HSTX_EXPAND_TMDS_L1_ROT(3) |
++		       HSTX_EXPAND_TMDS_L0_NBITS(4) |
++		       HSTX_EXPAND_TMDS_L0_ROT(29),
++		       fj->hstx_ctrl + HSTX_CTRL_EXPAND_TMDS);
++		writel(HSTX_EXPAND_SHIFT_ENC_N(FJ_DVI_WILI_SCALE) |
++		       HSTX_EXPAND_SHIFT_ENC(16) |
++		       HSTX_EXPAND_SHIFT_RAW_N(1) |
++		       HSTX_EXPAND_SHIFT_RAW(0),
++		       fj->hstx_ctrl + HSTX_CTRL_EXPAND_SHIFT);
++	} else {
++		writel(HSTX_EXPAND_TMDS_L2_NBITS(2) |
++		       HSTX_EXPAND_TMDS_L2_ROT(0) |
++		       HSTX_EXPAND_TMDS_L1_NBITS(2) |
++		       HSTX_EXPAND_TMDS_L1_ROT(29) |
++		       HSTX_EXPAND_TMDS_L0_NBITS(1) |
++		       HSTX_EXPAND_TMDS_L0_ROT(26),
++		       fj->hstx_ctrl + HSTX_CTRL_EXPAND_TMDS);
++		writel(HSTX_EXPAND_SHIFT_ENC_N(4) |
+ 	       HSTX_EXPAND_SHIFT_ENC(8) |
+ 	       HSTX_EXPAND_SHIFT_RAW_N(1) |
+ 	       HSTX_EXPAND_SHIFT_RAW(0),
+ 	       fj->hstx_ctrl + HSTX_CTRL_EXPAND_SHIFT);
++	}
+ 
+ 	for (lane = 0; lane < 8; lane++)
+ 		writel(0, fj->hstx_ctrl + HSTX_CTRL_BIT(lane));
+@@ -314,12 +417,12 @@
+ 	       fj->hstx_ctrl + HSTX_CTRL_CSR);
+ }
+ 
+-static u32 fj_dvi_dma_ctrl(u32 chain_to)
++static u32 fj_dvi_dma_ctrl(u32 chain_to, u32 size)
+ {
+ 	return DMA_CTRL_TREQ(FJ_DVI_DREQ_HSTX) |
+ 	       DMA_CTRL_CHAIN_TO(chain_to) |
+ 	       DMA_CTRL_INCR_READ |
+-	       DMA_CTRL_SIZE_WORD |
++	       size |
+ 	       DMA_CTRL_EN;
+ }
+ 
+@@ -330,14 +433,16 @@
+ 	writel((u32)(fj->hstx_fifo_phys + HSTX_FIFO_FIFO),
+ 	       fj->dma + DMA_CH_WRITE_ADDR(ch));
+ 	writel(words, fj->dma + DMA_CH_TRANS_COUNT(ch));
+-	writel(fj_dvi_dma_ctrl(chain_to), fj->dma + DMA_CH_CTRL_TRIG(ch));
++	writel(fj_dvi_dma_ctrl(chain_to, DMA_CTRL_SIZE_WORD),
++	       fj->dma + DMA_CH_CTRL_TRIG(ch));
+ }
+ 
+-static void fj_dvi_dma_update(struct fj_dvi *fj, u32 ch, const void *src,
+-			      u32 words)
++static void fj_dvi_dma_update_ctrl(struct fj_dvi *fj, u32 ch, const void *src,
++				   u32 count, u32 chain_to, u32 size)
+ {
+ 	writel((u32)virt_to_phys((void *)src), fj->dma + DMA_CH_READ_ADDR(ch));
+-	writel(words, fj->dma + DMA_CH_TRANS_COUNT(ch));
++	writel(count, fj->dma + DMA_CH_TRANS_COUNT(ch));
++	writel(fj_dvi_dma_ctrl(chain_to, size), fj->dma + DMA_CH_CTRL_TRIG(ch));
+ }
+ 
+ static void fj_dvi_hw_stop_irq(struct fj_dvi *fj)
+@@ -352,13 +457,60 @@
+ 	fj->running = false;
+ }
+ 
++static bool fj_dvi_wili_next_transfer(struct fj_dvi *fj, const void **src,
++				      u32 *count, u32 *size)
++{
++	u32 line = fj->scanline;
++	u32 row;
++
++	*size = DMA_CTRL_SIZE_WORD;
++	if (line < MODE_V_SYNC_WIDTH) {
++		*src = fj_dvi_vblank_vsync_on;
++		*count = ARRAY_SIZE(fj_dvi_vblank_vsync_on);
++		return true;
++	}
++	if (line < FJ_DVI_WILI_ACTIVE_START || line >= FJ_DVI_WILI_ACTIVE_END) {
++		*src = fj_dvi_vblank_vsync_off;
++		*count = ARRAY_SIZE(fj_dvi_vblank_vsync_off);
++		return true;
++	}
++	if (line < FJ_DVI_WILI_CONTENT_START || line >= FJ_DVI_WILI_CONTENT_END) {
++		*src = fj_dvi_wili_active_black;
++		*count = ARRAY_SIZE(fj_dvi_wili_active_black);
++		return true;
++	}
++
++	switch (fj->wili_stage) {
++	case FJ_DVI_WILI_STAGE_PRE:
++		*src = fj_dvi_wili_active_pre;
++		*count = ARRAY_SIZE(fj_dvi_wili_active_pre);
++		fj->wili_stage = FJ_DVI_WILI_STAGE_PIXELS;
++		return false;
++	case FJ_DVI_WILI_STAGE_PIXELS:
++		row = (line - FJ_DVI_WILI_CONTENT_START) / FJ_DVI_WILI_SCALE;
++		*src = &fj_dvi_wili_framebuf[row * FJ_DVI_WILI_FB_WIDTH];
++		*count = FJ_DVI_WILI_FB_WIDTH;
++		*size = DMA_CTRL_SIZE_HALFWORD;
++		fj->wili_stage = FJ_DVI_WILI_STAGE_POST;
++		return false;
++	default:
++		*src = fj_dvi_wili_active_post;
++		*count = ARRAY_SIZE(fj_dvi_wili_active_post);
++		fj->wili_stage = FJ_DVI_WILI_STAGE_PRE;
++		return true;
++	}
++}
++
+ static irqreturn_t fj_dvi_dma_irq(int irq, void *data)
+ {
+ 	struct fj_dvi *fj = data;
+ 	u32 status = readl(fj->dma + DMA_INTS0);
+ 	u32 ch = fj->dma_pong ? FJ_DVI_DMACH_PONG : FJ_DVI_DMACH_PING;
++	u32 chain_to = fj->dma_pong ? FJ_DVI_DMACH_PING : FJ_DVI_DMACH_PONG;
+ 	const void *src;
+ 	u32 words;
++	u32 size = DMA_CTRL_SIZE_WORD;
++	bool line_done = true;
+ 
+ 	if (!(status & (BIT(FJ_DVI_DMACH_PING) | BIT(FJ_DVI_DMACH_PONG))))
+ 		return IRQ_NONE;
+@@ -366,7 +518,9 @@
+ 	writel(BIT(ch), fj->dma + DMA_INTR);
+ 	fj->dma_pong = !fj->dma_pong;
+ 
+-	if (fj->scanline >= MODE_V_FRONT_PORCH &&
++	if (fj->wili_mode) {
++		line_done = fj_dvi_wili_next_transfer(fj, &src, &words, &size);
++	} else if (fj->scanline >= MODE_V_FRONT_PORCH &&
+ 	    fj->scanline < MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH) {
+ 		src = fj_dvi_vblank_vsync_on;
+ 		words = ARRAY_SIZE(fj_dvi_vblank_vsync_on);
+@@ -377,6 +531,7 @@
+ 		src = fj_dvi_active_line;
+ 		words = ARRAY_SIZE(fj_dvi_active_line);
+ 		fj->active_cmd_posted = true;
++		line_done = false;
+ 	} else {
+ 		u32 line = fj->scanline - MODE_V_ACTIVE_START;
+ 
+@@ -385,9 +540,9 @@
+ 		fj->active_cmd_posted = false;
+ 	}
+ 
+-	fj_dvi_dma_update(fj, ch, src, words);
++	fj_dvi_dma_update_ctrl(fj, ch, src, words, chain_to, size);
+ 
+-	if (!fj->active_cmd_posted) {
++	if (line_done) {
+ 		fj->scanline = (fj->scanline + 1) % MODE_V_TOTAL_LINES;
+ 		if (!fj->scanline) {
+ 			fj->frames++;
+@@ -417,10 +572,11 @@
+ 	fj_dvi_configure_gpio(fj);
+ 	fj_dvi_configure_hstx(fj);
+ 
+-	fj->scanline = 2;
++	fj->scanline = fj->wili_mode ? 0 : 2;
+ 	fj->frames = 0;
+ 	fj->dma_pong = false;
+ 	fj->active_cmd_posted = false;
++	fj->wili_stage = FJ_DVI_WILI_STAGE_PRE;
+ 
+ 	fj_dvi_dma_program(fj, FJ_DVI_DMACH_PING, fj_dvi_vblank_vsync_off,
+ 			   ARRAY_SIZE(fj_dvi_vblank_vsync_off), FJ_DVI_DMACH_PONG);
+@@ -453,6 +609,17 @@
+ 	fj->running = false;
+ }
+ 
++static void fj_dvi_select_mode(struct fj_dvi *fj, bool wili_mode)
++{
++	if (fj->wili_mode == wili_mode)
++		return;
++
++	fj_dvi_hw_stop(fj);
++	fj->wili_mode = wili_mode;
++	fj->active_cmd_posted = false;
++	fj->wili_stage = FJ_DVI_WILI_STAGE_PRE;
++}
++
+ static int fj_dvi_open(struct inode *inode, struct file *file)
+ {
+ 	struct miscdevice *miscdev = file->private_data;
+@@ -499,40 +666,74 @@
+ 		mutex_lock(&fj->lock);
+ 		if (!strcmp(cmd, "start") || !strcmp(cmd, "on") ||
+ 		    !strcmp(cmd, "show") || !strcmp(cmd, "frame")) {
++			fj_dvi_select_mode(fj, false);
+ 			fj->frames_left = FJ_DVI_SHOW_FRAMES;
+ 			ret = fj_dvi_hw_start(fj);
+ 			mutex_unlock(&fj->lock);
+ 			return ret ? ret : count;
+ 		}
+ 		if (!strcmp(cmd, "forever") || !strcmp(cmd, "continuous")) {
++			fj_dvi_select_mode(fj, false);
+ 			fj->frames_left = 0;
+ 			ret = fj_dvi_hw_start(fj);
+ 			mutex_unlock(&fj->lock);
+ 			return ret ? ret : count;
+ 		}
++		if (!strcmp(cmd, "wili-show") || !strcmp(cmd, "wili-frame")) {
++			fj_dvi_select_mode(fj, true);
++			fj->frames_left = FJ_DVI_SHOW_FRAMES;
++			ret = fj_dvi_hw_start(fj);
++			mutex_unlock(&fj->lock);
++			return ret ? ret : count;
++		}
++		if (!strcmp(cmd, "wili-forever") || !strcmp(cmd, "wili-continuous")) {
++			fj_dvi_select_mode(fj, true);
++			fj->frames_left = 0;
++			ret = fj_dvi_hw_start(fj);
++			mutex_unlock(&fj->lock);
++			return ret ? ret : count;
++		}
+ 		if (!strcmp(cmd, "stop") || !strcmp(cmd, "off")) {
+ 			fj_dvi_hw_stop(fj);
+ 			mutex_unlock(&fj->lock);
+ 			return count;
+ 		}
+ 		if (!strcmp(cmd, "test")) {
++			fj_dvi_select_mode(fj, false);
+ 			fj_dvi_fill_pattern();
+ 			fj->frames_left = FJ_DVI_TEST_FRAMES;
+ 			ret = fj_dvi_hw_start(fj);
+ 			mutex_unlock(&fj->lock);
+ 			return ret ? ret : count;
+ 		}
++		if (!strcmp(cmd, "wili-test")) {
++			fj_dvi_select_mode(fj, true);
++			fj_dvi_fill_wili_pattern();
++			fj->frames_left = FJ_DVI_TEST_FRAMES;
++			ret = fj_dvi_hw_start(fj);
++			mutex_unlock(&fj->lock);
++			return ret ? ret : count;
++		}
+ 		if (!strcmp(cmd, "pattern") || !strcmp(cmd, "bars")) {
++			fj_dvi_select_mode(fj, false);
+ 			fj_dvi_fill_pattern();
+ 			mutex_unlock(&fj->lock);
+ 			return count;
+ 		}
++		if (!strcmp(cmd, "wili-pattern")) {
++			fj_dvi_select_mode(fj, true);
++			fj_dvi_fill_wili_pattern();
++			mutex_unlock(&fj->lock);
++			return count;
++		}
+ 		if (!strcmp(cmd, "clear") || !strcmp(cmd, "black")) {
++			fj_dvi_select_mode(fj, false);
+ 			fj_dvi_fill_clear(0);
+ 			mutex_unlock(&fj->lock);
+ 			return count;
+ 		}
+ 		if (!strcmp(cmd, "white")) {
++			fj_dvi_select_mode(fj, false);
+ 			fj_dvi_fill_clear(0xff);
+ 			mutex_unlock(&fj->lock);
+ 			return count;
+@@ -547,6 +748,7 @@
+ 
+ 	todo = min_t(size_t, count, FJ_DVI_FB_SIZE - *ppos);
+ 	mutex_lock(&fj->lock);
++	fj_dvi_select_mode(fj, false);
+ 	if (copy_from_user(fj_dvi_framebuf + *ppos, buf, todo)) {
+ 		mutex_unlock(&fj->lock);
+ 		return -EFAULT;
+@@ -625,6 +827,7 @@
+ 		return ret;
+ 
+ 	fj_dvi_fill_pattern();
++	fj_dvi_fill_wili_pattern();
+ 
+ 	fj->miscdev.minor = MISC_DYNAMIC_MINOR;
+ 	fj->miscdev.name = "fruitjam-dvi";
+-- 
+2.39.5

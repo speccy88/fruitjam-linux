@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 17 Jun 2026 21:05:00 -0400
+Subject: [PATCH] misc: add Fruit Jam usbhost framed retry probe
+
+Pico-PIO-USB drives enumeration from a 1 ms host frame loop: each frame sends
+SOF first, then services queued endpoint transfers, retrying failed
+transactions in later frames. The Linux bridge has several one-shot
+GET_DESCRIPTOR probes, but none test that exact "SOF immediately before the
+control attempt, retry in-kernel" cadence.
+
+Add a diagnostic framed retry probe. It sends a SOF immediately before each
+tight GET_DESCRIPTOR attempt and retries inside the kernel, avoiding shell
+round-trip gaps while keeping the existing transaction code intact.
+---
+ drivers/misc/fruitjam_usbhost.c | 73 ++++++++++++++++++++++++++++++++
+ 1 file changed, 73 insertions(+)
+
+diff --git a/drivers/misc/fruitjam_usbhost.c b/drivers/misc/fruitjam_usbhost.c
+--- a/drivers/misc/fruitjam_usbhost.c
++++ b/drivers/misc/fruitjam_usbhost.c
+@@ -62,6 +62,8 @@
+ #define FJ_USBHOST_SETUP_GAP_MAX_BYTES 16u
+ #define FJ_USBHOST_SETUP_GAP_IDLE_FULL_BYTE 0xffu
+ #define FJ_USBHOST_SETUP_GAP_IDLE_LOW_BYTE 0x55u
++#define FJ_USBHOST_FRAME_RETRY_DEFAULT 8u
++#define FJ_USBHOST_FRAME_RETRY_MAX 64u
+ #define FJ_USBHOST_HANDSHAKE_PACKET_TIMEOUT_US 20u
+ #define FJ_USBHOST_BOOT_KEYBOARD_ADDR	1u
+ #define FJ_USBHOST_BOOT_KEYBOARD_CONFIG	1u
+@@ -3666,6 +3668,52 @@ static int fj_usbhost_pio_sof_burst(struct fruitjam_usbhost *uh, u32 frames)
+ 	return 0;
+ }
+ 
++static int fj_usbhost_pio_get_device8_frame_retry(struct fruitjam_usbhost *uh,
++						  u32 attempts)
++{
++	u32 attempt;
++	int last_ret = -ETIMEDOUT;
++	int ret;
++
++	if (!attempts)
++		attempts = FJ_USBHOST_FRAME_RETRY_DEFAULT;
++	if (attempts > FJ_USBHOST_FRAME_RETRY_MAX)
++		return -EINVAL;
++
++	ret = fj_usbhost_pio_require_configured(uh);
++	if (ret)
++		return ret;
++
++	for (attempt = 0; attempt < attempts; attempt++) {
++		u8 encoded_len = 0;
++
++		if (uh->low_speed)
++			ret = fj_usbhost_pio_send_keepalive(uh, &encoded_len);
++		else
++			ret = fj_usbhost_pio_send_sof(uh, uh->packets & 0x7ff,
++						      &encoded_len);
++		fj_usbhost_pio_record_tx(uh, ret, encoded_len);
++		if (ret)
++			return ret;
++
++		ret = fj_usbhost_pio_get_device8_tight(uh);
++		if (!ret) {
++			scnprintf(uh->last_probe_summary,
++				  sizeof(uh->last_probe_summary),
++				  "frame-retry success attempt=%u/%u",
++				  attempt + 1, attempts);
++			return 0;
++		}
++		last_ret = ret;
++		usleep_range(1000, 1100);
++	}
++
++	scnprintf(uh->last_probe_summary, sizeof(uh->last_probe_summary),
++		  "frame-retry attempts=%u last-ret=%d last-rx-len=%u pid=0x%02x",
++		  attempts, last_ret, uh->last_rx_len, uh->last_rx_pid);
++	return last_ret;
++}
++
+ static int fj_usbhost_pio_hub_set_address_noreset(struct fruitjam_usbhost *uh,
+ 						  u32 sof_frames)
+ {
+@@ -3909,6 +3957,14 @@ static int fj_usbhost_pio_get_device8_active_stream(struct fruitjam_usbhost *uh)
+ 	return ret ? ret : fj_usbhost_pio_get_device8_stream(uh);
+ }
+ 
++static int fj_usbhost_pio_get_device8_active_frame_retry(struct fruitjam_usbhost *uh,
++							 u32 attempts)
++{
++	int ret = fj_usbhost_pio_reset_active(uh);
++
++	return ret ? ret : fj_usbhost_pio_get_device8_frame_retry(uh, attempts);
++}
++
+ static void fj_usbhost_pio_release(struct fruitjam_usbhost *uh)
+ {
+ 	if (!uh->pio)
+@@ -4312,0 +4369,1 @@
++	u32 frame_retries;
+@@ -4388,0 +4446,8 @@
++	} else if (!strncmp(cmd, "get-device-8-frame-retry", 24) &&
++		   (cmd[24] == '\0' || cmd[24] == ' ' ||
++		    cmd[24] == '\t')) {
++		ret = fj_usbhost_parse_optional_u32(
++			cmd + 24, FJ_USBHOST_FRAME_RETRY_MAX,
++			&frame_retries);
++		if (!ret)
++			ret = fj_usbhost_pio_get_device8_frame_retry(uh, frame_retries);
+@@ -4413,0 +4479,8 @@
++	} else if (!strncmp(cmd, "reset-get-device-8-frame-retry", 30) &&
++		   (cmd[30] == '\0' || cmd[30] == ' ' ||
++		    cmd[30] == '\t')) {
++		ret = fj_usbhost_parse_optional_u32(
++			cmd + 30, FJ_USBHOST_FRAME_RETRY_MAX,
++			&frame_retries);
++		if (!ret)
++			ret = fj_usbhost_pio_get_device8_active_frame_retry(uh, frame_retries);
+-- 
+2.39.5

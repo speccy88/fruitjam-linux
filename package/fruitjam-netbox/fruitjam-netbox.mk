@@ -182,20 +182,14 @@ define FRUITJAM_NETBOX_CONFIG_COREBOX
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CHMOD)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CHOWN)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CP)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CUT)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DATE)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DD)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DF)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DIRNAME)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DMESG)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_EGREP)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_ENV)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_FALSE)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_FGREP)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_GETOPT)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_GREP)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_HALT)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_HEAD)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_HOSTNAME)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_KILL)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_LN)
@@ -209,21 +203,55 @@ define FRUITJAM_NETBOX_CONFIG_COREBOX
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_REBOOT)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_RM)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_RMDIR)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_SED)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_STTY)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_SYNC)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TAIL)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TEE)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TEST)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TOUCH)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TR)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TRUE)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_UNAME)
-	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_WC)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_WHICH)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_XARGS)
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_YES)
 endef
+
+define FRUITJAM_NETBOX_CONFIG_GREP
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_GREP)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_EGREP)
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_FGREP)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_SED
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_SED)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_DF
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_DF)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_HEAD
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_HEAD)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_TAIL
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TAIL)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_WC
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_WC)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_CUT
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_CUT)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_TR
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_TR)
+endef
+
+define FRUITJAM_NETBOX_CONFIG_UNAME
+	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_UNAME)
+endef
+
 
 define FRUITJAM_NETBOX_CONFIG_NETSTAT
 	$(call FRUITJAM_NETBOX_ENABLE,CONFIG_NETSTAT)
@@ -285,6 +313,15 @@ define FRUITJAM_NETBOX_BUILD_CMDS
 	$(call FRUITJAM_NETBOX_BUILD_ONE,INITBOX,fruitjam-busybox)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,HUSH,fruitjam-hush)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,COREBOX,fruitjam-corebox)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,GREP,fruitjam-grep)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,SED,fruitjam-sed)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,DF,fruitjam-df)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,HEAD,fruitjam-head)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,TAIL,fruitjam-tail)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,WC,fruitjam-wc)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,CUT,fruitjam-cut)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,TR,fruitjam-tr)
+	$(call FRUITJAM_NETBOX_BUILD_ONE,UNAME,fruitjam-uname)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,CAT,fruitjam-cat)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,ECHO,fruitjam-echo)
 	$(call FRUITJAM_NETBOX_BUILD_ONE,LS,fruitjam-ls)
@@ -337,12 +374,23 @@ define FRUITJAM_NETBOX_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/sbin/ifconfig \
 		$(TARGET_DIR)/bin/netstat
 	$(INSTALL) -D -m 0755 $(@D)/fruitjam-corebox $(TARGET_DIR)/bin/corebox
-	for app in chgrp chmod chown cp date dd df dmesg egrep false fgrep \
-		getopt grep hostname kill ln mknod more mv ping printenv pwd rm \
-		rmdir sed stty sync touch true uname; do \
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-grep $(TARGET_DIR)/bin/grep
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-sed $(TARGET_DIR)/bin/sed
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-df $(TARGET_DIR)/bin/df
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-head $(TARGET_DIR)/usr/bin/head
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-tail $(TARGET_DIR)/usr/bin/tail
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-wc $(TARGET_DIR)/usr/bin/wc
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-cut $(TARGET_DIR)/usr/bin/cut
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-tr $(TARGET_DIR)/usr/bin/tr
+	$(INSTALL) -D -m 0755 $(@D)/fruitjam-uname $(TARGET_DIR)/bin/uname
+	ln -sf grep $(TARGET_DIR)/bin/egrep
+	ln -sf grep $(TARGET_DIR)/bin/fgrep
+	for app in chgrp chmod chown cp date dd dmesg false \
+		getopt hostname kill ln mknod more mv ping printenv pwd rm \
+		rmdir stty sync touch true; do \
 		ln -sf corebox $(TARGET_DIR)/bin/$$app; \
 	done
-	for app in basename cut dirname env head tail tee test tr wc which xargs \
+	for app in basename dirname env tee test which xargs \
 		yes; do \
 		ln -sf ../../bin/corebox $(TARGET_DIR)/usr/bin/$$app; \
 	done

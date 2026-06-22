@@ -685,6 +685,13 @@ make -C buildroot
 picotool load -fu buildroot/output/images/flash-image.uf2
 ```
 
+> **Building a release:** do a clean rebuild so `.mk` hook-injected modules (e.g. the berry `i2c` module) are included — an incremental `make` reuses stale package binaries:
+>
+> ```bash
+> make -C buildroot berry-dirclean
+> make -C buildroot
+> ```
+
 If `picotool` was not available during the Buildroot post-image step, generate the
 UF2 manually:
 

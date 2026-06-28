@@ -542,7 +542,7 @@ static int start_ftp(void)
 static int start_telnet(void)
 {
 	char *const argv[] = {
-		"/usr/sbin/fruitjam-telnetd", "23", "/usr/bin/fruitjam-shell", NULL
+		"/usr/sbin/fruitjam-telnetd", "23", "/bin/sh", NULL
 	};
 
 	init_runtime();

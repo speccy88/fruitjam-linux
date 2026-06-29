@@ -65,11 +65,10 @@ Validated on the Fruit Jam board:
   modes.
 * USB CDC login shells use standalone `/usr/bin/hush`; the hardware UART uses
   `fruitjam-uart-login` to wait for Enter before execing `hush`, avoiding a
-  no-MMU respawn loop when nothing is attached. Telnet sessions use the smaller
-  `/usr/bin/fruitjam-shell` command loop with small history and command/path
-  tab completion to preserve no-MMU allocation headroom. The experimental USB
-  boot-keyboard `kbd-shell` path also has small history and command/path
-  completion.
+  no-MMU respawn loop when nothing is attached. Headless telnet sessions use
+  BusyBox `/bin/sh` with standalone applets so common commands avoid the
+  separate netbox binaries where possible. The experimental USB boot-keyboard
+  `kbd-shell` path still has small history and command/path completion.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners
   without spawning `ps` or `netstat`, and CGI still runs after status/telnet
   checks.
@@ -91,7 +90,7 @@ Validated on the Fruit Jam board:
 * `wget -O - http://127.0.0.1/index.html` serves the SD-card page after
   `fruitjam-services core`, and `wget -O - http://127.0.0.1/cgi-bin/env.cgi`
   returns `Fruit Jam CGI OK`.
-* AirLift telnet on TCP/23 spawns `fruitjam-shell` and successfully echoed
+* AirLift telnet on TCP/23 spawns `/bin/sh` and successfully echoed
   `TELNET_OK`; loopback telnet works after `fruitjam-services core`. AirLift
   telnet sessions use a 60-second default idle timeout so stale clients release
   the single shell bridge quickly, and a new connection can preempt a stale

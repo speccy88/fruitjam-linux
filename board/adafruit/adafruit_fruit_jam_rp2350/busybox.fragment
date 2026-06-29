@@ -163,12 +163,11 @@ CONFIG_FEATURE_HTTPD_PORT_DEFAULT=80
 # CONFIG_UDHCPC is not set
 # CONFIG_FEATURE_UDHCPC_SANITIZEOPT is not set
 
-# --- 2026-06-28: standalone shell so telnet commands run in-process (no per-command exec/OOM) ---
+# Telnet-friendly standalone shell. Prefer compiled-in BusyBox applets, using
+# NOFORK/NOEXEC where BusyBox marks an applet safe.
 CONFIG_FEATURE_SH_STANDALONE=y
 CONFIG_FEATURE_PREFER_APPLETS=y
 CONFIG_FEATURE_SH_NOFORK=y
-# Curated command applets compiled INTO busybox so the standalone shell runs
-# them NOFORK/NOEXEC in-process instead of execing the separate netbox binaries.
 CONFIG_CAT=y
 CONFIG_ECHO=y
 CONFIG_LS=y

@@ -23,7 +23,7 @@ Validated on Adafruit Fruit Jam hardware:
 * The flash rootfs is a 10 MiB CramFS partition from offset 6 MiB through the
   end of the 16 MiB flash device.
 * Serial login shells use `/usr/bin/hush`; telnet uses `fruitjam-telnetd` and
-  `/usr/bin/fruitjam-shell`.
+  `/bin/sh` with BusyBox standalone applets.
 * `fruitjam-services status` reads `/proc` directly and must not regress to
   spawning larger helper applets such as `ps` or `netstat`; CGI was verified
   before and after status/telnet checks.

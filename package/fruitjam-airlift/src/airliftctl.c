@@ -120,7 +120,7 @@
 #define DEFAULT_FTP_PORT 21u
 #define DEFAULT_FTP_DATA_PORT 2121u
 #define DEFAULT_TFTP_PORT 69u
-#define DEFAULT_SHELL_PATH "/usr/bin/fruitjam-shell"
+#define DEFAULT_SHELL_PATH "/bin/sh"
 #define PLAYGROUND_ROOT "/www"
 #define SD_WEB_ROOT "/mnt/sd/www"
 #define PLAYGROUND_PREFIX "/playground"

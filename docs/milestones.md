@@ -67,9 +67,9 @@ Included:
 * GPIO0/GPIO4/GPIO5 export as pulled-up button inputs.
 * BusyBox httpd and tftpd, plus tiny `nc`, `wget`, `fruitjam-ftpd`,
   `fruitjam-telnetd`, and `fruitjam-services`.
-* Serial consoles use standalone `/usr/bin/hush`; telnet sessions use
-  `/usr/bin/fruitjam-shell` with small history and command/path completion to
-  reduce no-MMU contiguous allocation pressure.
+* Serial consoles use standalone `/usr/bin/hush`; headless telnet sessions use
+  BusyBox `/bin/sh` with standalone applets so common commands avoid the
+  separate netbox binaries where possible.
 * `fruitjam-services status` reports service processes and TCP/UDP listeners by
   reading `/proc` directly instead of spawning larger `ps`/`netstat` applets.
 * Kernel config trimmed to keep USB CDC gadget support while removing Linux USB
